@@ -20,6 +20,7 @@ from myoutbrain.generation import (
     CloudAuthorization,
     EvidenceItem,
     EvidencePackage,
+    GeneratedClaim,
     GenerationRequest,
     ProviderFailure,
     create_generation_provider,
@@ -56,6 +57,8 @@ INITIAL_DIRECTORIES = (
 SCHEMA_VERSION = 1
 PERMANENT_STORAGE = ("vault", "store")
 REBUILDABLE_STORAGE = ("runtime",)
+DEFAULT_GENERATION_PROVIDER = "openai"
+DEFAULT_GENERATION_MODEL = "gpt-5-mini"
 GIT_IGNORE_MARKER = "# MyOutBrain machine data"
 GIT_IGNORE_RULES = ("/store/objects/", "/store/transactions/", "/runtime/", "/.myoutbrain.lock")
 
@@ -84,9 +87,8 @@ class CaptureResult:
 
 @dataclass(frozen=True)
 class AskResult:
-    answer: str
-    source_id: str
-    locator: str
+    claims: tuple[GeneratedClaim, ...]
+    evidence: tuple[EvidenceItem, ...]
     insufficient_evidence: bool
 
 
@@ -217,10 +219,26 @@ def _render_initial_configuration() -> str:
         "[storage]\n"
         f"permanent = [{permanent}]\n"
         f"rebuildable = [{rebuildable}]\n"
-        "\n[generation]\n"
-        'provider = "openai"\n'
-        'model = "gpt-5-mini"\n'
+        f"\n{_render_default_generation_configuration()}"
     )
+
+
+def _render_default_generation_configuration() -> str:
+    return (
+        "[generation]\n"
+        f'provider = "{DEFAULT_GENERATION_PROVIDER}"\n'
+        f'model = "{DEFAULT_GENERATION_MODEL}"\n'
+    )
+
+
+def _with_default_generation_configuration(configuration: str) -> str:
+    if configuration.endswith("\n\n"):
+        separator = ""
+    elif configuration.endswith("\n"):
+        separator = "\n"
+    else:
+        separator = "\n\n"
+    return f"{configuration}{separator}{_render_default_generation_configuration()}"
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -390,13 +408,17 @@ def _with_required_git_ignore_rules(existing_content: str) -> str:
     return f"{existing_content}{separator}{'\n'.join(additions)}\n"
 
 
-def _validate_configuration(path: Path) -> None:
+def _load_configuration(path: Path) -> dict[str, object]:
     try:
         with path.open("rb") as configuration_file:
             configuration = tomllib.load(configuration_file)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigurationConflict(f"invalid configuration: {path}") from error
+    return configuration
 
+
+def _load_validated_configuration(path: Path) -> dict[str, object]:
+    configuration = _load_configuration(path)
     if configuration.get("schema_version") != SCHEMA_VERSION:
         raise ConfigurationConflict("unsupported schema_version in existing configuration")
     if configuration.get("single_writer") is not True:
@@ -408,22 +430,26 @@ def _validate_configuration(path: Path) -> None:
         raise ConfigurationConflict("existing configuration has an invalid permanent storage classification")
     if storage.get("rebuildable") != list(REBUILDABLE_STORAGE):
         raise ConfigurationConflict("existing configuration has an invalid rebuildable storage classification")
+    return configuration
 
 
-def _generation_configuration(path: Path) -> tuple[str, str]:
+def _generation_configuration(
+    configuration: dict[str, object],
+    path: Path,
+) -> tuple[str, str]:
     try:
-        with path.open("rb") as configuration_file:
-            configuration = tomllib.load(configuration_file)
         generation = configuration.get("generation")
+        if generation is None:
+            return DEFAULT_GENERATION_PROVIDER, DEFAULT_GENERATION_MODEL
         if not isinstance(generation, dict):
-            raise TypeError("generation configuration is missing")
+            raise TypeError("generation configuration is invalid")
         provider = generation.get("provider")
         model = generation.get("model")
         if not isinstance(provider, str) or not provider:
             raise TypeError("generation provider is invalid")
         if not isinstance(model, str) or not model:
             raise TypeError("generation model is invalid")
-    except (OSError, tomllib.TOMLDecodeError, TypeError) as error:
+    except TypeError as error:
         raise ConfigurationConflict(f"invalid generation configuration: {path}") from error
     return provider, model
 
@@ -479,8 +505,19 @@ class KnowledgeWorkflow:
                 raise ConfigurationConflict(
                     f"Git ignore file is not valid UTF-8: {git_ignore}"
                 ) from error
+            migrated_configuration: str | None = None
             if configuration.exists():
-                _validate_configuration(configuration)
+                configuration_data = _load_validated_configuration(configuration)
+                if "generation" not in configuration_data:
+                    try:
+                        existing_configuration = configuration.read_text(encoding="utf-8")
+                    except (OSError, UnicodeError) as error:
+                        raise ConfigurationConflict(
+                            f"cannot read configuration for migration: {configuration}"
+                        ) from error
+                    migrated_configuration = _with_default_generation_configuration(
+                        existing_configuration
+                    )
             for relative_path in INITIAL_DIRECTORIES:
                 (root / relative_path).mkdir(parents=True, exist_ok=True)
             updated_git_ignore = _with_required_git_ignore_rules(existing_git_ignore)
@@ -488,12 +525,14 @@ class KnowledgeWorkflow:
                 _atomic_write(git_ignore, updated_git_ignore.encode("utf-8"))
             if not configuration.exists():
                 _atomic_write(configuration, _render_initial_configuration().encode("utf-8"))
+            elif migrated_configuration is not None:
+                _atomic_write(configuration, migrated_configuration.encode("utf-8"))
 
     def capture(self, source_path: Path, sensitivity: Sensitivity) -> CaptureResult:
         configuration = self._root / "myoutbrain.toml"
         if not configuration.is_file():
             raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
-        _validate_configuration(configuration)
+        _load_validated_configuration(configuration)
         source_bytes = _read_source(source_path)
         digest = hashlib.sha256(source_bytes).hexdigest()
         source_id = f"src_{digest}"
@@ -514,19 +553,23 @@ class KnowledgeWorkflow:
         configuration = self._root / "myoutbrain.toml"
         if not configuration.is_file():
             raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
-        _validate_configuration(configuration)
-        provider_name, model = _generation_configuration(configuration)
+        configuration_data = _load_validated_configuration(configuration)
+        provider_name, model = _generation_configuration(configuration_data, configuration)
         if not question.strip():
             raise UserInputError("question must not be blank")
         if not allow_cloud:
             raise UserInputError("this request requires explicit --allow-cloud authorization")
-        if not source_id.startswith("src_") or len(source_id) != 68:
+        digest = source_id.removeprefix("src_")
+        if (
+            not source_id.startswith("src_")
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
             raise UserInputError(f"invalid source identity: {source_id}")
 
         provider = create_generation_provider(provider_name, model)
         with _writer_lock(self._root):
             _recover_transactions(self._root)
-            digest = source_id.removeprefix("src_")
             object_reference = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
             record_path = self._root / "store" / "records" / f"{source_id}.json"
             if not record_path.is_file():
@@ -574,10 +617,19 @@ class KnowledgeWorkflow:
                 request=generation_request,
             )
             generated = provider.generate(generation_request)
+            allowed_citations = {
+                (item.source_id, item.locator) for item in evidence_package.items
+            }
+            if any(
+                (claim.source_id, claim.locator) not in allowed_citations
+                for claim in generated.claims
+            ):
+                raise ProviderFailure(
+                    "generated claim citation is outside the evidence package"
+                )
         return AskResult(
-            answer=generated.answer,
-            source_id=source_id,
-            locator=locator,
+            claims=generated.claims,
+            evidence=evidence_package.items,
             insufficient_evidence=generated.insufficient_evidence,
         )
 

@@ -31,6 +31,34 @@ def configure_fake_generation(library_root: Path) -> None:
     configure_generation(library_root, "fake", "deterministic-test")
 
 
+def source_locator(source_id: str, line_count: int = 1) -> str:
+    digest = source_id.removeprefix("src_")
+    return (
+        f"store/objects/sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+        f"#L1-L{line_count}"
+    )
+
+
+def grounded_response(
+    source_id: str,
+    text: str,
+    *,
+    insufficient_evidence: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "claims": [
+                {
+                    "text": text,
+                    "source_id": source_id,
+                    "locator": source_locator(source_id),
+                }
+            ],
+            "insufficient_evidence": insufficient_evidence,
+        }
+    )
+
+
 class AskFromEvidencePackageTests(unittest.TestCase):
     def test_new_library_configures_openai_as_the_first_generation_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -45,6 +73,71 @@ class AskFromEvidencePackageTests(unittest.TestCase):
             self.assertRegex(configuration, r'model = "[^\"]+"')
             self.assertNotIn("api_key", configuration.lower())
             self.assertNotIn("sk-", configuration)
+
+    def test_library_from_before_generation_config_uses_the_openai_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            library_root = temporary_root / "My Knowledge"
+            initialization = run_cli("init", "--root", str(library_root))
+            self.assertEqual(initialization.returncode, 0, initialization.stderr)
+            configuration_path = library_root / "myoutbrain.toml"
+            legacy_configuration = re.sub(
+                r'\n\[generation\]\nprovider = "openai"\nmodel = "[^"]+"\n',
+                "\n",
+                configuration_path.read_text(encoding="utf-8"),
+            )
+            configuration_path.write_text(legacy_configuration, encoding="utf-8")
+            source_path = temporary_root / "legacy.md"
+            source_path.write_text("# Legacy\n\nStill readable.\n", encoding="utf-8")
+            capture = run_cli(
+                "capture",
+                str(source_path),
+                "--sensitivity",
+                "cloud-allowed",
+                "--root",
+                str(library_root),
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
+            source_id = identity.group(0) if identity is not None else ""
+
+            result = run_cli(
+                "ask",
+                source_id,
+                "What is readable?",
+                "--allow-cloud",
+                "--root",
+                str(library_root),
+                environment={"OPENAI_API_KEY": ""},
+            )
+
+            self.assertEqual(result.returncode, 6)
+            self.assertIn("OPENAI_API_KEY", result.stderr)
+            self.assertNotIn("generation configuration", result.stderr)
+
+    def test_reinitializing_a_legacy_library_persists_generation_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root = Path(temporary_directory) / "My Knowledge"
+            library_root.mkdir()
+            configuration_path = library_root / "myoutbrain.toml"
+            configuration_path.write_text(
+                "# retained user comment\n"
+                "schema_version = 1\n"
+                "single_writer = true\n\n"
+                "[storage]\n"
+                'permanent = ["vault", "store"]\n'
+                'rebuildable = ["runtime"]\n',
+                encoding="utf-8",
+            )
+
+            result = run_cli("init", "--root", str(library_root))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            migrated = configuration_path.read_text(encoding="utf-8")
+            self.assertIn("# retained user comment", migrated)
+            self.assertIn("[generation]", migrated)
+            self.assertIn('provider = "openai"', migrated)
+            self.assertIn('model = "gpt-5-mini"', migrated)
 
     def test_creator_can_ask_a_captured_source_and_verify_the_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -70,11 +163,9 @@ class AskFromEvidencePackageTests(unittest.TestCase):
             identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
             self.assertIsNotNone(identity)
             source_id = identity.group(0) if identity is not None else ""
-            fake_response = json.dumps(
-                {
-                    "answer": "Reflection makes accumulated experience reusable.",
-                    "insufficient_evidence": False,
-                }
+            fake_response = grounded_response(
+                source_id,
+                "Reflection makes accumulated experience reusable.",
             )
 
             result = run_cli(
@@ -125,11 +216,9 @@ class AskFromEvidencePackageTests(unittest.TestCase):
                 str(library_root),
                 "--allow-cloud",
                 environment={
-                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
-                        {
-                            "answer": "It is the evidence package.",
-                            "insufficient_evidence": False,
-                        }
+                    "MYOUTBRAIN_FAKE_RESPONSE": grounded_response(
+                        source_id,
+                        "It is the evidence package.",
                     ),
                     "MYOUTBRAIN_FAKE_REQUEST_FILE": str(request_file),
                 },
@@ -187,11 +276,10 @@ class AskFromEvidencePackageTests(unittest.TestCase):
                 str(library_root),
                 "--allow-cloud",
                 environment={
-                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
-                        {
-                            "answer": "Paris.",
-                            "insufficient_evidence": True,
-                        }
+                    "MYOUTBRAIN_FAKE_RESPONSE": grounded_response(
+                        source_id,
+                        "Paris.",
+                        insufficient_evidence=True,
                     )
                 },
             )
@@ -222,8 +310,9 @@ class AskFromEvidencePackageTests(unittest.TestCase):
             identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
             self.assertIsNotNone(identity)
             source_id = identity.group(0) if identity is not None else ""
-            fake_response = json.dumps(
-                {"answer": "Current permission is required.", "insufficient_evidence": False}
+            fake_response = grounded_response(
+                source_id,
+                "Current permission is required.",
             )
             first_request = run_cli(
                 "ask",
@@ -438,9 +527,17 @@ class AskFromEvidencePackageTests(unittest.TestCase):
                         "body": body,
                     }
                 )
+                request_data = json.loads(body["input"])
+                evidence = request_data["evidence_package"]["evidence"][0]
                 structured_answer = json.dumps(
                     {
-                        "answer": "The evidence package is the smallest useful context.",
+                        "claims": [
+                            {
+                                "text": "The evidence package is the smallest useful context.",
+                                "source_id": evidence["source_id"],
+                                "locator": evidence["locator"],
+                            }
+                        ],
                         "insufficient_evidence": False,
                     }
                 )
@@ -571,6 +668,118 @@ class AskFromEvidencePackageTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 6)
             self.assertIn("OPENAI_API_KEY is not configured", result.stderr)
+
+    def test_invalid_source_identity_is_rejected_before_storage_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root = Path(temporary_directory) / "My Knowledge"
+            initialization = run_cli("init", "--root", str(library_root))
+            self.assertEqual(initialization.returncode, 0, initialization.stderr)
+            configure_fake_generation(library_root)
+            crafted_identity = "src_../../" + ("a" * 58)
+
+            result = run_cli(
+                "ask",
+                crafted_identity,
+                "Can this escape the record directory?",
+                "--root",
+                str(library_root),
+                "--allow-cloud",
+                environment={
+                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
+                        {"answer": "No.", "insufficient_evidence": False}
+                    )
+                },
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("invalid source identity", result.stderr)
+
+    def test_answer_without_claim_evidence_associations_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            library_root = temporary_root / "My Knowledge"
+            initialization = run_cli("init", "--root", str(library_root))
+            self.assertEqual(initialization.returncode, 0, initialization.stderr)
+            configure_fake_generation(library_root)
+            source_path = temporary_root / "Grounded.md"
+            source_path.write_text("Reflection makes experience reusable.\n", encoding="utf-8")
+            capture = run_cli(
+                "capture",
+                str(source_path),
+                "--root",
+                str(library_root),
+                "--sensitivity",
+                "cloud-allowed",
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
+            self.assertIsNotNone(identity)
+            source_id = identity.group(0) if identity is not None else ""
+
+            result = run_cli(
+                "ask",
+                source_id,
+                "What does reflection do?",
+                "--root",
+                str(library_root),
+                "--allow-cloud",
+                environment={
+                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
+                        {
+                            "answer": (
+                                "Reflection makes experience reusable, and the Moon is made of cheese."
+                            ),
+                            "insufficient_evidence": False,
+                        }
+                    )
+                },
+            )
+
+            self.assertEqual(result.returncode, 6)
+            self.assertIn("invalid result", result.stderr)
+            self.assertNotIn("Moon", result.stdout)
+
+    def test_claim_citation_must_belong_to_the_current_evidence_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            library_root = temporary_root / "My Knowledge"
+            initialization = run_cli("init", "--root", str(library_root))
+            self.assertEqual(initialization.returncode, 0, initialization.stderr)
+            configure_fake_generation(library_root)
+            source_path = temporary_root / "Grounded.md"
+            source_path.write_text("Reflection makes experience reusable.\n", encoding="utf-8")
+            capture = run_cli(
+                "capture",
+                str(source_path),
+                "--root",
+                str(library_root),
+                "--sensitivity",
+                "cloud-allowed",
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
+            self.assertIsNotNone(identity)
+            source_id = identity.group(0) if identity is not None else ""
+            unrelated_source_id = "src_" + ("0" * 64)
+
+            result = run_cli(
+                "ask",
+                source_id,
+                "What does reflection do?",
+                "--root",
+                str(library_root),
+                "--allow-cloud",
+                environment={
+                    "MYOUTBRAIN_FAKE_RESPONSE": grounded_response(
+                        unrelated_source_id,
+                        "The Moon is made of cheese.",
+                    )
+                },
+            )
+
+            self.assertEqual(result.returncode, 6)
+            self.assertIn("citation is outside the evidence package", result.stderr)
+            self.assertNotIn("Moon", result.stdout)
 
 
 if __name__ == "__main__":

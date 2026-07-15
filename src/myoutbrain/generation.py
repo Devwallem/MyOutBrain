@@ -61,8 +61,15 @@ class GenerationRequest:
 
 
 @dataclass(frozen=True)
+class GeneratedClaim:
+    text: str
+    source_id: str
+    locator: str
+
+
+@dataclass(frozen=True)
 class GeneratedAnswer:
-    answer: str
+    claims: tuple[GeneratedClaim, ...]
     insufficient_evidence: bool
 
 
@@ -128,10 +135,22 @@ class OpenAIGenerationProvider:
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "answer": {"type": "string"},
+                            "claims": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {"type": "string"},
+                                        "source_id": {"type": "string"},
+                                        "locator": {"type": "string"},
+                                    },
+                                    "required": ["text", "source_id", "locator"],
+                                    "additionalProperties": False,
+                                },
+                            },
                             "insufficient_evidence": {"type": "boolean"},
                         },
-                        "required": ["answer", "insufficient_evidence"],
+                        "required": ["claims", "insufficient_evidence"],
                         "additionalProperties": False,
                     },
                 }
@@ -189,13 +208,29 @@ class OpenAIGenerationProvider:
 def _parse_generated_answer(response: object) -> GeneratedAnswer:
     if not isinstance(response, dict):
         raise TypeError("generated answer is not an object")
-    answer = response["answer"]
+    claims_data = response["claims"]
     insufficient_evidence = response["insufficient_evidence"]
-    if not isinstance(answer, str) or not answer.strip():
-        raise TypeError("answer must be nonblank text")
+    if not isinstance(claims_data, list):
+        raise TypeError("claims must be a list")
     if not isinstance(insufficient_evidence, bool):
         raise TypeError("insufficient_evidence must be boolean")
-    return GeneratedAnswer(answer=answer, insufficient_evidence=insufficient_evidence)
+    claims: list[GeneratedClaim] = []
+    for claim_data in claims_data:
+        if not isinstance(claim_data, dict):
+            raise TypeError("claim must be an object")
+        text = claim_data.get("text")
+        source_id = claim_data.get("source_id")
+        locator = claim_data.get("locator")
+        if not isinstance(text, str) or not text.strip():
+            raise TypeError("claim text must be nonblank")
+        if not isinstance(source_id, str) or not source_id:
+            raise TypeError("claim source identity is invalid")
+        if not isinstance(locator, str) or not locator:
+            raise TypeError("claim locator is invalid")
+        claims.append(GeneratedClaim(text=text, source_id=source_id, locator=locator))
+    if not insufficient_evidence and not claims:
+        raise TypeError("answerable result must contain at least one claim")
+    return GeneratedAnswer(claims=tuple(claims), insufficient_evidence=insufficient_evidence)
 
 
 def create_generation_provider(provider_name: str, model: str) -> GenerationProvider:
