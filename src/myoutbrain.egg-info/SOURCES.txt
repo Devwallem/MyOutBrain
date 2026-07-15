@@ -1,0 +1,10 @@
+pyproject.toml
+src/myoutbrain/__init__.py
+src/myoutbrain/__main__.py
+src/myoutbrain/cli.py
+src/myoutbrain.egg-info/PKG-INFO
+src/myoutbrain.egg-info/SOURCES.txt
+src/myoutbrain.egg-info/dependency_links.txt
+src/myoutbrain.egg-info/entry_points.txt
+src/myoutbrain.egg-info/top_level.txt
+tests/test_cli_init.py

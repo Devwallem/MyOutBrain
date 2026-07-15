@@ -1,0 +1,6 @@
+schema_version = 1
+single_writer = true
+
+[storage]
+permanent = ["vault", "store"]
+rebuildable = ["runtime"]

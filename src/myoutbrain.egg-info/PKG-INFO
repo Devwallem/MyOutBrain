@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: myoutbrain
+Version: 0.1.0
+Summary: A local-first personal cognitive library.
+Requires-Python: >=3.13

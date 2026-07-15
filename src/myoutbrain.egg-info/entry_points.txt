@@ -1,0 +1,2 @@
+[console_scripts]
+myoutbrain = myoutbrain.cli:main
