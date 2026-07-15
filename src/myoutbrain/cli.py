@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import tomllib
 
 
 INITIAL_DIRECTORIES = (
@@ -27,22 +28,16 @@ INITIAL_DIRECTORIES = (
     "runtime/logs",
 )
 
-INITIAL_CONFIGURATION = """schema_version = 1
-single_writer = true
-
-[storage]
-permanent = ["vault", "store"]
-rebuildable = ["runtime"]
-"""
+SCHEMA_VERSION = 1
+PERMANENT_STORAGE = ("vault", "store")
+REBUILDABLE_STORAGE = ("runtime",)
 
 EXIT_CONFIGURATION = 3
 EXIT_LOCKED = 4
 EXIT_IO = 5
 
-GIT_IGNORE_BLOCK = """# MyOutBrain machine data
-/store/objects/
-/runtime/
-"""
+GIT_IGNORE_MARKER = "# MyOutBrain machine data"
+GIT_IGNORE_RULES = ("/store/objects/", "/runtime/")
 
 
 class ConfigurationConflict(Exception):
@@ -51,6 +46,18 @@ class ConfigurationConflict(Exception):
 
 class WriterLocked(Exception):
     """Raised when another writer already owns the project lock."""
+
+
+def render_initial_configuration() -> str:
+    permanent = ", ".join(f'"{name}"' for name in PERMANENT_STORAGE)
+    rebuildable = ", ".join(f'"{name}"' for name in REBUILDABLE_STORAGE)
+    return (
+        f"schema_version = {SCHEMA_VERSION}\n"
+        "single_writer = true\n\n"
+        "[storage]\n"
+        f"permanent = [{permanent}]\n"
+        f"rebuildable = [{rebuildable}]\n"
+    )
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -72,6 +79,38 @@ def atomic_write_text(path: Path, content: str) -> None:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def with_required_git_ignore_rules(existing_content: str) -> str:
+    existing_lines = set(existing_content.splitlines())
+    additions: list[str] = []
+    if GIT_IGNORE_MARKER not in existing_lines:
+        additions.append(GIT_IGNORE_MARKER)
+    additions.extend(rule for rule in GIT_IGNORE_RULES if rule not in existing_lines)
+    if not additions:
+        return existing_content
+    separator = "" if not existing_content or existing_content.endswith("\n") else "\n"
+    return f"{existing_content}{separator}{'\n'.join(additions)}\n"
+
+
+def validate_configuration(path: Path) -> None:
+    try:
+        with path.open("rb") as configuration_file:
+            configuration = tomllib.load(configuration_file)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigurationConflict(f"invalid configuration: {path}") from error
+
+    if configuration.get("schema_version") != SCHEMA_VERSION:
+        raise ConfigurationConflict("unsupported schema_version in existing configuration")
+    if configuration.get("single_writer") is not True:
+        raise ConfigurationConflict("existing configuration must enable single_writer")
+    storage = configuration.get("storage")
+    if not isinstance(storage, dict):
+        raise ConfigurationConflict("existing configuration is missing storage classification")
+    if storage.get("permanent") != list(PERMANENT_STORAGE):
+        raise ConfigurationConflict("existing configuration has an invalid permanent storage classification")
+    if storage.get("rebuildable") != list(REBUILDABLE_STORAGE):
+        raise ConfigurationConflict("existing configuration has an invalid rebuildable storage classification")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,17 +144,19 @@ def initialize(root: Path) -> int:
 
     try:
         os.write(lock_descriptor, str(os.getpid()).encode("ascii"))
+        try:
+            existing_git_ignore = git_ignore.read_text(encoding="utf-8") if git_ignore.exists() else ""
+        except UnicodeError as error:
+            raise ConfigurationConflict(f"Git ignore file is not valid UTF-8: {git_ignore}") from error
+        if configuration.exists():
+            validate_configuration(configuration)
         for relative_path in INITIAL_DIRECTORIES:
             (root / relative_path).mkdir(parents=True, exist_ok=True)
-        existing_git_ignore = git_ignore.read_text(encoding="utf-8") if git_ignore.exists() else ""
-        if "# MyOutBrain machine data" not in existing_git_ignore:
-            separator = "" if not existing_git_ignore or existing_git_ignore.endswith("\n") else "\n"
-            atomic_write_text(
-                git_ignore,
-                f"{existing_git_ignore}{separator}{GIT_IGNORE_BLOCK}",
-            )
+        updated_git_ignore = with_required_git_ignore_rules(existing_git_ignore)
+        if updated_git_ignore != existing_git_ignore:
+            atomic_write_text(git_ignore, updated_git_ignore)
         if not configuration.exists():
-            atomic_write_text(configuration, INITIAL_CONFIGURATION)
+            atomic_write_text(configuration, render_initial_configuration())
     finally:
         os.close(lock_descriptor)
         lock_path.unlink(missing_ok=True)

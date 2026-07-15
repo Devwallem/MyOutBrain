@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .mypy_cache/
+*.egg-info/
 
 # MyOutBrain machine data
 /store/objects/

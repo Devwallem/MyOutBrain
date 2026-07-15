@@ -108,6 +108,57 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
             self.assertNotIn("/store/\n", rules)
             self.assertNotIn("/vault/", rules)
 
+    def test_initialization_repairs_an_incomplete_managed_git_ignore_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root = Path(temporary_directory) / "My Knowledge"
+            library_root.mkdir()
+            git_ignore = library_root / ".gitignore"
+            git_ignore.write_text(
+                "# MyOutBrain machine data\n/runtime/\n",
+                encoding="utf-8",
+            )
+
+            result = run_cli("init", "--root", str(library_root))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rules = git_ignore.read_text(encoding="utf-8")
+            self.assertEqual(rules.count("# MyOutBrain machine data"), 1)
+            self.assertEqual(rules.count("/store/objects/"), 1)
+            self.assertEqual(rules.count("/runtime/"), 1)
+
+    def test_unreadable_git_ignore_is_rejected_before_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root = Path(temporary_directory) / "My Knowledge"
+            library_root.mkdir()
+            (library_root / ".gitignore").write_bytes(b"\xff")
+
+            result = run_cli("init", "--root", str(library_root))
+
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("Configuration conflict", result.stderr)
+            self.assertFalse((library_root / "vault").exists())
+            self.assertFalse((library_root / "store").exists())
+            self.assertFalse((library_root / "runtime").exists())
+            self.assertFalse((library_root / "myoutbrain.toml").exists())
+
+    def test_invalid_existing_configuration_is_rejected_before_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root = Path(temporary_directory) / "My Knowledge"
+            library_root.mkdir()
+            (library_root / "myoutbrain.toml").write_text(
+                "schema_version = 99\n",
+                encoding="utf-8",
+            )
+
+            result = run_cli("init", "--root", str(library_root))
+
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("Configuration conflict", result.stderr)
+            self.assertIn("schema_version", result.stderr)
+            self.assertFalse((library_root / "vault").exists())
+            self.assertFalse((library_root / "store").exists())
+            self.assertFalse((library_root / "runtime").exists())
+
     def test_missing_obsidian_cli_produces_actionable_windows_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             library_root = Path(temporary_directory) / "My Knowledge"
