@@ -14,12 +14,14 @@ from myoutbrain.library import (
     UserInputError,
     WriterLocked,
 )
+from myoutbrain.generation import ProviderFailure
 
 
 EXIT_USER = 2
 EXIT_CONFIGURATION = 3
 EXIT_LOCKED = 4
 EXIT_IO = 5
+EXIT_PROVIDER = 6
 EXIT_INTEGRITY = 7
 
 
@@ -36,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("local-only", "cloud-allowed"),
     )
+    ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
+    ask_parser.add_argument("source_id")
+    ask_parser.add_argument("question")
+    ask_parser.add_argument("--root", type=Path, default=Path.cwd())
+    ask_parser.add_argument("--allow-cloud", action="store_true")
     return parser
 
 
@@ -61,6 +68,16 @@ def _capture(root: Path, source: Path, sensitivity: Sensitivity) -> int:
     return 0
 
 
+def _ask(root: Path, source_id: str, question: str, allow_cloud: bool) -> int:
+    result = KnowledgeWorkflow(root).ask(source_id, question, allow_cloud=allow_cloud)
+    if result.insufficient_evidence:
+        print("Insufficient evidence: the captured source does not answer this question.")
+    else:
+        print(result.answer)
+    print(f"Evidence: [{result.source_id} @ {result.locator}]")
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     parsed_arguments = build_parser().parse_args(arguments)
     try:
@@ -72,6 +89,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.source,
                 parsed_arguments.sensitivity,
             )
+        if parsed_arguments.command == "ask":
+            return _ask(
+                parsed_arguments.root,
+                parsed_arguments.source_id,
+                parsed_arguments.question,
+                parsed_arguments.allow_cloud,
+            )
     except UserInputError as error:
         print(f"Invalid source: {error}", file=sys.stderr)
         return EXIT_USER
@@ -81,6 +105,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except WriterLocked:
         print("Another MyOutBrain writer is active.", file=sys.stderr)
         return EXIT_LOCKED
+    except ProviderFailure as error:
+        print(f"Provider failure: {error}", file=sys.stderr)
+        return EXIT_PROVIDER
     except IntegrityError as error:
         print(f"Integrity failure: {error}", file=sys.stderr)
         return EXIT_INTEGRITY

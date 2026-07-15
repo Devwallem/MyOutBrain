@@ -16,6 +16,15 @@ import tomllib
 from typing import Literal
 import uuid
 
+from myoutbrain.generation import (
+    CloudAuthorization,
+    EvidenceItem,
+    EvidencePackage,
+    GenerationRequest,
+    ProviderFailure,
+    create_generation_provider,
+)
+
 
 Sensitivity = Literal["local-only", "cloud-allowed"]
 CaptureDisposition = Literal[
@@ -71,6 +80,14 @@ class WriterLocked(Exception):
 class CaptureResult:
     source_id: str
     disposition: CaptureDisposition
+
+
+@dataclass(frozen=True)
+class AskResult:
+    answer: str
+    source_id: str
+    locator: str
+    insufficient_evidence: bool
 
 
 @dataclass(frozen=True)
@@ -200,6 +217,9 @@ def _render_initial_configuration() -> str:
         "[storage]\n"
         f"permanent = [{permanent}]\n"
         f"rebuildable = [{rebuildable}]\n"
+        "\n[generation]\n"
+        'provider = "openai"\n'
+        'model = "gpt-5-mini"\n'
     )
 
 
@@ -390,6 +410,24 @@ def _validate_configuration(path: Path) -> None:
         raise ConfigurationConflict("existing configuration has an invalid rebuildable storage classification")
 
 
+def _generation_configuration(path: Path) -> tuple[str, str]:
+    try:
+        with path.open("rb") as configuration_file:
+            configuration = tomllib.load(configuration_file)
+        generation = configuration.get("generation")
+        if not isinstance(generation, dict):
+            raise TypeError("generation configuration is missing")
+        provider = generation.get("provider")
+        model = generation.get("model")
+        if not isinstance(provider, str) or not provider:
+            raise TypeError("generation provider is invalid")
+        if not isinstance(model, str) or not model:
+            raise TypeError("generation model is invalid")
+    except (OSError, tomllib.TOMLDecodeError, TypeError) as error:
+        raise ConfigurationConflict(f"invalid generation configuration: {path}") from error
+    return provider, model
+
+
 def _read_source(source_path: Path) -> bytes:
     if not source_path.exists():
         raise UserInputError(f"source does not exist: {source_path}")
@@ -471,6 +509,108 @@ class KnowledgeWorkflow:
                 source_id=source_id,
             )
         return CaptureResult(source_id=source_id, disposition=disposition)
+
+    def ask(self, source_id: str, question: str, *, allow_cloud: bool) -> AskResult:
+        configuration = self._root / "myoutbrain.toml"
+        if not configuration.is_file():
+            raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
+        _validate_configuration(configuration)
+        provider_name, model = _generation_configuration(configuration)
+        if not question.strip():
+            raise UserInputError("question must not be blank")
+        if not allow_cloud:
+            raise UserInputError("this request requires explicit --allow-cloud authorization")
+        if not source_id.startswith("src_") or len(source_id) != 68:
+            raise UserInputError(f"invalid source identity: {source_id}")
+
+        provider = create_generation_provider(provider_name, model)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            digest = source_id.removeprefix("src_")
+            object_reference = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+            record_path = self._root / "store" / "records" / f"{source_id}.json"
+            if not record_path.is_file():
+                raise UserInputError(f"source does not exist: {source_id}")
+            record = SourceRecord.load(
+                record_path,
+                expected_source_id=source_id,
+                expected_digest=digest,
+                expected_object_reference=object_reference,
+            )
+            if record.sensitivity != "cloud-allowed":
+                raise UserInputError(f"source is not eligible for cloud generation: {source_id}")
+
+            object_path = self._root / "store" / "objects" / object_reference
+            try:
+                source_bytes = object_path.read_bytes()
+            except OSError as error:
+                raise IntegrityError(f"cannot read source object: {object_path}") from error
+            if hashlib.sha256(source_bytes).hexdigest() != digest:
+                raise IntegrityError(f"source object does not match its content address: {object_path}")
+            try:
+                source_content = source_bytes.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise IntegrityError(f"source object is not valid UTF-8: {object_path}") from error
+            line_count = max(1, len(source_content.splitlines()))
+            locator = f"store/objects/{object_reference}#L1-L{line_count}"
+            evidence_package = EvidencePackage(
+                question=question,
+                items=(
+                    EvidenceItem(
+                        source_id=source_id,
+                        locator=locator,
+                        content=source_content,
+                    ),
+                ),
+            )
+            generation_request = GenerationRequest(
+                purpose="answer-question",
+                authorization=CloudAuthorization(allow_cloud=allow_cloud),
+                evidence_package=evidence_package,
+            )
+            self._record_external_call(
+                provider=provider.name,
+                model=provider.model,
+                request=generation_request,
+            )
+            generated = provider.generate(generation_request)
+        return AskResult(
+            answer=generated.answer,
+            source_id=source_id,
+            locator=locator,
+            insufficient_evidence=generated.insufficient_evidence,
+        )
+
+    def _record_external_call(
+        self,
+        *,
+        provider: str,
+        model: str,
+        request: GenerationRequest,
+    ) -> None:
+        serialized_request = json.dumps(
+            request.to_data(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        event = {
+            "id": f"evt_{uuid.uuid4().hex}",
+            "type": "model.external_call",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "provider": provider,
+            "model": model,
+            "purpose": request.purpose,
+            "source_ids": [item.source_id for item in request.evidence_package.items],
+            "request_fingerprint": f"sha256:{hashlib.sha256(serialized_request).hexdigest()}",
+        }
+        journal_path = self._root / "store" / "journal" / "events.jsonl"
+        try:
+            existing_journal = journal_path.read_bytes() if journal_path.exists() else b""
+        except OSError as error:
+            raise IntegrityError(f"cannot read event journal: {journal_path}") from error
+        event_line = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+        _atomic_commit(self._root, [(journal_path, existing_journal + event_line)])
 
     def _commit_capture(
         self,
