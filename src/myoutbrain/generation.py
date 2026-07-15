@@ -13,15 +13,22 @@ class ProviderFailure(Exception):
 
 
 @dataclass(frozen=True)
-class EvidenceItem:
+class Citation:
     source_id: str
     locator: str
+
+    def to_data(self) -> dict[str, str]:
+        return {"source_id": self.source_id, "locator": self.locator}
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    citation: Citation
     content: str
 
     def to_data(self) -> dict[str, str]:
         return {
-            "source_id": self.source_id,
-            "locator": self.locator,
+            **self.citation.to_data(),
             "content": self.content,
         }
 
@@ -63,8 +70,7 @@ class GenerationRequest:
 @dataclass(frozen=True)
 class GeneratedClaim:
     text: str
-    source_id: str
-    locator: str
+    citation: Citation
 
 
 @dataclass(frozen=True)
@@ -227,7 +233,12 @@ def _parse_generated_answer(response: object) -> GeneratedAnswer:
             raise TypeError("claim source identity is invalid")
         if not isinstance(locator, str) or not locator:
             raise TypeError("claim locator is invalid")
-        claims.append(GeneratedClaim(text=text, source_id=source_id, locator=locator))
+        claims.append(
+            GeneratedClaim(
+                text=text,
+                citation=Citation(source_id=source_id, locator=locator),
+            )
+        )
     if not insufficient_evidence and not claims:
         raise TypeError("answerable result must contain at least one claim")
     return GeneratedAnswer(claims=tuple(claims), insufficient_evidence=insufficient_evidence)

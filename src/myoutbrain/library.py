@@ -17,6 +17,7 @@ from typing import Literal
 import uuid
 
 from myoutbrain.generation import (
+    Citation,
     CloudAuthorization,
     EvidenceItem,
     EvidencePackage,
@@ -600,8 +601,7 @@ class KnowledgeWorkflow:
                 question=question,
                 items=(
                     EvidenceItem(
-                        source_id=source_id,
-                        locator=locator,
+                        citation=Citation(source_id=source_id, locator=locator),
                         content=source_content,
                     ),
                 ),
@@ -617,13 +617,8 @@ class KnowledgeWorkflow:
                 request=generation_request,
             )
             generated = provider.generate(generation_request)
-            allowed_citations = {
-                (item.source_id, item.locator) for item in evidence_package.items
-            }
-            if any(
-                (claim.source_id, claim.locator) not in allowed_citations
-                for claim in generated.claims
-            ):
+            allowed_citations = {item.citation for item in evidence_package.items}
+            if any(claim.citation not in allowed_citations for claim in generated.claims):
                 raise ProviderFailure(
                     "generated claim citation is outside the evidence package"
                 )
@@ -653,7 +648,9 @@ class KnowledgeWorkflow:
             "provider": provider,
             "model": model,
             "purpose": request.purpose,
-            "source_ids": [item.source_id for item in request.evidence_package.items],
+            "source_ids": [
+                item.citation.source_id for item in request.evidence_package.items
+            ],
             "request_fingerprint": f"sha256:{hashlib.sha256(serialized_request).hexdigest()}",
         }
         journal_path = self._root / "store" / "journal" / "events.jsonl"

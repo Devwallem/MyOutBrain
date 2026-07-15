@@ -73,10 +73,16 @@ def _ask(root: Path, source_id: str, question: str, allow_cloud: bool) -> int:
     if result.insufficient_evidence:
         print("Insufficient evidence: the captured source does not answer this question.")
         for evidence in result.evidence:
-            print(f"Evidence checked: [{evidence.source_id} @ {evidence.locator}]")
+            print(
+                "Evidence checked: "
+                f"[{evidence.citation.source_id} @ {evidence.citation.locator}]"
+            )
     else:
         for claim in result.claims:
-            print(f"{claim.text} [{claim.source_id} @ {claim.locator}]")
+            print(
+                f"{claim.text} "
+                f"[{claim.citation.source_id} @ {claim.citation.locator}]"
+            )
     return 0
 
 
