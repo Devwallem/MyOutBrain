@@ -14,14 +14,23 @@ import unittest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def cli_invocation(
+    arguments: tuple[str, ...],
+    environment: dict[str, str] | None,
+) -> tuple[list[str], dict[str, str]]:
     command_environment = os.environ.copy()
     command_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
     if environment is not None:
         command_environment.update(environment)
+    command = [sys.executable, "-m", "myoutbrain", *arguments]
+    return command, command_environment
+
+
+def run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    command, command_environment = cli_invocation(arguments, environment)
 
     return subprocess.run(
-        [sys.executable, "-m", "myoutbrain", *arguments],
+        command,
         cwd=PROJECT_ROOT,
         env=command_environment,
         capture_output=True,
@@ -34,12 +43,9 @@ def start_cli(
     *arguments: str,
     environment: dict[str, str] | None = None,
 ) -> subprocess.Popen[str]:
-    command_environment = os.environ.copy()
-    command_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
-    if environment is not None:
-        command_environment.update(environment)
+    command, command_environment = cli_invocation(arguments, environment)
     return subprocess.Popen(
-        [sys.executable, "-m", "myoutbrain", *arguments],
+        command,
         cwd=PROJECT_ROOT,
         env=command_environment,
         stdout=subprocess.PIPE,
