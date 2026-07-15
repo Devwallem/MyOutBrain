@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -27,6 +28,38 @@ def run_cli(*arguments: str, environment: dict[str, str] | None = None) -> subpr
         text=True,
         check=False,
     )
+
+
+def start_cli(
+    *arguments: str,
+    environment: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
+    command_environment = os.environ.copy()
+    command_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    if environment is not None:
+        command_environment.update(environment)
+    return subprocess.Popen(
+        [sys.executable, "-m", "myoutbrain", *arguments],
+        cwd=PROJECT_ROOT,
+        env=command_environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def wait_until_lock_is_held(ready_file: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            if ready_file.read_text(encoding="ascii").strip():
+                return
+        except (FileNotFoundError, UnicodeError, OSError):
+            pass
+        time.sleep(0.01)
+    process.kill()
+    stdout, stderr = process.communicate()
+    raise AssertionError(f"Writer never acquired the lock. stdout={stdout!r}, stderr={stderr!r}")
 
 
 class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
@@ -181,17 +214,29 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
 
     def test_active_writer_lock_rejects_initialization_without_partial_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            library_root = Path(temporary_directory) / "My Knowledge"
-            library_root.mkdir()
-            (library_root / ".myoutbrain.lock").write_text("another writer", encoding="utf-8")
+            temporary_root = Path(temporary_directory)
+            library_root = temporary_root / "My Knowledge"
+            ready_file = temporary_root / "init-lock-ready"
+            first_writer = start_cli(
+                "init",
+                "--root",
+                str(library_root),
+                environment={
+                    "MYOUTBRAIN_FAULT_INJECTION": "hold-writer-lock",
+                    "MYOUTBRAIN_HOLD_SECONDS": "1",
+                    "MYOUTBRAIN_LOCK_READY_FILE": str(ready_file),
+                },
+            )
+            wait_until_lock_is_held(ready_file, first_writer)
 
-            result = run_cli("init", "--root", str(library_root))
+            competing_result = run_cli("init", "--root", str(library_root))
+            first_stdout, first_stderr = first_writer.communicate(timeout=5)
 
-            self.assertEqual(result.returncode, 4)
-            self.assertIn("Another MyOutBrain writer is active", result.stderr)
-            self.assertFalse((library_root / "vault").exists())
-            self.assertFalse((library_root / "runtime").exists())
-            self.assertFalse((library_root / "myoutbrain.toml").exists())
+            self.assertEqual(competing_result.returncode, 4)
+            self.assertIn("Another MyOutBrain writer is active", competing_result.stderr)
+            self.assertEqual(first_writer.returncode, 0, first_stderr)
+            self.assertIn("Initialized MyOutBrain", first_stdout)
+            self.assertTrue((library_root / "myoutbrain.toml").is_file())
 
 
 class CaptureMarkdownSourceTests(unittest.TestCase):
@@ -403,7 +448,7 @@ class CaptureMarkdownSourceTests(unittest.TestCase):
                 self.assertEqual(tuple((library_root / "store" / "records").iterdir()), ())
                 self.assertEqual(tuple((library_root / "store" / "journal").iterdir()), ())
 
-    def test_active_writer_lock_rejects_capture_without_partial_changes(self) -> None:
+    def test_competing_captures_allow_exactly_one_writer_to_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             library_root = temporary_root / "My Knowledge"
@@ -411,10 +456,23 @@ class CaptureMarkdownSourceTests(unittest.TestCase):
             self.assertEqual(initialization.returncode, 0, initialization.stderr)
             source_path = temporary_root / "Reflection.md"
             source_path.write_text("Only one writer may capture this.\n", encoding="utf-8")
-            lock_path = library_root / ".myoutbrain.lock"
-            lock_path.write_text("another writer", encoding="utf-8")
+            ready_file = temporary_root / "capture-lock-ready"
+            first_writer = start_cli(
+                "capture",
+                str(source_path),
+                "--root",
+                str(library_root),
+                "--sensitivity",
+                "local-only",
+                environment={
+                    "MYOUTBRAIN_FAULT_INJECTION": "hold-writer-lock",
+                    "MYOUTBRAIN_HOLD_SECONDS": "1",
+                    "MYOUTBRAIN_LOCK_READY_FILE": str(ready_file),
+                },
+            )
+            wait_until_lock_is_held(ready_file, first_writer)
 
-            result = run_cli(
+            competing_result = run_cli(
                 "capture",
                 str(source_path),
                 "--root",
@@ -422,19 +480,31 @@ class CaptureMarkdownSourceTests(unittest.TestCase):
                 "--sensitivity",
                 "local-only",
             )
+            first_stdout, first_stderr = first_writer.communicate(timeout=5)
 
-            self.assertEqual(result.returncode, 4)
-            self.assertIn("Another MyOutBrain writer is active", result.stderr)
+            self.assertEqual(first_writer.returncode, 0, first_stderr)
+            self.assertIn("Captured source", first_stdout)
+            self.assertEqual(competing_result.returncode, 4)
+            self.assertIn("Another MyOutBrain writer is active", competing_result.stderr)
             self.assertEqual(
-                tuple(
-                    path
-                    for path in (library_root / "store" / "objects" / "sha256").rglob("*")
-                    if path.is_file()
+                len(
+                    tuple(
+                        path
+                        for path in (library_root / "store" / "objects" / "sha256").rglob("*")
+                        if path.is_file()
+                    )
                 ),
-                (),
+                1,
             )
-            self.assertEqual(tuple((library_root / "store" / "records").iterdir()), ())
-            self.assertEqual(tuple((library_root / "store" / "journal").iterdir()), ())
+            self.assertEqual(len(tuple((library_root / "store" / "records").iterdir())), 1)
+            self.assertEqual(
+                len(
+                    (library_root / "store" / "journal" / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ),
+                1,
+            )
 
     def test_interrupted_capture_restores_the_complete_previous_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -471,15 +541,16 @@ class CaptureMarkdownSourceTests(unittest.TestCase):
                 environment={"MYOUTBRAIN_FAULT_INJECTION": "capture-after-first-replace"},
             )
 
-            self.assertEqual(interrupted.returncode, 5)
-            self.assertIn("Capture failed", interrupted.stderr)
+            self.assertEqual(interrupted.returncode, 86)
+            recovery = run_cli("init", "--root", str(library_root))
+            self.assertEqual(recovery.returncode, 0, recovery.stderr)
             after = {
                 path.relative_to(library_root).as_posix(): path.read_bytes()
                 for path in (library_root / "store").rglob("*")
                 if path.is_file()
             }
             self.assertEqual(after, before)
-            self.assertFalse((library_root / ".myoutbrain.lock").exists())
+            self.assertEqual(tuple((library_root / "store" / "transactions").iterdir()), ())
 
     def test_duplicate_capture_never_loosens_existing_sensitivity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
