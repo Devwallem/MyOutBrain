@@ -7,3 +7,6 @@ __pycache__/
 # MyOutBrain machine data
 /store/objects/
 /runtime/
+/store/transactions/
+/.myoutbrain.lock
+/vault/.obsidian/

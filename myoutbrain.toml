@@ -4,3 +4,7 @@ single_writer = true
 [storage]
 permanent = ["vault", "store"]
 rebuildable = ["runtime"]
+
+[generation]
+provider = "openai"
+model = "gpt-5-mini"
