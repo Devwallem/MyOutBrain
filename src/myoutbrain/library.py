@@ -34,6 +34,11 @@ from myoutbrain.candidates import (
 )
 from myoutbrain.knowledge import DerivedInsightNote, KnowledgeNoteError
 from myoutbrain.obsidian import create_obsidian_adapter
+from myoutbrain.vault import (
+    KnowledgeTransitionError,
+    VaultIntegrityError,
+    prepare_cognition_promotion,
+)
 
 
 Sensitivity = Literal["local-only", "cloud-allowed"]
@@ -113,6 +118,13 @@ class ReflectionResult:
 @dataclass(frozen=True)
 class AcceptResult:
     knowledge_id: str
+    note_path: Path
+    warning: str | None
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    cognition_id: str
     note_path: Path
     warning: str | None
 
@@ -531,15 +543,18 @@ def _read_source(source_path: Path) -> bytes:
 
 def _event_journal_change(
     root: Path,
-    event: Mapping[str, object],
+    *events: Mapping[str, object],
 ) -> tuple[Path, bytes]:
     journal_path = root / "store" / "journal" / "events.jsonl"
     try:
         existing_journal = journal_path.read_bytes() if journal_path.exists() else b""
     except OSError as error:
         raise IntegrityError(f"cannot read event journal: {journal_path}") from error
-    event_line = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
-    return journal_path, existing_journal + event_line
+    event_lines = b"".join(
+        json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+        for event in events
+    )
+    return journal_path, existing_journal + event_lines
 
 
 class KnowledgeWorkflow:
@@ -946,6 +961,77 @@ class KnowledgeWorkflow:
         return AcceptResult(
             knowledge_id=knowledge_id,
             note_path=note_path,
+            warning=warning,
+        )
+
+    def promote_insight(
+        self,
+        insight_id: str,
+        *,
+        title: str,
+        supersedes_id: str | None = None,
+    ) -> PromotionResult:
+        configuration_path = self._root / "myoutbrain.toml"
+        if not configuration_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain is not initialized at: {self._root}"
+            )
+        _load_validated_configuration(configuration_path)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            occurred_at = datetime.now(timezone.utc)
+            cognition_id = f"cog_{uuid.uuid4().hex}"
+            try:
+                promotion = prepare_cognition_promotion(
+                    self._root / "vault",
+                    insight_id=insight_id,
+                    cognition_id=cognition_id,
+                    title=title,
+                    occurred_at=occurred_at,
+                    supersedes_id=supersedes_id,
+                )
+            except KnowledgeTransitionError as error:
+                raise UserInputError(str(error)) from error
+            except VaultIntegrityError as error:
+                raise IntegrityError(str(error)) from error
+            promotion_event: dict[str, object] = {
+                "id": f"evt_{uuid.uuid4().hex}",
+                "type": "knowledge.promoted",
+                "occurred_at": occurred_at.isoformat(),
+                "from_id": insight_id,
+                "to_id": cognition_id,
+                "actor": "user",
+            }
+            events: list[dict[str, object]] = [promotion_event]
+            if supersedes_id is not None:
+                events.append(
+                    {
+                        "id": f"evt_{uuid.uuid4().hex}",
+                        "type": "knowledge.superseded",
+                        "occurred_at": occurred_at.isoformat(),
+                        "old_id": supersedes_id,
+                        "new_id": cognition_id,
+                        "actor": "user",
+                    }
+                )
+            changes = list(promotion.changes)
+            changes.append(_event_journal_change(self._root, *events))
+            _atomic_commit(
+                self._root,
+                changes,
+                fault_injections={
+                    0: "promote-after-insight-replace",
+                    1: "promote-after-cognition-replace",
+                    2: "promote-after-superseded-replace",
+                },
+            )
+        warning = create_obsidian_adapter().open_note(
+            self._root / "vault",
+            promotion.cognition_path,
+        )
+        return PromotionResult(
+            cognition_id=cognition_id,
+            note_path=promotion.cognition_path,
             warning=warning,
         )
 

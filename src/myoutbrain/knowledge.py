@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import re
 
 from myoutbrain.candidates import CandidateRecord
 from myoutbrain.generation import Citation
+from myoutbrain.note_title import NoteTitleError, normalize_note_title
 
 
 class KnowledgeNoteError(Exception):
@@ -38,7 +38,10 @@ class DerivedInsightNote:
         sensitivity: str,
         occurred_at: datetime,
     ) -> DerivedInsightNote:
-        normalized_title = _normalize_title(title)
+        try:
+            normalized_title = normalize_note_title(title)
+        except NoteTitleError as error:
+            raise KnowledgeNoteError(str(error)) from error
         edited_text = text.strip() if text is not None else candidate.text
         if not edited_text:
             raise KnowledgeNoteError("accepted insight text must not be blank")
@@ -106,20 +109,3 @@ class DerivedInsightNote:
             f"{contrary_lines}\n"
         )
         return content.encode("utf-8")
-
-
-def _normalize_title(title: str) -> str:
-    normalized = " ".join(title.split())
-    if not normalized:
-        raise KnowledgeNoteError("knowledge note title must not be blank")
-    if normalized in {".", ".."} or re.search(r'[<>:"/\\|?*]', normalized):
-        raise KnowledgeNoteError("knowledge note title contains invalid filename characters")
-    if normalized.endswith((".", " ")):
-        raise KnowledgeNoteError("knowledge note title has an invalid filename ending")
-    if len(normalized) > 120:
-        raise KnowledgeNoteError("knowledge note title is too long")
-    return re.sub(
-        r"(?<![\w'])([^\W_])",
-        lambda match: match.group(1).upper(),
-        normalized,
-    )

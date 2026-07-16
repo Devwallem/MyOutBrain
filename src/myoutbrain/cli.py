@@ -64,6 +64,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("local-only", "cloud-allowed"),
     )
     review_parser.add_argument("--root", type=Path, default=Path.cwd())
+    promote_parser = subcommands.add_parser(
+        "promote",
+        help="Explicitly promote a derived insight to personal cognition",
+    )
+    promote_parser.add_argument("insight_id")
+    promote_parser.add_argument("--title", required=True)
+    promote_parser.add_argument("--supersedes")
+    promote_parser.add_argument("--root", type=Path, default=Path.cwd())
     return parser
 
 
@@ -217,6 +225,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.text,
                 parsed_arguments.sensitivity,
             )
+        if parsed_arguments.command == "promote":
+            result = KnowledgeWorkflow(parsed_arguments.root).promote_insight(
+                parsed_arguments.insight_id,
+                title=parsed_arguments.title,
+                supersedes_id=parsed_arguments.supersedes,
+            )
+            print(
+                f"Promoted personal cognition {result.cognition_id} "
+                f"at {result.note_path}"
+            )
+            if result.warning is not None:
+                print(f"Warning: {result.warning}", file=sys.stderr)
+            return 0
     except UserInputError as error:
         print(f"Invalid source: {error}", file=sys.stderr)
         return EXIT_USER
