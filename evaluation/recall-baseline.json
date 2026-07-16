@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "evidence": [
+    {
+      "id": "source_reflection",
+      "kind": "source",
+      "state": "active",
+      "text": "每周反思让积累的经验成为可复用知识。"
+    },
+    {
+      "id": "source_capture",
+      "kind": "source",
+      "state": "active",
+      "text": "Capture preserves original material before interpretation."
+    },
+    {
+      "id": "cognition_daily_review_old",
+      "kind": "personal-cognition",
+      "state": "superseded",
+      "text": "Daily review cadence is mandatory."
+    },
+    {
+      "id": "cognition_weekly_review",
+      "kind": "personal-cognition",
+      "state": "active",
+      "text": "Weekly review cadence protects creative focus."
+    },
+    {
+      "id": "source_review_debate",
+      "kind": "source",
+      "state": "active",
+      "text": "Some collaborators still recommend daily review cadence."
+    }
+  ],
+  "cases": [
+    {
+      "id": "answerable_reflection",
+      "category": "answerable",
+      "question": "什么能让积累经验变成可复用知识？",
+      "answerable": true,
+      "expected_evidence_ids": [
+        "source_reflection"
+      ]
+    },
+    {
+      "id": "unanswerable_interface_color",
+      "category": "unanswerable",
+      "question": "What color should the archive interface use?",
+      "answerable": false,
+      "expected_evidence_ids": []
+    },
+    {
+      "id": "conflicting_review_cadence",
+      "category": "conflicting",
+      "question": "Which review cadence is recommended?",
+      "answerable": true,
+      "expected_evidence_ids": [
+        "cognition_weekly_review",
+        "source_review_debate"
+      ]
+    },
+    {
+      "id": "superseded_review_cadence",
+      "category": "superseded",
+      "question": "What review cadence protects creative focus?",
+      "answerable": true,
+      "expected_evidence_ids": [
+        "cognition_weekly_review"
+      ]
+    }
+  ]
+}

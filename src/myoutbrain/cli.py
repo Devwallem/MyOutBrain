@@ -6,6 +6,13 @@ from pathlib import Path
 import shutil
 import sys
 
+from myoutbrain.evaluation import (
+    evaluate_recall,
+    load_recall_dataset,
+    report_has_failures,
+    report_as_json,
+    report_as_text,
+)
 from myoutbrain.library import (
     ConfigurationConflict,
     IntegrityError,
@@ -77,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rebuild runtime projections from permanent knowledge",
     )
     rebuild_parser.add_argument("--root", type=Path, default=Path.cwd())
+    evaluate_parser = subcommands.add_parser(
+        "evaluate-recall",
+        help="Evaluate evidence retrieval without generating answers",
+    )
+    evaluate_parser.add_argument("dataset", type=Path)
+    evaluate_parser.add_argument("--format", choices=("json", "text"), default="text")
     return parser
 
 
@@ -252,8 +265,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 f"{rebuild_result.supersession_count} supersession relationships."
             )
             return 0
+        if parsed_arguments.command == "evaluate-recall":
+            report = evaluate_recall(load_recall_dataset(parsed_arguments.dataset))
+            rendered_report = (
+                report_as_json(report)
+                if parsed_arguments.format == "json"
+                else report_as_text(report)
+            )
+            print(rendered_report, end="")
+            return 1 if report_has_failures(report) else 0
     except UserInputError as error:
-        print(f"Invalid source: {error}", file=sys.stderr)
+        input_name = (
+            "evaluation dataset"
+            if parsed_arguments.command == "evaluate-recall"
+            else "source"
+        )
+        print(f"Invalid {input_name}: {error}", file=sys.stderr)
         return EXIT_USER
     except ConfigurationConflict as error:
         print(f"Configuration conflict: {error}", file=sys.stderr)
@@ -268,7 +295,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(f"Integrity failure: {error}", file=sys.stderr)
         return EXIT_INTEGRITY
     except OSError as error:
-        operation = "Capture" if parsed_arguments.command == "capture" else "Initialization"
+        operation = {
+            "capture": "Capture",
+            "evaluate-recall": "Evaluation",
+        }.get(parsed_arguments.command, "Initialization")
         print(f"{operation} failed: {error}", file=sys.stderr)
         return EXIT_IO
     return EXIT_USER
