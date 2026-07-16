@@ -1,4 +1,4 @@
-"""PROTOTYPE: pure state transitions for dialogue-derived reusable experience."""
+"""原型：对话沉淀为可复用经验的纯状态转换。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class PrototypeState:
     rejected_fingerprints: frozenset[str] = frozenset()
     last_query: str = ""
     recalled_memory_ids: tuple[str, ...] = ()
-    last_event: str = "Ready. Capture a sample dialogue."
+    last_event: str = "准备就绪，请先采集一段示例对话。"
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ def capture_scenario(state: PrototypeState, scenario_key: str) -> PrototypeState
     return replace(
         state,
         turns=state.turns + captured,
-        last_event=f"Captured scenario {scenario_key} as one immutable dialogue source.",
+        last_event=f"已将场景 {scenario_key} 采集为一份不可变对话来源。",
     )
 
 
@@ -162,9 +162,9 @@ def distill(state: PrototypeState) -> PrototypeState:
             )
         )
     event = (
-        f"Distilled {len(new_drafts)} new candidate(s); duplicates and rejections stayed suppressed."
+        f"已提炼 {len(new_drafts)} 个新候选；重复项和已拒绝项继续受到抑制。"
         if new_drafts
-        else "No new reusable candidate; raw dialogue was not copied."
+        else "没有新的可复用候选；原始对话没有被重复复制。"
     )
     return replace(
         state,
@@ -178,17 +178,17 @@ def distill(state: PrototypeState) -> PrototypeState:
 
 def select_next_draft(state: PrototypeState) -> PrototypeState:
     if not state.drafts:
-        return replace(state, last_event="There is no candidate to select.")
+        return replace(state, last_event="当前没有可供选择的候选。")
     return replace(
         state,
         selected_draft=(state.selected_draft + 1) % len(state.drafts),
-        last_event="Selected the next candidate.",
+        last_event="已选择下一个候选。",
     )
 
 
 def accept_selected(state: PrototypeState) -> PrototypeState:
     if not state.drafts:
-        return replace(state, last_event="Nothing was promoted; review queue is empty.")
+        return replace(state, last_event="审阅队列为空，没有内容被接受。")
     selected = state.drafts[state.selected_draft]
     memory = MemoryArtifact(
         memory_id=f"memory_{len(state.memories) + 1:03d}",
@@ -205,13 +205,13 @@ def accept_selected(state: PrototypeState) -> PrototypeState:
         drafts=remaining,
         selected_draft=min(state.selected_draft, max(0, len(remaining) - 1)),
         memories=state.memories + (memory,),
-        last_event=f"Human accepted {memory.memory_id}; it is now recallable.",
+        last_event=f"用户已接受 {memory.memory_id}，它现在可以参与召回。",
     )
 
 
 def reject_selected(state: PrototypeState) -> PrototypeState:
     if not state.drafts:
-        return replace(state, last_event="Nothing was rejected; review queue is empty.")
+        return replace(state, last_event="审阅队列为空，没有内容被拒绝。")
     selected = state.drafts[state.selected_draft]
     remaining = state.drafts[: state.selected_draft] + state.drafts[state.selected_draft + 1 :]
     return replace(
@@ -219,7 +219,7 @@ def reject_selected(state: PrototypeState) -> PrototypeState:
         drafts=remaining,
         selected_draft=min(state.selected_draft, max(0, len(remaining) - 1)),
         rejected_fingerprints=state.rejected_fingerprints | {selected.fingerprint},
-        last_event="Human rejected the candidate; only its compact fingerprint remains.",
+        last_event="用户已拒绝该候选；系统只保留轻量指纹。",
     )
 
 
@@ -243,16 +243,16 @@ def recall(state: PrototypeState, query: str) -> PrototypeState:
         last_query=query,
         recalled_memory_ids=recalled,
         last_event=(
-            f"Recalled {len(recalled)} accepted memory artifact(s) before answering."
+            f"回答前已召回 {len(recalled)} 条经过接受的记忆产物。"
             if recalled
-            else "No accepted prior experience matched; answer without invented memory."
+            else "没有匹配的已接受经验；回答时不得虚构历史记忆。"
         ),
     )
 
 
 def selected_markdown(state: PrototypeState) -> str:
     if not state.drafts:
-        return "(no candidate selected)"
+        return "（当前没有选中的候选）"
     draft = state.drafts[state.selected_draft]
     evidence = "\n".join(f"  - {turn_id}" for turn_id in draft.evidence_turn_ids)
     return (
@@ -264,9 +264,9 @@ def selected_markdown(state: PrototypeState) -> str:
         f"{evidence}\n"
         "---\n"
         f"# {draft.title}\n\n"
-        "## When To Use\n\n"
+        "## 适用场景\n\n"
         f"{draft.trigger}\n\n"
-        "## Practice\n\n"
+        "## 实践方法\n\n"
         f"{draft.practice}"
     )
 

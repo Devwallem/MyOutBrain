@@ -1,44 +1,37 @@
-# Dialogue Learning Prototype
+# 对话沉淀与经验召回原型
 
-> PROTOTYPE — throwaway, in-memory only. Do not treat this as the production
-> conversation ingestion or memory implementation.
+> 原型——一次性实验，仅保存在内存中。不要把它当成正式的对话采集或记忆实现。
 
-## Question
+当前实验只提供简体中文界面和文档。面向 GitHub 发布时再抽取显示文案并增加多语言支持；内部稳定字段不会随显示语言变化。
 
-Can a human-gated state model turn dialogue into compact knowledge, lesson, or
-skill-like Markdown; suppress repeated extraction; and recall only accepted
-experience before a future answer, without copying the full transcript into every
-artifact or automatically promoting AI output?
+## 要回答的问题
 
-## Run
+一个由用户把关的状态模型，能否把对话转化为紧凑的知识、教训或技能型 Markdown，抑制重复提炼，并在未来回答问题前只召回已经接受的经验，同时不在每个产物中复制完整对话，也不允许 AI 自动晋升自己的输出？
+
+## 运行
 
 ```powershell
 .\.venv\Scripts\myoutbrain-dialogue-prototype.exe
 ```
 
-For a deterministic walkthrough:
+运行确定性演示：
 
 ```powershell
 .\.venv\Scripts\myoutbrain-dialogue-prototype.exe --demo
 ```
 
-If the editable install has not refreshed the script yet:
+如果可编辑安装尚未刷新命令入口：
 
 ```powershell
 .\.venv\Scripts\python.exe -m myoutbrain.dialogue_learning_prototype --demo
 ```
 
-## What To Try
+## 建议实验步骤
 
-1. Capture scenario `1`, distill with `x`, and accept the lesson with `a`.
-2. Capture scenario `3` and distill again. The repeated lesson should not create a
-   second candidate.
-3. Ask `上传 GitHub 前应该检查什么？` with `/`. Only accepted memory should appear.
-4. Restart and reject the lesson with `r`; repeated distillation should preserve
-   only a compact rejection fingerprint.
-5. Capture small talk with `4`; it should not create a reusable artifact.
+1. 按 `1` 采集 GitHub 失败场景，按 `x` 提炼，再按 `a` 接受教训。
+2. 按 `3` 采集重复场景并再次提炼；系统不应产生第二份相同教训。
+3. 按 `/` 提问 `上传 GitHub 前应该检查什么？`；只应召回已经接受的记忆。
+4. 重新启动后提炼并按 `r` 拒绝；再次提炼时只应保留轻量拒绝指纹。
+5. 按 `4` 采集普通闲聊；系统不应生成可复用产物。
 
-The experiment deliberately tests lifecycle and recall boundaries, not whether a
-language model can write a good summary. Transcript persistence, model extraction,
-privacy controls, and integration with other agents remain production design work
-after the state model is validated.
+本实验只验证生命周期、去重和召回边界，不验证语言模型能否写出高质量总结。真实对话持久化、模型提炼、隐私控制和其它智能体接入，需要在状态模型获得确认后再进入正式设计。
