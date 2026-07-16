@@ -80,7 +80,7 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
             self.assertEqual(events[0]["type"], "memory.buffered")
             self.assertNotIn(body, json.dumps(events[0]))
 
-    def test_digest_keeps_opening_topic_and_late_conclusion_without_copying_body(self) -> None:
+    def test_digest_derives_scope_without_copying_conversation_passages(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             instance_root = temporary_root / "Private Companion"
@@ -119,9 +119,14 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             receipt = json.loads(result.stdout)
             digest = receipt["digest"]
-            self.assertIn("Opening topic", digest)
-            self.assertIn("Late conclusion", digest)
+            self.assertIn("digest-quality", digest)
+            self.assertIn("codex", digest)
+            self.assertIn("current task transcript", digest)
+            self.assertIn("earlier messages unavailable", digest)
+            self.assertIn("local-only", digest)
             self.assertIn(receipt["source_id"], digest)
+            self.assertNotIn("Opening topic", digest)
+            self.assertNotIn("Late conclusion", digest)
             self.assertNotIn(body, digest)
 
     def test_extremely_short_conversation_is_referenced_without_copying_it(self) -> None:

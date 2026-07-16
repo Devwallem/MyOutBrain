@@ -240,11 +240,7 @@ class LocalMemoryCore:
             if duplicate is not None:
                 return duplicate
 
-            digest = _compact_digest(
-                body.decode("utf-8"),
-                task=metadata.task,
-                source_id=source_id,
-            )
+            digest = _compact_digest(metadata, source_id=source_id)
             digest_fingerprint = hashlib.sha256(digest.encode("utf-8")).hexdigest()
             digest_id = f"mem_{hashlib.sha256(f'{experience_id}:{digest_fingerprint}'.encode()).hexdigest()}"
             created_at = datetime.now(timezone.utc).isoformat()
@@ -510,14 +506,18 @@ def _validate_content_object(path: Path, body: bytes, digest: str) -> None:
         raise IntegrityError(f"source object does not match its content address: {path}")
 
 
-def _compact_digest(body: str, *, task: str, source_id: str) -> str:
-    normalized = " ".join(body.split())
-    evidence = f"[evidence: {source_id}]"
-    if len(normalized) < 24:
-        return f"{task}: brief exchange {evidence}"
-    excerpt_length = min(140, len(normalized) // 2)
-    opening_length = (excerpt_length + 1) // 2
-    conclusion_length = excerpt_length - opening_length
-    opening = normalized[:opening_length].rstrip()
-    conclusion = normalized[-conclusion_length:].lstrip()
-    return f"{task}: {opening} … {conclusion} {evidence}"
+def _compact_digest(metadata: ExperienceMetadata, *, source_id: str) -> str:
+    gaps = "; ".join(metadata.context_gaps)
+    return (
+        f"{_bounded(metadata.task, 80)} via {_bounded(metadata.entrance, 40)}; "
+        f"visible: {_bounded(metadata.visible_context, 100)}; "
+        f"gaps: {_bounded(gaps, 120)}; "
+        f"sensitivity: {metadata.sensitivity}; "
+        f"[evidence: {source_id}]"
+    )
+
+
+def _bounded(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 1].rstrip()}…"
