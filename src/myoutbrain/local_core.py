@@ -185,6 +185,7 @@ class LocalMemoryCore:
         occurred_at: str,
         entrance: str,
         task: str,
+        memory_digest: str,
         sensitivity: Sensitivity,
         visible_context: str,
         context_gaps: tuple[str, ...],
@@ -225,6 +226,7 @@ class LocalMemoryCore:
         object_reference = object_path.relative_to(
             self._root / "store" / "objects"
         ).as_posix()
+        digest = _validated_digest(memory_digest, body.decode("utf-8"), source_id)
 
         with writer_lock(self._root):
             hold_writer_lock_for_acceptance_test()
@@ -236,11 +238,11 @@ class LocalMemoryCore:
                 experience_id=experience_id,
                 source_id=source_id,
                 metadata=metadata,
+                expected_digest=digest,
             )
             if duplicate is not None:
                 return duplicate
 
-            digest = _compact_digest(metadata, source_id=source_id)
             digest_fingerprint = hashlib.sha256(digest.encode("utf-8")).hexdigest()
             digest_id = f"mem_{hashlib.sha256(f'{experience_id}:{digest_fingerprint}'.encode()).hexdigest()}"
             created_at = datetime.now(timezone.utc).isoformat()
@@ -304,6 +306,7 @@ class LocalMemoryCore:
         experience_id: str,
         source_id: str,
         metadata: ExperienceMetadata,
+        expected_digest: str,
     ) -> BufferedMemoryReceipt | None:
         try:
             with closing(sqlite3.connect(database_path)) as connection:
@@ -322,6 +325,10 @@ class LocalMemoryCore:
         digest_id, digest = row
         if not isinstance(digest_id, str) or not isinstance(digest, str):
             raise IntegrityError("buffered memory has invalid persisted fields")
+        if digest != expected_digest:
+            raise UserInputError(
+                "this experience already has a different buffered-memory digest"
+            )
         return BufferedMemoryReceipt(
             source_id=source_id,
             experience_id=experience_id,
@@ -506,18 +513,13 @@ def _validate_content_object(path: Path, body: bytes, digest: str) -> None:
         raise IntegrityError(f"source object does not match its content address: {path}")
 
 
-def _compact_digest(metadata: ExperienceMetadata, *, source_id: str) -> str:
-    gaps = "; ".join(metadata.context_gaps)
-    return (
-        f"{_bounded(metadata.task, 80)} via {_bounded(metadata.entrance, 40)}; "
-        f"visible: {_bounded(metadata.visible_context, 100)}; "
-        f"gaps: {_bounded(gaps, 120)}; "
-        f"sensitivity: {metadata.sensitivity}; "
-        f"[evidence: {source_id}]"
-    )
-
-
-def _bounded(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return f"{value[: limit - 1].rstrip()}…"
+def _validated_digest(value: str, body: str, source_id: str) -> str:
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise UserInputError("memory digest must not be blank")
+    if len(normalized) > 500:
+        raise UserInputError("memory digest must not exceed 500 characters")
+    normalized_body = " ".join(body.split())
+    if normalized_body.casefold() in normalized.casefold():
+        raise UserInputError("memory digest must not copy the complete conversation")
+    return f"{normalized} [evidence: {source_id}]"

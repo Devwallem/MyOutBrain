@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     remember_parser.add_argument("--entrance", required=True)
     remember_parser.add_argument("--task", required=True)
     remember_parser.add_argument(
+        "--digest",
+        required=True,
+        help="Compact semantic memory derived by the submitting entrance",
+    )
+    remember_parser.add_argument(
         "--sensitivity",
         required=True,
         choices=("local-only", "cloud-allowed"),
@@ -140,6 +145,7 @@ def _remember(
     occurred_at: str,
     entrance: str,
     task: str,
+    digest: str,
     sensitivity: Sensitivity,
     visible_context: str,
     context_gaps: Sequence[str],
@@ -150,6 +156,7 @@ def _remember(
         occurred_at=occurred_at,
         entrance=entrance,
         task=task,
+        memory_digest=digest,
         sensitivity=sensitivity,
         visible_context=visible_context,
         context_gaps=tuple(context_gaps),
@@ -277,6 +284,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 occurred_at=parsed_arguments.occurred_at,
                 entrance=parsed_arguments.entrance,
                 task=parsed_arguments.task,
+                digest=parsed_arguments.digest,
                 sensitivity=parsed_arguments.sensitivity,
                 visible_context=parsed_arguments.visible_context,
                 context_gaps=parsed_arguments.context_gap,

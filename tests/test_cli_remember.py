@@ -33,6 +33,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "codex",
                 "--task",
                 "implement-01",
+                "--digest",
+                "Explicit context gaps prevent false claims of remembered history.",
                 "--sensitivity",
                 "local-only",
                 "--visible-context",
@@ -80,7 +82,7 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
             self.assertEqual(events[0]["type"], "memory.buffered")
             self.assertNotIn(body, json.dumps(events[0]))
 
-    def test_digest_derives_scope_without_copying_conversation_passages(self) -> None:
+    def test_semantic_digest_references_source_without_copying_conversation_passages(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             instance_root = temporary_root / "Private Companion"
@@ -106,6 +108,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "codex",
                 "--task",
                 "digest-quality",
+                "--digest",
+                "Explicit blind spots keep the companion honest about remembered context.",
                 "--sensitivity",
                 "local-only",
                 "--visible-context",
@@ -119,11 +123,7 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             receipt = json.loads(result.stdout)
             digest = receipt["digest"]
-            self.assertIn("digest-quality", digest)
-            self.assertIn("codex", digest)
-            self.assertIn("current task transcript", digest)
-            self.assertIn("earlier messages unavailable", digest)
-            self.assertIn("local-only", digest)
+            self.assertIn("Explicit blind spots", digest)
             self.assertIn(receipt["source_id"], digest)
             self.assertNotIn("Opening topic", digest)
             self.assertNotIn("Late conclusion", digest)
@@ -149,6 +149,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "cli",
                 "--task",
                 "brief-confirmation",
+                "--digest",
+                "The user gave a brief confirmation.",
                 "--sensitivity",
                 "local-only",
                 "--visible-context",
@@ -185,6 +187,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "2026-07-17T10:00:00+08:00",
                 "--sensitivity",
                 "cloud-allowed",
+                "--digest",
+                "One source can support separate task-scoped experiences.",
                 "--visible-context",
                 "the current conversation",
                 "--context-gap",
@@ -249,6 +253,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "codex",
                 "--task",
                 "retry-safe-capture",
+                "--digest",
+                "Exact retries must not multiply buffered memory.",
                 "--sensitivity",
                 "local-only",
                 "--visible-context",
@@ -299,6 +305,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                 "codex",
                 "--task",
                 "transactional-capture",
+                "--digest",
+                "Source, relation, digest, and audit must commit together.",
                 "--sensitivity",
                 "local-only",
                 "--visible-context",
@@ -369,6 +377,8 @@ class CaptureBufferedMemoryTests(unittest.TestCase):
                     "codex",
                     "--task",
                     "validation",
+                    "--digest",
+                    "Potential memory digest.",
                     "--sensitivity",
                     "local-only",
                     "--visible-context",
