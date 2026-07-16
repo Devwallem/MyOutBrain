@@ -7,20 +7,14 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+from typing import Any
 import unittest
 
 from tests.cli_support import run_cli
 
 
 def configure_fake_generation(library_root: Path) -> None:
-    configuration_path = library_root / "myoutbrain.toml"
-    configuration = configuration_path.read_text(encoding="utf-8")
-    configuration = re.sub(
-        r'\[generation\]\nprovider = "[^"]+"\nmodel = "[^"]+"',
-        '[generation]\nprovider = "fake"\nmodel = "deterministic-test"',
-        configuration,
-    )
-    configuration_path.write_text(configuration, encoding="utf-8")
+    configure_generation(library_root, "fake", "deterministic-test")
 
 
 def configure_generation(library_root: Path, provider: str, model: str) -> None:
@@ -67,11 +61,19 @@ def initialize_cloud_source(temporary_root: Path) -> tuple[Path, str]:
 
 
 def reflection_response(source_id: str) -> str:
+    return candidate_response(
+        source_id,
+        "Reflection turns experience into reusable guidance.",
+        "Generalizes the source.",
+    )
+
+
+def candidate_response(source_id: str, text: str, derivation: str) -> str:
     return json.dumps(
         {
             "candidates": [
                 {
-                    "text": "Reflection turns experience into reusable guidance.",
+                    "text": text,
                     "supporting_evidence": [
                         {
                             "source_id": source_id,
@@ -79,7 +81,7 @@ def reflection_response(source_id: str) -> str:
                         }
                     ],
                     "contrary_evidence": [],
-                    "derivation": "Generalizes the source.",
+                    "derivation": derivation,
                 }
             ],
             "insufficient_evidence": False,
@@ -87,31 +89,26 @@ def reflection_response(source_id: str) -> str:
     )
 
 
+def candidate_records(library_root: Path) -> list[dict[str, Any]]:
+    catalog_path = (
+        library_root / "runtime" / "workspace" / "candidates" / "catalog.json"
+    )
+    if not catalog_path.is_file():
+        return []
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    candidates = catalog["candidates"]
+    if not isinstance(candidates, list):
+        raise AssertionError("candidate catalog is not a list")
+    if any(not isinstance(candidate, dict) for candidate in candidates):
+        raise AssertionError("candidate catalog contains a non-object")
+    return candidates
+
+
 class ReflectOnEvidenceTests(unittest.TestCase):
     def test_creator_can_reflect_without_writing_permanent_knowledge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
-            library_root = temporary_root / "My Knowledge"
-            initialization = run_cli("init", "--root", str(library_root))
-            self.assertEqual(initialization.returncode, 0, initialization.stderr)
-            configure_fake_generation(library_root)
-            source_path = temporary_root / "Reflection.md"
-            source_path.write_text(
-                "Reflection makes accumulated experience reusable.\n",
-                encoding="utf-8",
-            )
-            capture = run_cli(
-                "capture",
-                str(source_path),
-                "--sensitivity",
-                "cloud-allowed",
-                "--root",
-                str(library_root),
-            )
-            self.assertEqual(capture.returncode, 0, capture.stderr)
-            identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
-            self.assertIsNotNone(identity)
-            source_id = identity.group(0) if identity is not None else ""
+            library_root, source_id = initialize_cloud_source(temporary_root)
             vault_before = sorted(
                 path.relative_to(library_root / "vault")
                 for path in (library_root / "vault").rglob("*")
@@ -126,25 +123,10 @@ class ReflectOnEvidenceTests(unittest.TestCase):
                 "--root",
                 str(library_root),
                 environment={
-                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": json.dumps(
-                        {
-                            "candidates": [
-                                {
-                                    "text": "Reflection turns experience into reusable guidance.",
-                                    "supporting_evidence": [
-                                        {
-                                            "source_id": source_id,
-                                            "locator": source_locator(source_id),
-                                        }
-                                    ],
-                                    "contrary_evidence": [],
-                                    "derivation": (
-                                        "Generalizes the source's stated benefit of reflection."
-                                    ),
-                                }
-                            ],
-                            "insufficient_evidence": False,
-                        }
+                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": candidate_response(
+                        source_id,
+                        "Reflection turns experience into reusable guidance.",
+                        "Generalizes the source's stated benefit of reflection.",
                     )
                 },
             )
@@ -155,10 +137,9 @@ class ReflectOnEvidenceTests(unittest.TestCase):
             candidate_id = (
                 candidate_identity.group(0) if candidate_identity is not None else ""
             )
-            candidate_path = (
-                library_root / "runtime" / "workspace" / "candidates" / f"{candidate_id}.json"
-            )
-            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            records = candidate_records(library_root)
+            self.assertEqual(len(records), 1)
+            candidate = records[0]
             self.assertEqual(candidate["id"], candidate_id)
             self.assertEqual(candidate["kind"], "candidate-insight")
             self.assertEqual(candidate["state"], "pending-review")
@@ -180,26 +161,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
-            library_root = temporary_root / "My Knowledge"
-            initialization = run_cli("init", "--root", str(library_root))
-            self.assertEqual(initialization.returncode, 0, initialization.stderr)
-            configure_fake_generation(library_root)
-            source_path = temporary_root / "Reflection.md"
-            source_path.write_text(
-                "Reflection makes accumulated experience reusable.\n",
-                encoding="utf-8",
-            )
-            capture = run_cli(
-                "capture",
-                str(source_path),
-                "--sensitivity",
-                "cloud-allowed",
-                "--root",
-                str(library_root),
-            )
-            self.assertEqual(capture.returncode, 0, capture.stderr)
-            identity = re.search(r"src_[0-9a-f]{64}", capture.stdout)
-            source_id = identity.group(0) if identity is not None else ""
+            library_root, source_id = initialize_cloud_source(temporary_root)
             first_response = json.dumps(
                 {
                     "candidates": [
@@ -213,6 +175,24 @@ class ReflectOnEvidenceTests(unittest.TestCase):
                             ],
                             "contrary_evidence": [],
                             "derivation": "Generalizes the source.",
+                        },
+                        {
+                            "text": (
+                                "Reflection turns accumulated experience into reusable guidance."
+                            ),
+                            "supporting_evidence": [
+                                {
+                                    "source_id": source_id,
+                                    "locator": source_locator(source_id),
+                                }
+                            ],
+                            "contrary_evidence": [
+                                {
+                                    "source_id": source_id,
+                                    "locator": source_locator(source_id),
+                                }
+                            ],
+                            "derivation": "Adds the contrary evidence found in this pass.",
                         }
                     ],
                     "insufficient_evidence": False,
@@ -258,21 +238,59 @@ class ReflectOnEvidenceTests(unittest.TestCase):
                         "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": similar_response
                     },
                 )
-                for _ in range(4)
+                for _ in range(3)
             ]
 
             self.assertEqual(first.returncode, 0, first.stderr)
             for result in repeated:
                 self.assertEqual(result.returncode, 0, result.stderr)
-            candidate_files = list(
-                (library_root / "runtime" / "workspace" / "candidates").glob(
-                    "cand_*.json"
-                )
-            )
-            self.assertEqual(len(candidate_files), 1)
-            candidate = json.loads(candidate_files[0].read_text(encoding="utf-8"))
+            records = candidate_records(library_root)
+            self.assertEqual(len(records), 1)
+            candidate = records[0]
             self.assertEqual(candidate["occurrence_count"], 5)
+            self.assertEqual(len(candidate["contrary_evidence"]), 1)
             self.assertGreater(candidate["last_seen_at"], candidate["created_at"])
+
+    def test_highly_similar_chinese_candidates_are_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root, source_id = initialize_cloud_source(
+                Path(temporary_directory)
+            )
+            arguments = (
+                "reflect",
+                source_id,
+                "寻找可复用的洞见。",
+                "--allow-cloud",
+                "--root",
+                str(library_root),
+            )
+
+            first = run_cli(
+                *arguments,
+                environment={
+                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": candidate_response(
+                        source_id,
+                        "反思让积累的经验变成可复用的指导。",
+                        "概括材料中的反思价值。",
+                    )
+                },
+            )
+            second = run_cli(
+                *arguments,
+                environment={
+                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": candidate_response(
+                        source_id,
+                        "反思让积累经验变成可重复使用的指导。",
+                        "以近义表达重述同一洞见。",
+                    )
+                },
+            )
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            records = candidate_records(library_root)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["occurrence_count"], 2)
 
     def test_candidate_expiry_uses_the_configured_retention_period(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -300,12 +318,9 @@ class ReflectOnEvidenceTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            candidate_path = next(
-                (library_root / "runtime" / "workspace" / "candidates").glob(
-                    "cand_*.json"
-                )
-            )
-            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            records = candidate_records(library_root)
+            self.assertEqual(len(records), 1)
+            candidate = records[0]
             created_at = datetime.fromisoformat(candidate["created_at"])
             expires_at = datetime.fromisoformat(candidate["expires_at"])
             self.assertEqual((expires_at - created_at).days, 7)
@@ -331,12 +346,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 6)
             self.assertIn("timeout", result.stderr)
-            candidate_files = list(
-                (library_root / "runtime" / "workspace" / "candidates").glob(
-                    "cand_*.json"
-                )
-            )
-            self.assertEqual(candidate_files, [])
+            self.assertEqual(candidate_records(library_root), [])
             self.assertEqual(list((library_root / "vault").rglob("*.md")), [])
 
     def test_recent_rejection_fingerprint_suppresses_duplicate_without_retaining_text(
@@ -384,12 +394,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("recently rejected", result.stdout)
-            candidate_files = list(
-                (library_root / "runtime" / "workspace" / "candidates").glob(
-                    "cand_*.json"
-                )
-            )
-            self.assertEqual(candidate_files, [])
+            self.assertEqual(candidate_records(library_root), [])
             rejection_data = rejection_path.read_text(encoding="utf-8")
             self.assertNotIn("Reflection turns experience", rejection_data)
 
@@ -477,14 +482,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Insufficient evidence", result.stdout)
             self.assertNotIn("Moon", result.stdout)
-            self.assertEqual(
-                list(
-                    (library_root / "runtime" / "workspace" / "candidates").glob(
-                        "cand_*.json"
-                    )
-                ),
-                [],
-            )
+            self.assertEqual(candidate_records(library_root), [])
 
     def test_interrupted_multi_candidate_write_recovers_without_partial_candidates(
         self,
@@ -535,18 +533,13 @@ class ReflectOnEvidenceTests(unittest.TestCase):
                     "MYOUTBRAIN_FAULT_INJECTION": "reflect-after-first-replace",
                 },
             )
+            visible_count_before_recovery = len(candidate_records(library_root))
             recovered = run_cli("init", "--root", str(library_root))
 
             self.assertEqual(interrupted.returncode, 86)
+            self.assertEqual(visible_count_before_recovery, 2)
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
-            self.assertEqual(
-                list(
-                    (library_root / "runtime" / "workspace" / "candidates").glob(
-                        "cand_*.json"
-                    )
-                ),
-                [],
-            )
+            self.assertEqual(candidate_records(library_root), [])
 
     def test_local_only_source_never_reaches_reflection_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -583,7 +576,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 2)
-            self.assertIn("not eligible for cloud use", result.stderr)
+            self.assertIn("not eligible for cloud generation", result.stderr)
             self.assertFalse(request_file.exists())
 
     def test_candidate_citations_must_belong_to_reflection_evidence(self) -> None:
@@ -622,14 +615,7 @@ class ReflectOnEvidenceTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 6)
             self.assertIn("citation is outside the evidence package", result.stderr)
-            self.assertEqual(
-                list(
-                    (library_root / "runtime" / "workspace" / "candidates").glob(
-                        "cand_*.json"
-                    )
-                ),
-                [],
-            )
+            self.assertEqual(candidate_records(library_root), [])
 
     def test_openai_adapter_translates_reflection_to_responses_api(self) -> None:
         requests: list[dict[str, object]] = []

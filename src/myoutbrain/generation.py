@@ -109,26 +109,34 @@ class FakeGenerationProvider:
         self.model = model
 
     def generate(self, request: GenerationRequest) -> GeneratedAnswer:
-        request_file = os.environ.get("MYOUTBRAIN_FAKE_REQUEST_FILE")
-        if request_file is not None:
-            with open(request_file, "w", encoding="utf-8") as recorded_request:
-                json.dump(request.to_data(), recorded_request, ensure_ascii=False, indent=2)
-                recorded_request.write("\n")
-        simulated_error = os.environ.get("MYOUTBRAIN_FAKE_ERROR")
-        if simulated_error == "timeout":
-            raise ProviderFailure("generation provider timeout")
-        if simulated_error == "refusal":
-            raise ProviderFailure("generation provider refused the request")
-        serialized_response = os.environ.get("MYOUTBRAIN_FAKE_RESPONSE")
-        if serialized_response is None:
-            raise ProviderFailure("fake provider response is not configured")
+        response = self._load_response(
+            request,
+            environment_name="MYOUTBRAIN_FAKE_RESPONSE",
+            missing_message="fake provider response is not configured",
+        )
         try:
-            response = json.loads(serialized_response)
             return _parse_generated_answer(response)
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+        except (KeyError, TypeError) as error:
             raise ProviderFailure("fake provider returned an invalid result") from error
 
     def reflect(self, request: GenerationRequest) -> GeneratedReflection:
+        response = self._load_response(
+            request,
+            environment_name="MYOUTBRAIN_FAKE_REFLECTION_RESPONSE",
+            missing_message="fake reflection response is not configured",
+        )
+        try:
+            return _parse_generated_reflection(response)
+        except (KeyError, TypeError) as error:
+            raise ProviderFailure("fake provider returned an invalid result") from error
+
+    def _load_response(
+        self,
+        request: GenerationRequest,
+        *,
+        environment_name: str,
+        missing_message: str,
+    ) -> object:
         request_file = os.environ.get("MYOUTBRAIN_FAKE_REQUEST_FILE")
         if request_file is not None:
             with open(request_file, "w", encoding="utf-8") as recorded_request:
@@ -139,13 +147,12 @@ class FakeGenerationProvider:
             raise ProviderFailure("generation provider timeout")
         if simulated_error == "refusal":
             raise ProviderFailure("generation provider refused the request")
-        serialized_response = os.environ.get("MYOUTBRAIN_FAKE_REFLECTION_RESPONSE")
+        serialized_response = os.environ.get(environment_name)
         if serialized_response is None:
-            raise ProviderFailure("fake reflection response is not configured")
+            raise ProviderFailure(missing_message)
         try:
-            response = json.loads(serialized_response)
-            return _parse_generated_reflection(response)
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            return json.loads(serialized_response)
+        except json.JSONDecodeError as error:
             raise ProviderFailure("fake provider returned an invalid result") from error
 
 
