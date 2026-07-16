@@ -11,16 +11,18 @@ import tempfile
 from typing import Literal
 import uuid
 
-from myoutbrain.library import (
+from myoutbrain.core_types import (
     ConfigurationConflict,
     IntegrityError,
     Sensitivity,
     UserInputError,
-    _atomic_commit,
-    _event_journal_change,
-    _hold_writer_lock_for_acceptance_test,
-    _recover_transactions,
-    _writer_lock,
+)
+from myoutbrain.persistence import (
+    atomic_commit,
+    event_journal_change,
+    hold_writer_lock_for_acceptance_test,
+    recover_transactions,
+    writer_lock,
 )
 
 
@@ -81,18 +83,61 @@ MemoryDisposition = Literal["buffered", "duplicate"]
 
 
 @dataclass(frozen=True)
-class BufferedMemoryReceipt:
-    source_id: str
-    experience_id: str
-    digest_id: str
-    digest: str
-    disposition: MemoryDisposition
+class ExperienceMetadata:
     occurred_at: str
     entrance: str
     task: str
     sensitivity: Sensitivity
     visible_context: str
     context_gaps: tuple[str, ...]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        occurred_at: str,
+        entrance: str,
+        task: str,
+        sensitivity: Sensitivity,
+        visible_context: str,
+        context_gaps: tuple[str, ...],
+    ) -> ExperienceMetadata:
+        normalized_gaps = tuple(
+            _required_text("context gap", gap) for gap in context_gaps
+        )
+        if not normalized_gaps:
+            raise UserInputError("at least one explicit context gap is required")
+        if sensitivity not in ("local-only", "cloud-allowed"):
+            raise UserInputError(f"invalid sensitivity: {sensitivity}")
+        return cls(
+            occurred_at=_validated_time(occurred_at),
+            entrance=_required_text("entrance", entrance),
+            task=_required_text("task", task),
+            sensitivity=sensitivity,
+            visible_context=_required_text("visible context", visible_context),
+            context_gaps=normalized_gaps,
+        )
+
+    def identity_data(self, source_id: str) -> dict[str, object]:
+        return {
+            "source_id": source_id,
+            "occurred_at": self.occurred_at,
+            "entrance": self.entrance,
+            "task": self.task,
+            "sensitivity": self.sensitivity,
+            "visible_context": self.visible_context,
+            "context_gaps": self.context_gaps,
+        }
+
+
+@dataclass(frozen=True)
+class BufferedMemoryReceipt:
+    source_id: str
+    experience_id: str
+    digest_id: str
+    digest: str
+    disposition: MemoryDisposition
+    metadata: ExperienceMetadata
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -103,12 +148,12 @@ class BufferedMemoryReceipt:
             "disposition": self.disposition,
             "state": "buffered",
             "canonical_memory_id": None,
-            "occurred_at": self.occurred_at,
-            "entrance": self.entrance,
-            "task": self.task,
-            "sensitivity": self.sensitivity,
-            "visible_context": self.visible_context,
-            "context_gaps": list(self.context_gaps),
+            "occurred_at": self.metadata.occurred_at,
+            "entrance": self.metadata.entrance,
+            "task": self.metadata.task,
+            "sensitivity": self.metadata.sensitivity,
+            "visible_context": self.metadata.visible_context,
+            "context_gaps": list(self.metadata.context_gaps),
         }
 
 
@@ -125,13 +170,13 @@ class LocalMemoryCore:
                 f"MyOutBrain is not initialized at: {self._root}"
             )
         database_path = self._root / MEMORY_DATABASE
-        with _writer_lock(self._root):
-            _recover_transactions(self._root)
+        with writer_lock(self._root):
+            recover_transactions(self._root)
             if database_path.exists():
                 self._validate_database(database_path)
                 return
             database_content = self._new_database_content(database_path.parent)
-            _atomic_commit(self._root, [(database_path, database_content)])
+            atomic_commit(self._root, [(database_path, database_content)])
 
     def capture_experience(
         self,
@@ -150,32 +195,19 @@ class LocalMemoryCore:
                 f"MyOutBrain memory core is not initialized at: {self._root}"
             )
         body = _read_conversation(conversation_path)
-        normalized_time = _validated_time(occurred_at)
-        normalized_entrance = _required_text("entrance", entrance)
-        normalized_task = _required_text("task", task)
-        normalized_visible_context = _required_text(
-            "visible context", visible_context
+        metadata = ExperienceMetadata.create(
+            occurred_at=occurred_at,
+            entrance=entrance,
+            task=task,
+            sensitivity=sensitivity,
+            visible_context=visible_context,
+            context_gaps=context_gaps,
         )
-        normalized_gaps = tuple(
-            _required_text("context gap", gap) for gap in context_gaps
-        )
-        if not normalized_gaps:
-            raise UserInputError("at least one explicit context gap is required")
-        if sensitivity not in ("local-only", "cloud-allowed"):
-            raise UserInputError(f"invalid sensitivity: {sensitivity}")
 
         source_digest = hashlib.sha256(body).hexdigest()
         source_id = f"src_{source_digest}"
         identity_document = json.dumps(
-            {
-                "source_id": source_id,
-                "occurred_at": normalized_time,
-                "entrance": normalized_entrance,
-                "task": normalized_task,
-                "sensitivity": sensitivity,
-                "visible_context": normalized_visible_context,
-                "context_gaps": normalized_gaps,
-            },
+            metadata.identity_data(source_id),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -194,26 +226,25 @@ class LocalMemoryCore:
             self._root / "store" / "objects"
         ).as_posix()
 
-        with _writer_lock(self._root):
-            _hold_writer_lock_for_acceptance_test()
-            _recover_transactions(self._root)
+        with writer_lock(self._root):
+            hold_writer_lock_for_acceptance_test()
+            recover_transactions(self._root)
             self._validate_database(database_path)
             _validate_content_object(object_path, body, source_digest)
             duplicate = self._duplicate_receipt(
                 database_path,
                 experience_id=experience_id,
                 source_id=source_id,
-                occurred_at=normalized_time,
-                entrance=normalized_entrance,
-                task=normalized_task,
-                sensitivity=sensitivity,
-                visible_context=normalized_visible_context,
-                context_gaps=normalized_gaps,
+                metadata=metadata,
             )
             if duplicate is not None:
                 return duplicate
 
-            digest = _compact_digest(body.decode("utf-8"), normalized_task)
+            digest = _compact_digest(
+                body.decode("utf-8"),
+                task=metadata.task,
+                source_id=source_id,
+            )
             digest_fingerprint = hashlib.sha256(digest.encode("utf-8")).hexdigest()
             digest_id = f"mem_{hashlib.sha256(f'{experience_id}:{digest_fingerprint}'.encode()).hexdigest()}"
             created_at = datetime.now(timezone.utc).isoformat()
@@ -222,9 +253,9 @@ class LocalMemoryCore:
                 "source_id": source_id,
                 "experience_id": experience_id,
                 "digest_id": digest_id,
-                "entrance": normalized_entrance,
-                "task": normalized_task,
-                "sensitivity": sensitivity,
+                "entrance": metadata.entrance,
+                "task": metadata.task,
+                "sensitivity": metadata.sensitivity,
                 "state": "buffered",
             }
             staged_database = self._database_with_capture(
@@ -233,12 +264,7 @@ class LocalMemoryCore:
                 content_hash=f"sha256:{source_digest}",
                 object_reference=object_reference,
                 experience_id=experience_id,
-                occurred_at=normalized_time,
-                entrance=normalized_entrance,
-                task=normalized_task,
-                sensitivity=sensitivity,
-                visible_context=normalized_visible_context,
-                context_gaps=normalized_gaps,
+                metadata=metadata,
                 digest_id=digest_id,
                 digest=digest,
                 digest_fingerprint=f"sha256:{digest_fingerprint}",
@@ -258,10 +284,10 @@ class LocalMemoryCore:
             changes.extend(
                 [
                     (database_path, staged_database),
-                    _event_journal_change(self._root, event),
+                    event_journal_change(self._root, event),
                 ]
             )
-            _atomic_commit(
+            atomic_commit(
                 self._root,
                 changes,
                 fault_injections={0: "remember-after-first-replace"},
@@ -272,12 +298,7 @@ class LocalMemoryCore:
             digest_id=digest_id,
             digest=digest,
             disposition="buffered",
-            occurred_at=normalized_time,
-            entrance=normalized_entrance,
-            task=normalized_task,
-            sensitivity=sensitivity,
-            visible_context=normalized_visible_context,
-            context_gaps=normalized_gaps,
+            metadata=metadata,
         )
 
     @staticmethod
@@ -286,12 +307,7 @@ class LocalMemoryCore:
         *,
         experience_id: str,
         source_id: str,
-        occurred_at: str,
-        entrance: str,
-        task: str,
-        sensitivity: Sensitivity,
-        visible_context: str,
-        context_gaps: tuple[str, ...],
+        metadata: ExperienceMetadata,
     ) -> BufferedMemoryReceipt | None:
         try:
             with closing(sqlite3.connect(database_path)) as connection:
@@ -316,12 +332,7 @@ class LocalMemoryCore:
             digest_id=digest_id,
             digest=digest,
             disposition="duplicate",
-            occurred_at=occurred_at,
-            entrance=entrance,
-            task=task,
-            sensitivity=sensitivity,
-            visible_context=visible_context,
-            context_gaps=context_gaps,
+            metadata=metadata,
         )
 
     @staticmethod
@@ -332,12 +343,7 @@ class LocalMemoryCore:
         content_hash: str,
         object_reference: str,
         experience_id: str,
-        occurred_at: str,
-        entrance: str,
-        task: str,
-        sensitivity: Sensitivity,
-        visible_context: str,
-        context_gaps: tuple[str, ...],
+        metadata: ExperienceMetadata,
         digest_id: str,
         digest: str,
         digest_fingerprint: str,
@@ -376,12 +382,12 @@ class LocalMemoryCore:
                     (
                         experience_id,
                         source_id,
-                        occurred_at,
-                        entrance,
-                        task,
-                        sensitivity,
-                        visible_context,
-                        json.dumps(context_gaps, ensure_ascii=False),
+                        metadata.occurred_at,
+                        metadata.entrance,
+                        metadata.task,
+                        metadata.sensitivity,
+                        metadata.visible_context,
+                        json.dumps(metadata.context_gaps, ensure_ascii=False),
                         created_at,
                     ),
                 )
@@ -504,10 +510,14 @@ def _validate_content_object(path: Path, body: bytes, digest: str) -> None:
         raise IntegrityError(f"source object does not match its content address: {path}")
 
 
-def _compact_digest(body: str, task: str) -> str:
+def _compact_digest(body: str, *, task: str, source_id: str) -> str:
     normalized = " ".join(body.split())
-    excerpt_length = min(240, max(1, len(normalized) // 2))
-    excerpt = normalized[:excerpt_length].rstrip()
-    if excerpt_length < len(normalized):
-        excerpt = f"{excerpt}…"
-    return f"{task}: {excerpt}"
+    evidence = f"[evidence: {source_id}]"
+    if len(normalized) < 24:
+        return f"{task}: brief exchange {evidence}"
+    excerpt_length = min(140, len(normalized) // 2)
+    opening_length = (excerpt_length + 1) // 2
+    conclusion_length = excerpt_length - opening_length
+    opening = normalized[:opening_length].rstrip()
+    conclusion = normalized[-conclusion_length:].lstrip()
+    return f"{task}: {opening} … {conclusion} {evidence}"

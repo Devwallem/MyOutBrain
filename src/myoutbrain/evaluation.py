@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import cast
 
-from myoutbrain.library import UserInputError
+from myoutbrain.core_types import UserInputError
 from myoutbrain.retrieval import (
     EvidenceKind,
     EvidenceRetriever,

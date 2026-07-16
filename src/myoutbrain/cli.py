@@ -13,14 +13,14 @@ from myoutbrain.evaluation import (
     report_as_json,
     report_as_text,
 )
-from myoutbrain.library import (
+from myoutbrain.core_types import (
     ConfigurationConflict,
     IntegrityError,
-    KnowledgeWorkflow,
     Sensitivity,
     UserInputError,
     WriterLocked,
 )
+from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.generation import ProviderFailure
 from myoutbrain.local_core import LocalMemoryCore
 
