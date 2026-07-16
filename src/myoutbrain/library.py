@@ -34,6 +34,14 @@ from myoutbrain.candidates import (
 )
 from myoutbrain.knowledge import DerivedInsightNote, KnowledgeNoteError
 from myoutbrain.obsidian import create_obsidian_adapter
+from myoutbrain.reconstruction import (
+    RebuildResult,
+    ReconstructionError,
+    RuntimeProjectionError,
+    RuntimeProjectionReader,
+    RuntimeProjectionUnavailable,
+    RuntimeReconstructor,
+)
 from myoutbrain.vault import (
     KnowledgeTransitionError,
     VaultIntegrityError,
@@ -679,6 +687,12 @@ class KnowledgeWorkflow:
             raise UserInputError(
                 f"source is not eligible for cloud generation: {source_id}"
             )
+        try:
+            projected_source = RuntimeProjectionReader(self._root).source(source_id)
+        except RuntimeProjectionUnavailable as error:
+            raise UserInputError(str(error)) from error
+        except RuntimeProjectionError as error:
+            raise IntegrityError(str(error)) from error
         object_path = self._root / "store" / "objects" / object_reference
         try:
             source_bytes = object_path.read_bytes()
@@ -694,6 +708,15 @@ class KnowledgeWorkflow:
             raise IntegrityError(
                 f"source object is not valid UTF-8: {object_path}"
             ) from error
+        if projected_source is not None:
+            if (
+                projected_source.sensitivity != record.sensitivity
+                or projected_source.text != source_content
+            ):
+                raise IntegrityError(
+                    f"runtime projection disagrees with permanent source: {source_id}"
+                )
+            source_content = projected_source.text
         line_count = max(1, len(source_content.splitlines()))
         evidence_package = EvidencePackage(
             question=prompt,
@@ -1034,6 +1057,20 @@ class KnowledgeWorkflow:
             note_path=promotion.cognition_path,
             warning=warning,
         )
+
+    def rebuild_runtime(self) -> RebuildResult:
+        configuration_path = self._root / "myoutbrain.toml"
+        if not configuration_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain is not initialized at: {self._root}"
+            )
+        _load_validated_configuration(configuration_path)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            try:
+                return RuntimeReconstructor(self._root).rebuild()
+            except ReconstructionError as error:
+                raise IntegrityError(str(error)) from error
 
     def _record_external_call(
         self,

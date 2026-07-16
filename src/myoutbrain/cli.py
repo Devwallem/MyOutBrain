@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
     promote_parser.add_argument("--title", required=True)
     promote_parser.add_argument("--supersedes")
     promote_parser.add_argument("--root", type=Path, default=Path.cwd())
+    rebuild_parser = subcommands.add_parser(
+        "rebuild",
+        help="Rebuild runtime projections from permanent knowledge",
+    )
+    rebuild_parser.add_argument("--root", type=Path, default=Path.cwd())
     return parser
 
 
@@ -226,17 +231,26 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.sensitivity,
             )
         if parsed_arguments.command == "promote":
-            result = KnowledgeWorkflow(parsed_arguments.root).promote_insight(
+            promotion_result = KnowledgeWorkflow(parsed_arguments.root).promote_insight(
                 parsed_arguments.insight_id,
                 title=parsed_arguments.title,
                 supersedes_id=parsed_arguments.supersedes,
             )
             print(
-                f"Promoted personal cognition {result.cognition_id} "
-                f"at {result.note_path}"
+                f"Promoted personal cognition {promotion_result.cognition_id} "
+                f"at {promotion_result.note_path}"
             )
-            if result.warning is not None:
-                print(f"Warning: {result.warning}", file=sys.stderr)
+            if promotion_result.warning is not None:
+                print(f"Warning: {promotion_result.warning}", file=sys.stderr)
+            return 0
+        if parsed_arguments.command == "rebuild":
+            rebuild_result = KnowledgeWorkflow(parsed_arguments.root).rebuild_runtime()
+            print(
+                f"Rebuilt runtime from {rebuild_result.source_count} source, "
+                f"{rebuild_result.insight_count} insights, "
+                f"{rebuild_result.cognition_count} cognitions, and "
+                f"{rebuild_result.supersession_count} supersession relationships."
+            )
             return 0
     except UserInputError as error:
         print(f"Invalid source: {error}", file=sys.stderr)

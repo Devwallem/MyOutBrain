@@ -36,6 +36,98 @@ class CognitionPromotion:
         return tuple(changes)
 
 
+@dataclass(frozen=True)
+class KnowledgeNoteSnapshot:
+    knowledge_id: str
+    kind: str
+    state: str
+    authorship: str
+    sensitivity: str
+    created_at: str
+    updated_at: str
+    sources: tuple[str, ...]
+    supersedes: tuple[str, ...]
+    superseded_by: tuple[str, ...]
+    derived_from: str | None
+    promoted_to: str | None
+    candidate_id: str | None
+    path: Path
+    body: str
+
+
+def scan_knowledge_notes(vault: Path) -> tuple[KnowledgeNoteSnapshot, ...]:
+    notes: list[KnowledgeNoteSnapshot] = []
+    identities: set[str] = set()
+    for path in sorted(vault.rglob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise VaultIntegrityError(f"cannot read Vault note: {path}") from error
+        if not text.startswith("---\n"):
+            continue
+        frontmatter, body = _split_note(path, text)
+        if re.search(r"(?m)^id: ", frontmatter) is None:
+            continue
+        knowledge_id = _scalar(frontmatter, "id", path)
+        kind = _scalar(frontmatter, "kind", path)
+        state = _scalar(frontmatter, "state", path)
+        authorship = _scalar(frontmatter, "authorship", path)
+        sensitivity = _scalar(frontmatter, "sensitivity", path)
+        created_at = _scalar(frontmatter, "created_at", path)
+        updated_at = _scalar(frontmatter, "updated_at", path)
+        sources = _list(frontmatter, "sources", path)
+        supersedes = _inline_list(frontmatter, "supersedes", path)
+        superseded_by = _inline_list(frontmatter, "superseded_by", path)
+        if kind not in ("insight", "cognition"):
+            raise VaultIntegrityError(f"knowledge note has invalid kind: {path}")
+        expected_prefix = "ins_" if kind == "insight" else "cog_"
+        if re.fullmatch(rf"{expected_prefix}[0-9a-f]{{32}}", knowledge_id) is None:
+            raise VaultIntegrityError(f"knowledge note has invalid identity: {path}")
+        if knowledge_id in identities:
+            raise VaultIntegrityError(f"duplicate knowledge identity: {knowledge_id}")
+        identities.add(knowledge_id)
+        if state not in ("active", "superseded", "archived"):
+            raise VaultIntegrityError(f"knowledge note has invalid state: {path}")
+        if authorship not in ("user", "system", "mixed"):
+            raise VaultIntegrityError(f"knowledge note has invalid authorship: {path}")
+        if sensitivity not in ("local-only", "cloud-allowed"):
+            raise VaultIntegrityError(f"knowledge note has invalid sensitivity: {path}")
+        _validate_timestamp(created_at, "created_at", path)
+        _validate_timestamp(updated_at, "updated_at", path)
+        if any(re.fullmatch(r"src_[0-9a-f]{64}", value) is None for value in sources):
+            raise VaultIntegrityError(f"knowledge note has invalid sources: {path}")
+        derived_from = _optional_scalar(frontmatter, "derived_from")
+        promoted_to = _optional_scalar(frontmatter, "promoted_to")
+        candidate_id = _optional_scalar(frontmatter, "candidate_id")
+        if kind == "insight" and (
+            candidate_id is None
+            or re.fullmatch(r"cand_[0-9a-f]{64}", candidate_id) is None
+        ):
+            raise VaultIntegrityError(f"derived insight has invalid candidate_id: {path}")
+        if kind == "cognition" and candidate_id is not None:
+            raise VaultIntegrityError(f"personal cognition has invalid candidate_id: {path}")
+        notes.append(
+            KnowledgeNoteSnapshot(
+                knowledge_id=knowledge_id,
+                kind=kind,
+                state=state,
+                authorship=authorship,
+                sensitivity=sensitivity,
+                created_at=created_at,
+                updated_at=updated_at,
+                sources=sources,
+                supersedes=supersedes,
+                superseded_by=superseded_by,
+                derived_from=derived_from,
+                promoted_to=promoted_to,
+                candidate_id=candidate_id,
+                path=path,
+                body=body,
+            )
+        )
+    return tuple(notes)
+
+
 def prepare_cognition_promotion(
     vault: Path,
     *,
@@ -221,6 +313,33 @@ def _list(frontmatter: str, key: str, path: Path) -> tuple[str, ...]:
     if not values:
         raise VaultIntegrityError(f"knowledge note has invalid {key}: {path}")
     return values
+
+
+def _inline_list(frontmatter: str, key: str, path: Path) -> tuple[str, ...]:
+    value = _scalar(frontmatter, key, path)
+    if not value.startswith("[") or not value.endswith("]"):
+        raise VaultIntegrityError(f"knowledge note has invalid {key}: {path}")
+    inner = value[1:-1].strip()
+    if not inner:
+        return ()
+    values = tuple(item.strip() for item in inner.split(","))
+    if any(re.fullmatch(r"cog_[0-9a-f]{32}", item) is None for item in values):
+        raise VaultIntegrityError(f"knowledge note has invalid {key}: {path}")
+    return values
+
+
+def _optional_scalar(frontmatter: str, key: str) -> str | None:
+    match = re.search(rf"(?m)^{re.escape(key)}: (.+)$", frontmatter)
+    return match.group(1).strip() if match is not None else None
+
+
+def _validate_timestamp(value: str, key: str, path: Path) -> None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise VaultIntegrityError(f"knowledge note has invalid {key}: {path}") from error
+    if parsed.tzinfo is None:
+        raise VaultIntegrityError(f"knowledge note has invalid {key}: {path}")
 
 
 def _replace_scalar(frontmatter: str, key: str, value: str) -> str:
