@@ -22,6 +22,7 @@ from myoutbrain.library import (
     WriterLocked,
 )
 from myoutbrain.generation import ProviderFailure
+from myoutbrain.local_core import LocalMemoryCore
 
 
 EXIT_USER = 2
@@ -45,6 +46,23 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("local-only", "cloud-allowed"),
     )
+    remember_parser = subcommands.add_parser(
+        "remember",
+        help="Record a visible conversation as buffered memory",
+    )
+    remember_parser.add_argument("conversation", type=Path)
+    remember_parser.add_argument("--root", type=Path, default=Path.cwd())
+    remember_parser.add_argument("--occurred-at", required=True)
+    remember_parser.add_argument("--entrance", required=True)
+    remember_parser.add_argument("--task", required=True)
+    remember_parser.add_argument(
+        "--sensitivity",
+        required=True,
+        choices=("local-only", "cloud-allowed"),
+    )
+    remember_parser.add_argument("--visible-context", required=True)
+    remember_parser.add_argument("--context-gap", action="append", required=True)
+    remember_parser.add_argument("--format", choices=("json", "text"), default="text")
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
     ask_parser.add_argument("source_id")
     ask_parser.add_argument("question")
@@ -112,6 +130,38 @@ def _capture(root: Path, source: Path, sensitivity: Sensitivity) -> int:
     else:
         detail = result.disposition.replace("-", " ")
         print(f"Already captured source {result.source_id} ({detail})")
+    return 0
+
+
+def _remember(
+    root: Path,
+    conversation: Path,
+    *,
+    occurred_at: str,
+    entrance: str,
+    task: str,
+    sensitivity: Sensitivity,
+    visible_context: str,
+    context_gaps: Sequence[str],
+    output_format: str,
+) -> int:
+    receipt = LocalMemoryCore(root).capture_experience(
+        conversation,
+        occurred_at=occurred_at,
+        entrance=entrance,
+        task=task,
+        sensitivity=sensitivity,
+        visible_context=visible_context,
+        context_gaps=tuple(context_gaps),
+    )
+    if output_format == "json":
+        import json
+
+        print(json.dumps(receipt.to_data(), ensure_ascii=False, sort_keys=True))
+    elif receipt.disposition == "duplicate":
+        print(f"Already buffered memory {receipt.digest_id} from {receipt.experience_id}")
+    else:
+        print(f"Buffered memory {receipt.digest_id} from {receipt.experience_id}")
     return 0
 
 
@@ -220,6 +270,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.source,
                 parsed_arguments.sensitivity,
             )
+        if parsed_arguments.command == "remember":
+            return _remember(
+                parsed_arguments.root,
+                parsed_arguments.conversation,
+                occurred_at=parsed_arguments.occurred_at,
+                entrance=parsed_arguments.entrance,
+                task=parsed_arguments.task,
+                sensitivity=parsed_arguments.sensitivity,
+                visible_context=parsed_arguments.visible_context,
+                context_gaps=parsed_arguments.context_gap,
+                output_format=parsed_arguments.format,
+            )
         if parsed_arguments.command == "ask":
             return _ask(
                 parsed_arguments.root,
@@ -297,6 +359,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except OSError as error:
         operation = {
             "capture": "Capture",
+            "remember": "Memory capture",
             "evaluate-recall": "Evaluation",
         }.get(parsed_arguments.command, "Initialization")
         print(f"{operation} failed: {error}", file=sys.stderr)

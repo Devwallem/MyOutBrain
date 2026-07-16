@@ -83,7 +83,13 @@ DEFAULT_GENERATION_PROVIDER = "openai"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
 DEFAULT_CANDIDATE_TTL_DAYS = 30
 GIT_IGNORE_MARKER = "# MyOutBrain machine data"
-GIT_IGNORE_RULES = ("/store/objects/", "/store/transactions/", "/runtime/", "/.myoutbrain.lock")
+GIT_IGNORE_RULES = (
+    "/store/objects/",
+    "/store/transactions/",
+    "/store/memory.sqlite3",
+    "/runtime/",
+    "/.myoutbrain.lock",
+)
 
 
 class ConfigurationConflict(Exception):
@@ -620,6 +626,9 @@ class KnowledgeWorkflow:
                 _atomic_write(configuration, _render_initial_configuration().encode("utf-8"))
             elif migrated_configuration is not None:
                 _atomic_write(configuration, migrated_configuration.encode("utf-8"))
+        from myoutbrain.local_core import LocalMemoryCore
+
+        LocalMemoryCore(root).initialize()
 
     def capture(self, source_path: Path, sensitivity: Sensitivity) -> CaptureResult:
         configuration = self._root / "myoutbrain.toml"

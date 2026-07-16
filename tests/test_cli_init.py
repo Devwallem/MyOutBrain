@@ -36,6 +36,8 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
                     f"Expected initialized directory: {relative_path}",
                 )
             self.assertTrue((library_root / "myoutbrain.toml").is_file())
+            self.assertTrue((library_root / "store" / "memory.sqlite3").is_file())
+            self.assertFalse((library_root / ".git").exists())
 
     def test_reinitialization_preserves_existing_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
