@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import msvcrt
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
@@ -22,6 +23,7 @@ from myoutbrain.generation import (
     EvidenceItem,
     EvidencePackage,
     GeneratedClaim,
+    GeneratedCandidate,
     GenerationRequest,
     ProviderFailure,
     create_generation_provider,
@@ -60,6 +62,7 @@ PERMANENT_STORAGE = ("vault", "store")
 REBUILDABLE_STORAGE = ("runtime",)
 DEFAULT_GENERATION_PROVIDER = "openai"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
+DEFAULT_CANDIDATE_TTL_DAYS = 30
 GIT_IGNORE_MARKER = "# MyOutBrain machine data"
 GIT_IGNORE_RULES = ("/store/objects/", "/store/transactions/", "/runtime/", "/.myoutbrain.lock")
 
@@ -91,6 +94,14 @@ class AskResult:
     claims: tuple[GeneratedClaim, ...]
     evidence: tuple[EvidenceItem, ...]
     insufficient_evidence: bool
+
+
+@dataclass(frozen=True)
+class ReflectionResult:
+    candidate_ids: tuple[str, ...]
+    evidence: tuple[EvidenceItem, ...]
+    insufficient_evidence: bool
+    suppressed_count: int
 
 
 @dataclass(frozen=True)
@@ -221,6 +232,8 @@ def _render_initial_configuration() -> str:
         f"permanent = [{permanent}]\n"
         f"rebuildable = [{rebuildable}]\n"
         f"\n{_render_default_generation_configuration()}"
+        "\n[reflection]\n"
+        f"candidate_ttl_days = {DEFAULT_CANDIDATE_TTL_DAYS}\n"
     )
 
 
@@ -352,7 +365,10 @@ def _atomic_commit(root: Path, changes: Sequence[tuple[Path, bytes]]) -> None:
             if (
                 index == 0
                 and os.environ.get("MYOUTBRAIN_FAULT_INJECTION")
-                == "capture-after-first-replace"
+                in {
+                    "capture-after-first-replace",
+                    "reflect-after-first-replace",
+                }
             ):
                 os._exit(86)
         _atomic_write(transaction_path / "committed", b"committed\n")
@@ -455,6 +471,22 @@ def _generation_configuration(
     return provider, model
 
 
+def _candidate_ttl_days(configuration: dict[str, object], path: Path) -> int:
+    reflection = configuration.get("reflection")
+    if reflection is None:
+        return DEFAULT_CANDIDATE_TTL_DAYS
+    if not isinstance(reflection, dict):
+        raise ConfigurationConflict(f"invalid reflection configuration: {path}")
+    candidate_ttl_days = reflection.get("candidate_ttl_days")
+    if (
+        not isinstance(candidate_ttl_days, int)
+        or isinstance(candidate_ttl_days, bool)
+        or candidate_ttl_days < 1
+    ):
+        raise ConfigurationConflict(f"invalid reflection configuration: {path}")
+    return candidate_ttl_days
+
+
 def _read_source(source_path: Path) -> bytes:
     if not source_path.exists():
         raise UserInputError(f"source does not exist: {source_path}")
@@ -471,6 +503,65 @@ def _read_source(source_path: Path) -> bytes:
     if source_path.suffix.lower() != ".md" or not source_text.strip():
         raise UserInputError(f"source is not a valid Markdown document: {source_path}")
     return source_bytes
+
+
+def _candidate_identity(candidate: GeneratedCandidate) -> str:
+    normalized_text = " ".join(candidate.text.casefold().split())
+    fingerprint = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+    return f"cand_{fingerprint}"
+
+
+def _candidate_similarity(left: str, right: str) -> float:
+    left_terms = set(re.findall(r"\w+", left.casefold()))
+    right_terms = set(re.findall(r"\w+", right.casefold()))
+    if not left_terms or not right_terms:
+        return 0.0
+    return len(left_terms & right_terms) / len(left_terms | right_terms)
+
+
+def _load_candidate_data(path: Path) -> dict[str, object]:
+    try:
+        candidate_data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(candidate_data, dict):
+            raise TypeError("candidate record is not an object")
+        expected_id = path.stem
+        if candidate_data.get("id") != expected_id:
+            raise ValueError("candidate record identity does not match its path")
+        text = candidate_data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("candidate text is invalid")
+        occurrence_count = candidate_data.get("occurrence_count")
+        if not isinstance(occurrence_count, int) or occurrence_count < 1:
+            raise ValueError("candidate recurrence is invalid")
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise IntegrityError(f"invalid candidate record: {path}") from error
+    return candidate_data
+
+
+def _candidate_is_suppressed(
+    candidate_directory: Path,
+    candidate_id: str,
+    occurred_at: datetime,
+) -> bool:
+    fingerprint = candidate_id.removeprefix("cand_")
+    rejection_path = candidate_directory / "rejected" / f"rej_{fingerprint}.json"
+    if not rejection_path.is_file():
+        return False
+    try:
+        rejection = json.loads(rejection_path.read_text(encoding="utf-8"))
+        if not isinstance(rejection, dict):
+            raise TypeError("rejection fingerprint is not an object")
+        if rejection.get("fingerprint") != f"sha256:{fingerprint}":
+            raise ValueError("rejection fingerprint does not match its path")
+        suppress_until_value = rejection.get("suppress_until")
+        if not isinstance(suppress_until_value, str):
+            raise TypeError("rejection suppression expiry is invalid")
+        suppress_until = datetime.fromisoformat(suppress_until_value)
+        if suppress_until.tzinfo is None:
+            raise ValueError("rejection suppression expiry requires a timezone")
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise IntegrityError(f"invalid rejection fingerprint: {rejection_path}") from error
+    return suppress_until > occurred_at
 
 
 class KnowledgeWorkflow:
@@ -626,6 +717,185 @@ class KnowledgeWorkflow:
             claims=generated.claims,
             evidence=evidence_package.items,
             insufficient_evidence=generated.insufficient_evidence,
+        )
+
+    def reflect(
+        self,
+        source_id: str,
+        prompt: str,
+        *,
+        allow_cloud: bool,
+    ) -> ReflectionResult:
+        configuration = self._root / "myoutbrain.toml"
+        if not configuration.is_file():
+            raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
+        configuration_data = _load_validated_configuration(configuration)
+        provider_name, model = _generation_configuration(configuration_data, configuration)
+        candidate_ttl_days = _candidate_ttl_days(configuration_data, configuration)
+        if not prompt.strip():
+            raise UserInputError("reflection prompt must not be blank")
+        if not allow_cloud:
+            raise UserInputError("this request requires explicit --allow-cloud authorization")
+        digest = source_id.removeprefix("src_")
+        if (
+            not source_id.startswith("src_")
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise UserInputError(f"invalid source identity: {source_id}")
+
+        provider = create_generation_provider(provider_name, model)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            object_reference = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}"
+            record_path = self._root / "store" / "records" / f"{source_id}.json"
+            if not record_path.is_file():
+                raise UserInputError(f"captured source does not exist: {source_id}")
+            record = SourceRecord.load(
+                record_path,
+                expected_source_id=source_id,
+                expected_digest=digest,
+                expected_object_reference=object_reference,
+            )
+            if record.sensitivity != "cloud-allowed":
+                raise UserInputError(f"source is not eligible for cloud use: {source_id}")
+            object_path = self._root / "store" / "objects" / object_reference
+            try:
+                source_bytes = object_path.read_bytes()
+            except OSError as error:
+                raise IntegrityError(f"cannot read source object: {object_path}") from error
+            if hashlib.sha256(source_bytes).hexdigest() != digest:
+                raise IntegrityError(
+                    f"source object does not match its content address: {object_path}"
+                )
+            try:
+                source_content = source_bytes.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise IntegrityError(
+                    f"source object is not valid UTF-8: {object_path}"
+                ) from error
+            line_count = max(1, len(source_content.splitlines()))
+            locator = f"store/objects/{object_reference}#L1-L{line_count}"
+            evidence_package = EvidencePackage(
+                question=prompt,
+                items=(
+                    EvidenceItem(
+                        citation=Citation(source_id=source_id, locator=locator),
+                        content=source_content,
+                    ),
+                ),
+            )
+            generation_request = GenerationRequest(
+                purpose="reflect-on-source",
+                authorization=CloudAuthorization(allow_cloud=allow_cloud),
+                evidence_package=evidence_package,
+            )
+            self._record_external_call(
+                provider=provider.name,
+                model=provider.model,
+                request=generation_request,
+            )
+            generated = provider.reflect(generation_request)
+            allowed_citations = {item.citation for item in evidence_package.items}
+            for candidate in generated.candidates:
+                candidate_citations = (
+                    candidate.supporting_evidence + candidate.contrary_evidence
+                )
+                if any(
+                    citation not in allowed_citations
+                    for citation in candidate_citations
+                ):
+                    raise ProviderFailure(
+                        "generated candidate citation is outside the evidence package"
+                    )
+            if generated.insufficient_evidence:
+                return ReflectionResult(
+                    candidate_ids=(),
+                    evidence=evidence_package.items,
+                    insufficient_evidence=True,
+                    suppressed_count=0,
+                )
+            occurred_at = datetime.now(timezone.utc)
+            writes: list[tuple[Path, bytes]] = []
+            candidate_ids: list[str] = []
+            suppressed_count = 0
+            candidate_directory = (
+                self._root / "runtime" / "workspace" / "candidates"
+            )
+            for candidate in generated.candidates:
+                candidate_id = _candidate_identity(candidate)
+                if _candidate_is_suppressed(
+                    candidate_directory,
+                    candidate_id,
+                    occurred_at,
+                ):
+                    suppressed_count += 1
+                    continue
+                candidate_path = candidate_directory / f"{candidate_id}.json"
+                if not candidate_path.exists():
+                    for existing_path in sorted(candidate_directory.glob("cand_*.json")):
+                        existing_data = _load_candidate_data(existing_path)
+                        existing_text = existing_data["text"]
+                        if (
+                            isinstance(existing_text, str)
+                            and _candidate_similarity(candidate.text, existing_text) >= 0.8
+                        ):
+                            candidate_id = existing_path.stem
+                            candidate_path = existing_path
+                            break
+                candidate_ids.append(candidate_id)
+                if candidate_path.exists():
+                    candidate_data = _load_candidate_data(candidate_path)
+                    occurrence_count = candidate_data["occurrence_count"]
+                    if not isinstance(occurrence_count, int):
+                        raise IntegrityError(
+                            f"invalid candidate record: {candidate_path}"
+                        )
+                    candidate_data["occurrence_count"] = occurrence_count + 1
+                    candidate_data["last_seen_at"] = occurred_at.isoformat()
+                    candidate_data["expires_at"] = (
+                        occurred_at + timedelta(days=candidate_ttl_days)
+                    ).isoformat()
+                else:
+                    candidate_data = {
+                        "schema_version": SCHEMA_VERSION,
+                        "id": candidate_id,
+                        "kind": "candidate-insight",
+                        "state": "pending-review",
+                        "authorship": "system",
+                        "text": candidate.text,
+                        "supporting_evidence": [
+                            citation.to_data()
+                            for citation in candidate.supporting_evidence
+                        ],
+                        "contrary_evidence": [
+                            citation.to_data()
+                            for citation in candidate.contrary_evidence
+                        ],
+                        "derivation": candidate.derivation,
+                        "occurrence_count": 1,
+                        "created_at": occurred_at.isoformat(),
+                        "last_seen_at": occurred_at.isoformat(),
+                        "expires_at": (
+                            occurred_at + timedelta(days=candidate_ttl_days)
+                        ).isoformat(),
+                    }
+                writes.append(
+                    (
+                        candidate_path,
+                        json.dumps(candidate_data, ensure_ascii=False, indent=2).encode(
+                            "utf-8"
+                        )
+                        + b"\n",
+                    )
+                )
+            if writes:
+                _atomic_commit(self._root, writes)
+        return ReflectionResult(
+            candidate_ids=tuple(candidate_ids),
+            evidence=evidence_package.items,
+            insufficient_evidence=False,
+            suppressed_count=suppressed_count,
         )
 
     def _record_external_call(

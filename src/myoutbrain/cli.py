@@ -43,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     ask_parser.add_argument("question")
     ask_parser.add_argument("--root", type=Path, default=Path.cwd())
     ask_parser.add_argument("--allow-cloud", action="store_true")
+    reflect_parser = subcommands.add_parser(
+        "reflect",
+        help="Generate temporary candidate insights from one captured source",
+    )
+    reflect_parser.add_argument("source_id")
+    reflect_parser.add_argument("prompt")
+    reflect_parser.add_argument("--root", type=Path, default=Path.cwd())
+    reflect_parser.add_argument("--allow-cloud", action="store_true")
     return parser
 
 
@@ -86,6 +94,30 @@ def _ask(root: Path, source_id: str, question: str, allow_cloud: bool) -> int:
     return 0
 
 
+def _reflect(root: Path, source_id: str, prompt: str, allow_cloud: bool) -> int:
+    result = KnowledgeWorkflow(root).reflect(
+        source_id,
+        prompt,
+        allow_cloud=allow_cloud,
+    )
+    if result.insufficient_evidence:
+        print("Insufficient evidence: no candidate insight was created.")
+        for evidence in result.evidence:
+            print(
+                "Evidence checked: "
+                f"[{evidence.citation.source_id} @ {evidence.citation.locator}]"
+            )
+    else:
+        for candidate_id in result.candidate_ids:
+            print(f"Candidate insight {candidate_id}")
+        if result.suppressed_count:
+            print(
+                f"No duplicate created: {result.suppressed_count} recently rejected "
+                "candidate suppressed."
+            )
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     parsed_arguments = build_parser().parse_args(arguments)
     try:
@@ -102,6 +134,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 parsed_arguments.source_id,
                 parsed_arguments.question,
+                parsed_arguments.allow_cloud,
+            )
+        if parsed_arguments.command == "reflect":
+            return _reflect(
+                parsed_arguments.root,
+                parsed_arguments.source_id,
+                parsed_arguments.prompt,
                 parsed_arguments.allow_cloud,
             )
     except UserInputError as error:

@@ -79,11 +79,27 @@ class GeneratedAnswer:
     insufficient_evidence: bool
 
 
+@dataclass(frozen=True)
+class GeneratedCandidate:
+    text: str
+    supporting_evidence: tuple[Citation, ...]
+    contrary_evidence: tuple[Citation, ...]
+    derivation: str
+
+
+@dataclass(frozen=True)
+class GeneratedReflection:
+    candidates: tuple[GeneratedCandidate, ...]
+    insufficient_evidence: bool
+
+
 class GenerationProvider(Protocol):
     name: str
     model: str
 
     def generate(self, request: GenerationRequest) -> GeneratedAnswer: ...
+
+    def reflect(self, request: GenerationRequest) -> GeneratedReflection: ...
 
 
 class FakeGenerationProvider:
@@ -112,6 +128,26 @@ class FakeGenerationProvider:
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             raise ProviderFailure("fake provider returned an invalid result") from error
 
+    def reflect(self, request: GenerationRequest) -> GeneratedReflection:
+        request_file = os.environ.get("MYOUTBRAIN_FAKE_REQUEST_FILE")
+        if request_file is not None:
+            with open(request_file, "w", encoding="utf-8") as recorded_request:
+                json.dump(request.to_data(), recorded_request, ensure_ascii=False, indent=2)
+                recorded_request.write("\n")
+        simulated_error = os.environ.get("MYOUTBRAIN_FAKE_ERROR")
+        if simulated_error == "timeout":
+            raise ProviderFailure("generation provider timeout")
+        if simulated_error == "refusal":
+            raise ProviderFailure("generation provider refused the request")
+        serialized_response = os.environ.get("MYOUTBRAIN_FAKE_REFLECTION_RESPONSE")
+        if serialized_response is None:
+            raise ProviderFailure("fake reflection response is not configured")
+        try:
+            response = json.loads(serialized_response)
+            return _parse_generated_reflection(response)
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ProviderFailure("fake provider returned an invalid result") from error
+
 
 class OpenAIGenerationProvider:
     name = "openai"
@@ -120,6 +156,107 @@ class OpenAIGenerationProvider:
         self.model = model
 
     def generate(self, request: GenerationRequest) -> GeneratedAnswer:
+        schema = {
+            "type": "object",
+            "properties": {
+                "claims": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "source_id": {"type": "string"},
+                            "locator": {"type": "string"},
+                        },
+                        "required": ["text", "source_id", "locator"],
+                        "additionalProperties": False,
+                    },
+                },
+                "insufficient_evidence": {"type": "boolean"},
+            },
+            "required": ["claims", "insufficient_evidence"],
+            "additionalProperties": False,
+        }
+        response = self._request_structured(
+            request,
+            format_name="grounded_answer",
+            instructions=(
+                "Answer only from the supplied evidence package. If it does not support an answer, "
+                "set insufficient_evidence to true. Do not use outside knowledge."
+            ),
+            schema=schema,
+        )
+        try:
+            return _parse_generated_answer(response)
+        except (KeyError, TypeError) as error:
+            raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
+
+    def reflect(self, request: GenerationRequest) -> GeneratedReflection:
+        citation_schema = {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "locator": {"type": "string"},
+            },
+            "required": ["source_id", "locator"],
+            "additionalProperties": False,
+        }
+        schema = {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "supporting_evidence": {
+                                "type": "array",
+                                "items": citation_schema,
+                            },
+                            "contrary_evidence": {
+                                "type": "array",
+                                "items": citation_schema,
+                            },
+                            "derivation": {"type": "string"},
+                        },
+                        "required": [
+                            "text",
+                            "supporting_evidence",
+                            "contrary_evidence",
+                            "derivation",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "insufficient_evidence": {"type": "boolean"},
+            },
+            "required": ["candidates", "insufficient_evidence"],
+            "additionalProperties": False,
+        }
+        response = self._request_structured(
+            request,
+            format_name="grounded_reflection",
+            instructions=(
+                "Propose candidate insights only from the supplied evidence package. Include "
+                "supporting evidence, contrary evidence when present, and a derivation summary. "
+                "If the evidence cannot support a candidate, set insufficient_evidence to true."
+            ),
+            schema=schema,
+        )
+        try:
+            return _parse_generated_reflection(response)
+        except (KeyError, TypeError) as error:
+            raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
+
+    def _request_structured(
+        self,
+        request: GenerationRequest,
+        *,
+        format_name: str,
+        instructions: str,
+        schema: dict[str, object],
+    ) -> object:
         api_key = os.environ.get("OPENAI_API_KEY")
         if api_key is None or not api_key.strip():
             raise ProviderFailure("OPENAI_API_KEY is not configured")
@@ -128,37 +265,14 @@ class OpenAIGenerationProvider:
         body = {
             "model": self.model,
             "store": False,
-            "instructions": (
-                "Answer only from the supplied evidence package. If it does not support an answer, "
-                "set insufficient_evidence to true. Do not use outside knowledge."
-            ),
+            "instructions": instructions,
             "input": json.dumps(request.to_data(), ensure_ascii=False),
             "text": {
                 "format": {
                     "type": "json_schema",
-                    "name": "grounded_answer",
+                    "name": format_name,
                     "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "claims": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "text": {"type": "string"},
-                                        "source_id": {"type": "string"},
-                                        "locator": {"type": "string"},
-                                    },
-                                    "required": ["text", "source_id", "locator"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                            "insufficient_evidence": {"type": "boolean"},
-                        },
-                        "required": ["claims", "insufficient_evidence"],
-                        "additionalProperties": False,
-                    },
+                    "schema": schema,
                 }
             },
         }
@@ -203,12 +317,12 @@ class OpenAIGenerationProvider:
                     output_text = content_item.get("text")
                     if not isinstance(output_text, str):
                         raise TypeError("output text is invalid")
-                    return _parse_generated_answer(json.loads(output_text))
+                    return json.loads(output_text)
         except ProviderFailure:
             raise
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
-        raise ProviderFailure("OpenAI Responses API returned no answer")
+        raise ProviderFailure("OpenAI Responses API returned no result")
 
 
 def _parse_generated_answer(response: object) -> GeneratedAnswer:
@@ -242,6 +356,67 @@ def _parse_generated_answer(response: object) -> GeneratedAnswer:
     if not insufficient_evidence and not claims:
         raise TypeError("answerable result must contain at least one claim")
     return GeneratedAnswer(claims=tuple(claims), insufficient_evidence=insufficient_evidence)
+
+
+def _parse_citations(value: object, field: str) -> tuple[Citation, ...]:
+    if not isinstance(value, list):
+        raise TypeError(f"{field} must be a list")
+    citations: list[Citation] = []
+    for citation_data in value:
+        if not isinstance(citation_data, dict):
+            raise TypeError(f"{field} citation must be an object")
+        source_id = citation_data.get("source_id")
+        locator = citation_data.get("locator")
+        if not isinstance(source_id, str) or not source_id:
+            raise TypeError(f"{field} source identity is invalid")
+        if not isinstance(locator, str) or not locator:
+            raise TypeError(f"{field} locator is invalid")
+        citations.append(Citation(source_id=source_id, locator=locator))
+    return tuple(citations)
+
+
+def _parse_generated_reflection(response: object) -> GeneratedReflection:
+    if not isinstance(response, dict):
+        raise TypeError("generated reflection is not an object")
+    candidates_data = response["candidates"]
+    insufficient_evidence = response["insufficient_evidence"]
+    if not isinstance(candidates_data, list):
+        raise TypeError("candidates must be a list")
+    if not isinstance(insufficient_evidence, bool):
+        raise TypeError("insufficient_evidence must be boolean")
+    candidates: list[GeneratedCandidate] = []
+    for candidate_data in candidates_data:
+        if not isinstance(candidate_data, dict):
+            raise TypeError("candidate must be an object")
+        text = candidate_data.get("text")
+        derivation = candidate_data.get("derivation")
+        if not isinstance(text, str) or not text.strip():
+            raise TypeError("candidate text must be nonblank")
+        if not isinstance(derivation, str) or not derivation.strip():
+            raise TypeError("candidate derivation must be nonblank")
+        supporting_evidence = _parse_citations(
+            candidate_data.get("supporting_evidence"),
+            "supporting_evidence",
+        )
+        if not supporting_evidence:
+            raise TypeError("candidate must contain supporting evidence")
+        candidates.append(
+            GeneratedCandidate(
+                text=text,
+                supporting_evidence=supporting_evidence,
+                contrary_evidence=_parse_citations(
+                    candidate_data.get("contrary_evidence"),
+                    "contrary_evidence",
+                ),
+                derivation=derivation,
+            )
+        )
+    if not insufficient_evidence and not candidates:
+        raise TypeError("supported reflection must contain at least one candidate")
+    return GeneratedReflection(
+        candidates=tuple(candidates),
+        insufficient_evidence=insufficient_evidence,
+    )
 
 
 def create_generation_provider(provider_name: str, model: str) -> GenerationProvider:
