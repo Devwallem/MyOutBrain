@@ -223,6 +223,46 @@ class CandidateWorkspace:
         }
         return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
 
+    def list_records(self) -> tuple[CandidateRecord, ...]:
+        return tuple(self._records)
+
+    def get_record(self, candidate_id: str) -> CandidateRecord:
+        for record in self._records:
+            if record.candidate_id == candidate_id:
+                return record
+        raise CandidateWorkspaceError(f"candidate does not exist: {candidate_id}")
+
+    def remove(self, candidate_id: str) -> CandidateRecord:
+        for index, record in enumerate(self._records):
+            if record.candidate_id == candidate_id:
+                del self._records[index]
+                return record
+        raise CandidateWorkspaceError(f"candidate does not exist: {candidate_id}")
+
+    def reject(
+        self,
+        candidate_id: str,
+        occurred_at: datetime,
+        suppression_days: int,
+    ) -> tuple[str, Path, bytes]:
+        self.remove(candidate_id)
+        fingerprint = candidate_id.removeprefix("cand_")
+        rejection_path = (
+            self._candidate_directory / "rejected" / f"rej_{fingerprint}.json"
+        )
+        rejection = {
+            "schema_version": SCHEMA_VERSION,
+            "fingerprint": f"sha256:{fingerprint}",
+            "rejected_at": occurred_at.isoformat(),
+            "suppress_until": (
+                occurred_at + timedelta(days=suppression_days)
+            ).isoformat(),
+        }
+        rejection_content = (
+            json.dumps(rejection, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        )
+        return f"sha256:{fingerprint}", rejection_path, rejection_content
+
     def _matching_record_index(
         self,
         candidate: GeneratedCandidate,

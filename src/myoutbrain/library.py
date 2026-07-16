@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,7 +27,13 @@ from myoutbrain.generation import (
     ProviderFailure,
     create_generation_provider,
 )
-from myoutbrain.candidates import CandidateWorkspace, CandidateWorkspaceError
+from myoutbrain.candidates import (
+    CandidateRecord,
+    CandidateWorkspace,
+    CandidateWorkspaceError,
+)
+from myoutbrain.knowledge import DerivedInsightNote, KnowledgeNoteError
+from myoutbrain.obsidian import create_obsidian_adapter
 
 
 Sensitivity = Literal["local-only", "cloud-allowed"]
@@ -102,6 +108,13 @@ class ReflectionResult:
     evidence: tuple[EvidenceItem, ...]
     insufficient_evidence: bool
     suppressed_count: int
+
+
+@dataclass(frozen=True)
+class AcceptResult:
+    knowledge_id: str
+    note_path: Path
+    warning: str | None
 
 
 @dataclass(frozen=True)
@@ -348,7 +361,7 @@ def _atomic_commit(
     root: Path,
     changes: Sequence[tuple[Path, bytes]],
     *,
-    fault_injection: str | None = None,
+    fault_injections: dict[int, str] | None = None,
 ) -> None:
     transactions_root = root / "store" / "transactions"
     transactions_root.mkdir(parents=True, exist_ok=True)
@@ -374,10 +387,12 @@ def _atomic_commit(
     try:
         for index, (path, content) in enumerate(changes):
             _atomic_write(path, content)
+            injected_fault = (
+                fault_injections.get(index) if fault_injections is not None else None
+            )
             if (
-                index == 0
-                and fault_injection is not None
-                and os.environ.get("MYOUTBRAIN_FAULT_INJECTION") == fault_injection
+                injected_fault is not None
+                and os.environ.get("MYOUTBRAIN_FAULT_INJECTION") == injected_fault
             ):
                 os._exit(86)
         _atomic_write(transaction_path / "committed", b"committed\n")
@@ -512,6 +527,19 @@ def _read_source(source_path: Path) -> bytes:
     if source_path.suffix.lower() != ".md" or not source_text.strip():
         raise UserInputError(f"source is not a valid Markdown document: {source_path}")
     return source_bytes
+
+
+def _event_journal_change(
+    root: Path,
+    event: Mapping[str, object],
+) -> tuple[Path, bytes]:
+    journal_path = root / "store" / "journal" / "events.jsonl"
+    try:
+        existing_journal = journal_path.read_bytes() if journal_path.exists() else b""
+    except OSError as error:
+        raise IntegrityError(f"cannot read event journal: {journal_path}") from error
+    event_line = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+    return journal_path, existing_journal + event_line
 
 
 class KnowledgeWorkflow:
@@ -765,13 +793,160 @@ class KnowledgeWorkflow:
                 _atomic_commit(
                     self._root,
                     [(workspace.catalog_path, workspace.catalog_content())],
-                    fault_injection="reflect-after-first-replace",
+                    fault_injections={0: "reflect-after-first-replace"},
                 )
         return ReflectionResult(
             candidate_ids=tuple(candidate_ids),
             evidence=evidence,
             insufficient_evidence=False,
             suppressed_count=suppressed_count,
+        )
+
+    def review_candidates(self) -> tuple[CandidateRecord, ...]:
+        configuration = self._root / "myoutbrain.toml"
+        if not configuration.is_file():
+            raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
+        _load_validated_configuration(configuration)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            try:
+                return CandidateWorkspace.load(self._root).list_records()
+            except CandidateWorkspaceError as error:
+                raise IntegrityError(str(error)) from error
+
+    def defer_candidate(self, candidate_id: str) -> None:
+        configuration = self._root / "myoutbrain.toml"
+        if not configuration.is_file():
+            raise ConfigurationConflict(f"MyOutBrain is not initialized at: {self._root}")
+        _load_validated_configuration(configuration)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            try:
+                CandidateWorkspace.load(self._root).get_record(candidate_id)
+            except CandidateWorkspaceError as error:
+                raise UserInputError(str(error)) from error
+            event = {
+                "id": f"evt_{uuid.uuid4().hex}",
+                "type": "candidate.reviewed",
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "candidate_id": candidate_id,
+                "decision": "defer",
+            }
+            _atomic_commit(
+                self._root,
+                [_event_journal_change(self._root, event)],
+            )
+
+    def reject_candidate(self, candidate_id: str) -> None:
+        configuration_path = self._root / "myoutbrain.toml"
+        if not configuration_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain is not initialized at: {self._root}"
+            )
+        configuration = _load_validated_configuration(configuration_path)
+        suppression_days = _candidate_ttl_days(configuration, configuration_path)
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            try:
+                workspace = CandidateWorkspace.load(self._root)
+                occurred_at = datetime.now(timezone.utc)
+                fingerprint, rejection_path, rejection_content = workspace.reject(
+                    candidate_id,
+                    occurred_at,
+                    suppression_days,
+                )
+            except CandidateWorkspaceError as error:
+                raise UserInputError(str(error)) from error
+            event = {
+                "id": f"evt_{uuid.uuid4().hex}",
+                "type": "candidate.reviewed",
+                "occurred_at": occurred_at.isoformat(),
+                "candidate_id": candidate_id,
+                "candidate_fingerprint": fingerprint,
+                "decision": "reject",
+            }
+            _atomic_commit(
+                self._root,
+                [
+                    (workspace.catalog_path, workspace.catalog_content()),
+                    (rejection_path, rejection_content),
+                    _event_journal_change(self._root, event),
+                ],
+            )
+
+    def accept_candidate(
+        self,
+        candidate_id: str,
+        *,
+        title: str,
+        sensitivity: Sensitivity,
+        text: str | None = None,
+    ) -> AcceptResult:
+        configuration_path = self._root / "myoutbrain.toml"
+        if not configuration_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain is not initialized at: {self._root}"
+            )
+        _load_validated_configuration(configuration_path)
+        if sensitivity not in ("local-only", "cloud-allowed"):
+            raise UserInputError(f"invalid sensitivity: {sensitivity}")
+
+        with _writer_lock(self._root):
+            _recover_transactions(self._root)
+            try:
+                workspace = CandidateWorkspace.load(self._root)
+                candidate = workspace.remove(candidate_id)
+            except CandidateWorkspaceError as error:
+                raise UserInputError(str(error)) from error
+
+            occurred_at = datetime.now(timezone.utc)
+            knowledge_id = f"ins_{uuid.uuid4().hex}"
+            try:
+                note = DerivedInsightNote.from_candidate(
+                    candidate,
+                    knowledge_id=knowledge_id,
+                    title=title,
+                    text=text,
+                    sensitivity=sensitivity,
+                    occurred_at=occurred_at,
+                )
+            except KnowledgeNoteError as error:
+                raise UserInputError(str(error)) from error
+            note_path = self._root / "vault" / note.filename
+            if note_path.exists():
+                raise UserInputError(f"knowledge note already exists: {note.filename}")
+
+            event = {
+                "id": f"evt_{uuid.uuid4().hex}",
+                "type": "candidate.reviewed",
+                "occurred_at": occurred_at.isoformat(),
+                "candidate_id": candidate_id,
+                "decision": "accept",
+                "knowledge_id": knowledge_id,
+                "note_path": note_path.relative_to(self._root).as_posix(),
+                "authorship": note.authorship,
+            }
+            _atomic_commit(
+                self._root,
+                [
+                    (workspace.catalog_path, workspace.catalog_content()),
+                    (note_path, note.render()),
+                    _event_journal_change(self._root, event),
+                ],
+                fault_injections={
+                    0: "review-after-first-replace",
+                    1: "review-after-note-replace",
+                },
+            )
+
+        warning = create_obsidian_adapter().open_note(
+            self._root / "vault",
+            note_path,
+        )
+        return AcceptResult(
+            knowledge_id=knowledge_id,
+            note_path=note_path,
+            warning=warning,
         )
 
     def _record_external_call(
@@ -881,7 +1056,7 @@ class KnowledgeWorkflow:
         _atomic_commit(
             self._root,
             changes,
-            fault_injection="capture-after-first-replace",
+            fault_injections={0: "capture-after-first-replace"},
         )
         return disposition
 

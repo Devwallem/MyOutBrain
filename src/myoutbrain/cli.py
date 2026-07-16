@@ -51,6 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
     reflect_parser.add_argument("prompt")
     reflect_parser.add_argument("--root", type=Path, default=Path.cwd())
     reflect_parser.add_argument("--allow-cloud", action="store_true")
+    review_parser = subcommands.add_parser(
+        "review",
+        help="List and review temporary candidate insights",
+    )
+    review_parser.add_argument("candidate_id", nargs="?")
+    review_parser.add_argument("--decision", choices=("defer", "reject", "accept"))
+    review_parser.add_argument("--title")
+    review_parser.add_argument("--text")
+    review_parser.add_argument(
+        "--sensitivity",
+        choices=("local-only", "cloud-allowed"),
+    )
+    review_parser.add_argument("--root", type=Path, default=Path.cwd())
     return parser
 
 
@@ -118,6 +131,58 @@ def _reflect(root: Path, source_id: str, prompt: str, allow_cloud: bool) -> int:
     return 0
 
 
+def _review(
+    root: Path,
+    candidate_id: str | None,
+    decision: str | None,
+    title: str | None,
+    text: str | None,
+    sensitivity: Sensitivity | None,
+) -> int:
+    if candidate_id is not None or decision is not None:
+        if candidate_id is None or decision is None:
+            raise UserInputError("review decision requires a candidate identity")
+        if decision == "defer":
+            KnowledgeWorkflow(root).defer_candidate(candidate_id)
+            print(f"Deferred candidate {candidate_id}")
+            return 0
+        if decision == "reject":
+            KnowledgeWorkflow(root).reject_candidate(candidate_id)
+            print(f"Rejected candidate {candidate_id}")
+            return 0
+        if title is None or sensitivity is None:
+            raise UserInputError(
+                "accepting a candidate requires --title and --sensitivity"
+            )
+        result = KnowledgeWorkflow(root).accept_candidate(
+            candidate_id,
+            title=title,
+            text=text,
+            sensitivity=sensitivity,
+        )
+        print(f"Accepted derived insight {result.knowledge_id} at {result.note_path}")
+        if result.warning is not None:
+            print(f"Warning: {result.warning}", file=sys.stderr)
+        return 0
+    candidates = KnowledgeWorkflow(root).review_candidates()
+    if not candidates:
+        print("No candidate insights awaiting review.")
+        return 0
+    for candidate in candidates:
+        print(f"Candidate {candidate.candidate_id}")
+        print(candidate.text)
+        for citation in candidate.supporting_evidence:
+            print(f"Supporting evidence: [{citation.source_id} @ {citation.locator}]")
+        if candidate.contrary_evidence:
+            for citation in candidate.contrary_evidence:
+                print(f"Contrary evidence: [{citation.source_id} @ {citation.locator}]")
+        else:
+            print("Contrary evidence: none")
+        print(f"Derivation: {candidate.derivation}")
+        print(f"Occurrences: {candidate.occurrence_count}")
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     parsed_arguments = build_parser().parse_args(arguments)
     try:
@@ -142,6 +207,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.source_id,
                 parsed_arguments.prompt,
                 parsed_arguments.allow_cloud,
+            )
+        if parsed_arguments.command == "review":
+            return _review(
+                parsed_arguments.root,
+                parsed_arguments.candidate_id,
+                parsed_arguments.decision,
+                parsed_arguments.title,
+                parsed_arguments.text,
+                parsed_arguments.sensitivity,
             )
     except UserInputError as error:
         print(f"Invalid source: {error}", file=sys.stderr)
