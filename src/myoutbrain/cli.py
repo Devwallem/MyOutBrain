@@ -44,6 +44,7 @@ from myoutbrain.memory_gateway import (
     QueryPurpose,
     RecallRequest,
 )
+from myoutbrain.memory_governance import MemoryGovernanceService
 
 
 EXIT_USER = 2
@@ -192,6 +193,16 @@ def build_parser() -> argparse.ArgumentParser:
     audit_memory_parser.add_argument("query")
     audit_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
     audit_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    forget_memory_parser = subcommands.add_parser(
+        "forget-memory",
+        help="Naturally deactivate or restore one canonical memory",
+    )
+    forget_memory_parser.add_argument("memory_id")
+    forget_memory_parser.add_argument("instruction")
+    forget_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    forget_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     migrate_parser = subcommands.add_parser(
@@ -771,6 +782,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.query,
                 parsed_arguments.format,
             )
+        if parsed_arguments.command == "forget-memory":
+            state_change = MemoryGovernanceService(
+                parsed_arguments.root
+            ).forget(
+                parsed_arguments.memory_id,
+                parsed_arguments.instruction,
+            )
+            if parsed_arguments.format == "json":
+                print(
+                    json.dumps(
+                        state_change.to_data(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(
+                    f"Canonical memory {state_change.memory_id}: "
+                    f"{state_change.action}."
+                )
+            return 0
         if parsed_arguments.command == "migrate-v1":
             return _render_migration_summary(
                 V1PermanentKnowledgeMigrator(parsed_arguments.root).migrate(),

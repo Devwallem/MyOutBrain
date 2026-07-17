@@ -229,6 +229,7 @@ IntegrationAction = Literal["new", "supplement", "revise", "conflict"]
 AppliedIntegrationAction = Literal[
     "created", "supplemented", "revised", "conflicted", "rejected"
 ]
+MemoryLifecycleAction = Literal["deactivated", "reactivated"]
 
 
 @dataclass(frozen=True)
@@ -458,6 +459,36 @@ class UnresolvedMemoryConflict:
 
 
 @dataclass(frozen=True)
+class MemoryLifecycleEvent:
+    action: MemoryLifecycleAction
+    occurred_at: str
+    reason: str
+
+    def to_data(self) -> dict[str, str]:
+        return {
+            "action": self.action,
+            "occurred_at": self.occurred_at,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalMemoryStateChange:
+    memory_id: str
+    action: MemoryLifecycleAction
+    occurred_at: str
+    reason: str
+
+    def to_data(self) -> dict[str, str]:
+        return {
+            "memory_id": self.memory_id,
+            "action": self.action,
+            "occurred_at": self.occurred_at,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
     state: Literal["active", "inactive"]
@@ -467,6 +498,7 @@ class CanonicalMemoryAudit:
     current_source_ids: tuple[str, ...]
     versions: tuple[CanonicalMemoryVersion, ...]
     unresolved_conflicts: tuple[UnresolvedMemoryConflict, ...]
+    lifecycle_events: tuple[MemoryLifecycleEvent, ...]
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -479,6 +511,9 @@ class CanonicalMemoryAudit:
             "versions": [version.to_data() for version in self.versions],
             "unresolved_conflicts": [
                 conflict.to_data() for conflict in self.unresolved_conflicts
+            ],
+            "lifecycle_events": [
+                event.to_data() for event in self.lifecycle_events
             ],
         }
 
@@ -1054,6 +1089,85 @@ class LocalMemoryCore:
             except sqlite3.Error as error:
                 raise IntegrityError("cannot list canonical memory audits") from error
 
+    def set_canonical_memory_active(
+        self,
+        memory_id: str,
+        *,
+        active: bool,
+        reason: str,
+    ) -> CanonicalMemoryStateChange:
+        normalized_memory_id = _required_text("canonical memory id", memory_id)
+        normalized_reason = _required_text("memory lifecycle reason", reason)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        target_state = "active" if active else "inactive"
+        action: MemoryLifecycleAction = "reactivated" if active else "deactivated"
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    row = connection.execute(
+                        "SELECT state FROM canonical_memories WHERE memory_id = ?",
+                        (normalized_memory_id,),
+                    ).fetchone()
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot inspect canonical memory state") from error
+            if row is None:
+                raise UserInputError(
+                    f"canonical memory does not exist: {normalized_memory_id}"
+                )
+            if row[0] == target_state:
+                return CanonicalMemoryStateChange(
+                    memory_id=normalized_memory_id,
+                    action=action,
+                    occurred_at=occurred_at,
+                    reason=normalized_reason,
+                )
+            event_id = f"evt_{uuid.uuid4().hex}"
+            payload = {
+                "memory_id": normalized_memory_id,
+                "action": action,
+                "state": target_state,
+                "reason": normalized_reason,
+            }
+            staged_database = self._database_with_state_change(
+                database_path,
+                memory_id=normalized_memory_id,
+                state=target_state,
+                event_id=event_id,
+                event_type=f"memory.{action}",
+                occurred_at=occurred_at,
+                payload=payload,
+            )
+            atomic_commit(
+                self._root,
+                [
+                    (database_path, staged_database),
+                    (
+                        event_journal_change(
+                            self._root,
+                            {
+                                "id": event_id,
+                                "type": f"memory.{action}",
+                                "occurred_at": occurred_at,
+                                **payload,
+                            },
+                        )
+                    ),
+                ],
+            )
+        return CanonicalMemoryStateChange(
+            memory_id=normalized_memory_id,
+            action=action,
+            occurred_at=occurred_at,
+            reason=normalized_reason,
+        )
+
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
@@ -1160,6 +1274,62 @@ class LocalMemoryCore:
             disposition="duplicate",
             metadata=metadata,
         )
+
+    @staticmethod
+    def _database_with_state_change(
+        database_path: Path,
+        *,
+        memory_id: str,
+        state: str,
+        event_id: str,
+        event_type: str,
+        occurred_at: str,
+        payload: dict[str, str],
+    ) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-state.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                updated = connection.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET state = ?, updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (state, occurred_at, memory_id),
+                )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError("canonical memory state was not updated")
+                connection.execute(
+                    """
+                    INSERT INTO memory_events
+                        (event_id, event_type, occurred_at, subject_id, payload_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        event_type,
+                        occurred_at,
+                        memory_id,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage canonical memory state change") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     @staticmethod
     def _database_with_capture(
@@ -2042,6 +2212,16 @@ def _canonical_memory_audit(
         """,
         (memory_id, memory_id, memory_id),
     ).fetchall()
+    lifecycle_rows = connection.execute(
+        """
+        SELECT event_type, occurred_at, payload_json
+        FROM memory_events
+        WHERE subject_id = ?
+          AND event_type IN ('memory.deactivated', 'memory.reactivated')
+        ORDER BY occurred_at, event_id
+        """,
+        (memory_id,),
+    ).fetchall()
     if (
         current is None
         or not isinstance(current[0], str)
@@ -2070,6 +2250,26 @@ def _canonical_memory_audit(
         )
         for row in conflict_rows
     )
+    lifecycle_events: list[MemoryLifecycleEvent] = []
+    for event_type, occurred_at, payload_json in lifecycle_rows:
+        try:
+            payload = json.loads(payload_json)
+            reason = payload["reason"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise IntegrityError("canonical memory lifecycle audit is invalid") from error
+        if not isinstance(reason, str):
+            raise IntegrityError("canonical memory lifecycle audit is invalid")
+        lifecycle_events.append(
+            MemoryLifecycleEvent(
+                action=(
+                    "deactivated"
+                    if event_type == "memory.deactivated"
+                    else "reactivated"
+                ),
+                occurred_at=occurred_at,
+                reason=reason,
+            )
+        )
     current_version = current[1]
     current_sources = next(
         (
@@ -2088,6 +2288,7 @@ def _canonical_memory_audit(
         current_source_ids=current_sources,
         versions=versions,
         unresolved_conflicts=conflicts,
+        lifecycle_events=tuple(lifecycle_events),
     )
 
 
