@@ -371,6 +371,67 @@ class MemoryGatewayTests(unittest.TestCase):
             self.assertEqual(package.items[0].memory_id, receipt["digest_id"])
             self.assertEqual(package.items[0].match, RecallMatch.FULL_TEXT)
 
+    def test_full_text_recall_excludes_items_sharing_only_a_generic_term(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialization = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialization.returncode, 0, initialization.stderr)
+            receipts: dict[str, dict[str, object]] = {}
+            scenarios = (
+                (
+                    "target",
+                    "Project Orion deployment requires signed manifests.",
+                    "Orion deployment evidence.",
+                ),
+                (
+                    "distractor",
+                    "Project Atlas meetings use a generic project checklist.",
+                    "Atlas meeting evidence.",
+                ),
+            )
+            for index, (name, digest, body) in enumerate(scenarios):
+                conversation = temporary_root / f"{name}.txt"
+                conversation.write_text(body, encoding="utf-8")
+                capture = run_cli(
+                    "remember",
+                    str(conversation),
+                    "--root",
+                    str(instance_root),
+                    "--occurred-at",
+                    f"2026-07-17T15:1{index}:00+08:00",
+                    "--entrance",
+                    "codex",
+                    "--task",
+                    "deployment-review",
+                    "--digest",
+                    digest,
+                    "--sensitivity",
+                    "local-only",
+                    "--visible-context",
+                    "deployment task",
+                    "--context-gap",
+                    "other projects unavailable",
+                    "--format",
+                    "json",
+                )
+                self.assertEqual(capture.returncode, 0, capture.stderr)
+                receipts[name] = json.loads(capture.stdout)
+
+            package = MemoryGateway(instance_root).recall(
+                RecallRequest(
+                    query="How should Project Orion deployment be handled?",
+                    task="deployment-review",
+                    access=MemoryAccess.TASK_SCOPED,
+                    purpose=QueryPurpose.SUBSTANTIVE,
+                )
+            )
+
+            self.assertEqual(
+                [item.memory_id for item in package.items],
+                [receipts["target"]["digest_id"]],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import uuid
 from myoutbrain.core_types import (
     ConfigurationConflict,
     IntegrityError,
+    MemoryState,
     Sensitivity,
     UserInputError,
 )
@@ -165,6 +166,22 @@ class BufferedMemoryReceipt:
         }
 
 
+@dataclass(frozen=True)
+class RecallableMemory:
+    memory_id: str
+    content: str
+    memory_state: MemoryState
+    source_ids: tuple[str, ...]
+    occurred_at: str
+    sensitivity: Sensitivity
+    entrance: str | None
+    task: str | None
+
+    @property
+    def confirmed(self) -> bool:
+        return self.memory_state is MemoryState.CANONICAL
+
+
 class LocalMemoryCore:
     """Own the durable private-instance memory state."""
 
@@ -310,6 +327,99 @@ class LocalMemoryCore:
             disposition="buffered",
             metadata=metadata,
         )
+
+    def recallable_memories(self) -> tuple[RecallableMemory, ...]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise UserInputError(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        try:
+            with writer_lock(self._root):
+                recover_transactions(self._root)
+                self._validate_database(database_path)
+                with closing(sqlite3.connect(database_path)) as connection:
+                    buffered_rows = connection.execute(
+                        """
+                        SELECT d.digest_id, d.content, e.source_id, e.occurred_at,
+                               CASE
+                                   WHEN EXISTS (
+                                       SELECT 1
+                                       FROM experiences AS private_experience
+                                       WHERE private_experience.source_id = e.source_id
+                                         AND private_experience.sensitivity = 'local-only'
+                                   ) THEN 'local-only'
+                                   ELSE e.sensitivity
+                               END AS effective_sensitivity,
+                               e.entrance, e.task
+                        FROM buffered_digests AS d
+                        JOIN experiences AS e
+                          ON e.experience_id = d.experience_id
+                        WHERE d.state = 'buffered'
+                        """
+                    ).fetchall()
+                    canonical_rows = connection.execute(
+                        """
+                        SELECT c.memory_id, c.content, c.updated_at,
+                               CASE
+                                   WHEN c.sensitivity = 'local-only'
+                                     OR EXISTS (
+                                         SELECT 1
+                                         FROM canonical_memory_sources AS private_source
+                                         JOIN experiences AS private_experience
+                                           ON private_experience.source_id = private_source.source_id
+                                         WHERE private_source.memory_id = c.memory_id
+                                           AND private_experience.sensitivity = 'local-only'
+                                     ) THEN 'local-only'
+                                   ELSE 'cloud-allowed'
+                               END AS effective_sensitivity,
+                               GROUP_CONCAT(source.source_id, ',') AS source_ids
+                        FROM canonical_memories AS c
+                        LEFT JOIN canonical_memory_sources AS source
+                          ON source.memory_id = c.memory_id
+                        WHERE c.state = 'active'
+                        GROUP BY c.memory_id, c.content, c.updated_at, c.sensitivity
+                        """
+                    ).fetchall()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot query recallable memory") from error
+        buffered = tuple(
+            RecallableMemory(
+                memory_id=memory_id,
+                content=content,
+                memory_state=MemoryState.BUFFERED,
+                source_ids=(source_id,),
+                occurred_at=occurred_at,
+                sensitivity=sensitivity,
+                entrance=entrance,
+                task=task,
+            )
+            for (
+                memory_id,
+                content,
+                source_id,
+                occurred_at,
+                sensitivity,
+                entrance,
+                task,
+            ) in buffered_rows
+        )
+        canonical = tuple(
+            RecallableMemory(
+                memory_id=memory_id,
+                content=content,
+                memory_state=MemoryState.CANONICAL,
+                source_ids=(
+                    tuple(source_ids.split(",")) if source_ids is not None else ()
+                ),
+                occurred_at=updated_at,
+                sensitivity=sensitivity,
+                entrance=None,
+                task=None,
+            )
+            for memory_id, content, updated_at, sensitivity, source_ids in canonical_rows
+        )
+        return canonical + buffered
 
     @staticmethod
     def _duplicate_receipt(
