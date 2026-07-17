@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -234,6 +234,7 @@ class RecallableMemory:
     sensitivity: Sensitivity
     entrance: str | None
     task: str | None
+    related_memory_ids: tuple[str, ...] = field(default=(), kw_only=True)
 
     @property
     def confirmed(self) -> bool:
@@ -526,6 +527,13 @@ class LocalMemoryCore:
                         GROUP BY c.memory_id, c.content, c.updated_at, c.sensitivity
                         """
                     ).fetchall()
+                    relation_rows = connection.execute(
+                        """
+                        SELECT memory_id, related_memory_id
+                        FROM canonical_memory_relations
+                        ORDER BY memory_id, related_memory_id
+                        """
+                    ).fetchall()
         except sqlite3.Error as error:
             raise IntegrityError("cannot query recallable memory") from error
         buffered = tuple(
@@ -561,6 +569,11 @@ class LocalMemoryCore:
                 sensitivity=sensitivity,
                 entrance=None,
                 task=None,
+                related_memory_ids=tuple(
+                    related_memory_id
+                    for relation_memory_id, related_memory_id in relation_rows
+                    if relation_memory_id == memory_id
+                ),
             )
             for memory_id, content, updated_at, sensitivity, source_ids in canonical_rows
         )

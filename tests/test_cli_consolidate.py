@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from typing import cast
 
-from myoutbrain.core_types import MemoryState
+from myoutbrain.core_types import MemoryState, Sensitivity
 from myoutbrain.embeddings import DeterministicEmbeddingProvider
 from myoutbrain.local_core import LocalMemoryCore
 from tests.cli_support import run_cli
@@ -21,6 +21,7 @@ def remember_digest(
     name: str,
     digest: str,
     task: str = "weekly-review",
+    sensitivity: Sensitivity = "local-only",
 ) -> dict[str, object]:
     conversation = temporary_root / f"{name}.txt"
     conversation.write_text(f"Conversation evidence for {name}.", encoding="utf-8")
@@ -38,7 +39,7 @@ def remember_digest(
         "--digest",
         digest,
         "--sensitivity",
-        "local-only",
+        sensitivity,
         "--visible-context",
         "manual consolidation acceptance",
         "--context-gap",
@@ -357,6 +358,7 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
                 name="first-copy",
                 digest="Weekly reflection makes accumulated lessons reusable.",
                 task="first-pass",
+                sensitivity="cloud-allowed",
             )
             initial_proposal = json.loads(
                 run_cli(
@@ -419,6 +421,45 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
             self.assertEqual(
                 set(canonical[0].source_ids),
                 {first["source_id"], second["source_id"]},
+            )
+            self.assertEqual(canonical[0].sensitivity, "local-only")
+
+            third = remember_digest(
+                temporary_root,
+                instance_root,
+                name="third-copy",
+                digest="Weekly reflection makes accumulated lessons reusable.",
+                task="third-pass",
+                sensitivity="cloud-allowed",
+            )
+            third_proposal = json.loads(
+                run_cli(
+                    "consolidate",
+                    "--task",
+                    "third-pass",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )["proposals"][0]
+            third_review = run_cli(
+                "review-memory",
+                third_proposal["proposal_id"],
+                "accept",
+                "--root",
+                str(instance_root),
+            )
+
+            self.assertEqual(third_review.returncode, 0, third_review.stderr)
+            after_cloud_duplicate = LocalMemoryCore(
+                instance_root
+            ).recallable_memories()
+            self.assertEqual(len(after_cloud_duplicate), 1)
+            self.assertEqual(after_cloud_duplicate[0].sensitivity, "local-only")
+            self.assertEqual(
+                set(after_cloud_duplicate[0].source_ids),
+                {first["source_id"], second["source_id"], third["source_id"]},
             )
 
     def test_natural_edit_and_rejection_preserve_review_history_without_unapproved_semantics(
@@ -637,6 +678,12 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
                     accepted_data["canonical_memory_id"]
                 ].source_ids,
                 (followup["source_id"],),
+            )
+            self.assertEqual(
+                canonical_after_review[
+                    accepted_data["canonical_memory_id"]
+                ].related_memory_ids,
+                (canonical_id,),
             )
 
     def test_v2_memory_store_upgrades_without_losing_public_memory_behavior(
