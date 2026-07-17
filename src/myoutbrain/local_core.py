@@ -37,7 +37,7 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 4
+MEMORY_SCHEMA_VERSION = 5
 MEMORY_DATABASE = "store/memory.sqlite3"
 
 
@@ -181,6 +181,44 @@ CREATE TABLE memory_events (
     occurred_at TEXT NOT NULL,
     subject_id TEXT NOT NULL,
     payload_json TEXT NOT NULL
+);
+
+CREATE TABLE legacy_migration_runs (
+    migration_id TEXT PRIMARY KEY,
+    source_schema_version INTEGER NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status = 'complete'),
+    source_count INTEGER NOT NULL,
+    insight_count INTEGER NOT NULL,
+    cognition_count INTEGER NOT NULL,
+    event_count INTEGER NOT NULL,
+    completed_at TEXT NOT NULL
+);
+
+CREATE TABLE legacy_audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE legacy_source_metadata (
+    source_id TEXT PRIMARY KEY REFERENCES source_objects(source_id),
+    sensitivity TEXT NOT NULL
+        CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+    origins_json TEXT NOT NULL,
+    legacy_record_path TEXT NOT NULL
+);
+
+CREATE TABLE legacy_knowledge_metadata (
+    memory_id TEXT PRIMARY KEY REFERENCES canonical_memories(memory_id),
+    legacy_kind TEXT NOT NULL CHECK (legacy_kind IN ('insight', 'cognition')),
+    legacy_state TEXT NOT NULL
+        CHECK (legacy_state IN ('active', 'superseded', 'archived')),
+    authorship TEXT NOT NULL CHECK (authorship IN ('user', 'system', 'mixed')),
+    legacy_path TEXT NOT NULL,
+    candidate_id TEXT,
+    relations_json TEXT NOT NULL
 );
 """
 
@@ -469,6 +507,10 @@ class LocalMemoryCore:
                     version = 3
                 if version == 3:
                     migrated = self._migrate_v3_database(database_path)
+                    atomic_commit(self._root, [(database_path, migrated)])
+                    version = 4
+                if version == 4:
+                    migrated = self._migrate_v4_database(database_path)
                     atomic_commit(self._root, [(database_path, migrated)])
                 self._validate_database(database_path)
                 return
@@ -1652,6 +1694,73 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v4_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    CREATE TABLE legacy_migration_runs (
+                        migration_id TEXT PRIMARY KEY,
+                        source_schema_version INTEGER NOT NULL,
+                        source_fingerprint TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (status = 'complete'),
+                        source_count INTEGER NOT NULL,
+                        insight_count INTEGER NOT NULL,
+                        cognition_count INTEGER NOT NULL,
+                        event_count INTEGER NOT NULL,
+                        completed_at TEXT NOT NULL
+                    );
+                    CREATE TABLE legacy_audit_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        payload_json TEXT NOT NULL
+                    );
+                    CREATE TABLE legacy_source_metadata (
+                        source_id TEXT PRIMARY KEY REFERENCES source_objects(source_id),
+                        sensitivity TEXT NOT NULL
+                            CHECK (sensitivity IN
+                                ('local-only', 'cloud-allowed')),
+                        origins_json TEXT NOT NULL,
+                        legacy_record_path TEXT NOT NULL
+                    );
+                    CREATE TABLE legacy_knowledge_metadata (
+                        memory_id TEXT PRIMARY KEY
+                            REFERENCES canonical_memories(memory_id),
+                        legacy_kind TEXT NOT NULL
+                            CHECK (legacy_kind IN ('insight', 'cognition')),
+                        legacy_state TEXT NOT NULL
+                            CHECK (legacy_state IN
+                                ('active', 'superseded', 'archived')),
+                        authorship TEXT NOT NULL
+                            CHECK (authorship IN ('user', 'system', 'mixed')),
+                        legacy_path TEXT NOT NULL,
+                        candidate_id TEXT,
+                        relations_json TEXT NOT NULL
+                    );
+                    PRAGMA user_version = 5;
+                    """
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)

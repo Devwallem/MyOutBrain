@@ -22,6 +22,7 @@ from myoutbrain.core_types import (
     WriterLocked,
 )
 from myoutbrain.library import KnowledgeWorkflow
+from myoutbrain.legacy_migration import MigrationSummary, V1PermanentKnowledgeMigrator
 from myoutbrain.generation import ProviderFailure
 from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
 from myoutbrain.memory_gateway import (
@@ -129,6 +130,20 @@ def build_parser() -> argparse.ArgumentParser:
     why_memory_parser.add_argument("memory_id")
     why_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
     why_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    migrate_parser = subcommands.add_parser(
+        "migrate-v1",
+        help="Migrate validated V1 permanent knowledge into canonical memory",
+    )
+    migrate_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migrate_parser.add_argument("--format", choices=("json", "text"), default="text")
+    migration_status_parser = subcommands.add_parser(
+        "migration-status",
+        help="Show V1 permanent-knowledge migration status and audit counts",
+    )
+    migration_status_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migration_status_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
@@ -270,6 +285,31 @@ def _recall(
             f"{item.memory_id} ({item.memory_state.value}, {item.match.value}): "
             f"{item.content}"
         )
+    return 0
+
+
+def _render_migration_summary(
+    summary: MigrationSummary,
+    *,
+    output_format: str,
+) -> int:
+    if output_format == "json":
+        print(json.dumps(summary.to_data(), ensure_ascii=False, sort_keys=True))
+        return 0
+    if summary.status == "not-started":
+        print("V1 permanent-knowledge migration has not started.")
+        return 0
+    disposition = (
+        "already complete"
+        if summary.disposition == "already-complete"
+        else "complete"
+    )
+    print(f"V1 permanent-knowledge migration is {disposition}.")
+    print(
+        f"Migrated {summary.source_count} sources, {summary.insight_count} insights, "
+        f"{summary.cognition_count} cognitions, and {summary.event_count} audit events."
+    )
+    print(f"Source fingerprint: {summary.source_fingerprint}")
     return 0
 
 
@@ -540,6 +580,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 parsed_arguments.memory_id,
                 parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migrate-v1":
+            return _render_migration_summary(
+                V1PermanentKnowledgeMigrator(parsed_arguments.root).migrate(),
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migration-status":
+            return _render_migration_summary(
+                V1PermanentKnowledgeMigrator(parsed_arguments.root).status(),
+                output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "ask":
             return _ask(

@@ -99,6 +99,10 @@ def downgrade_memory_store_to_v3(instance_root: Path) -> None:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
+            DROP TABLE legacy_knowledge_metadata;
+            DROP TABLE legacy_source_metadata;
+            DROP TABLE legacy_audit_events;
+            DROP TABLE legacy_migration_runs;
             DROP TABLE canonical_memory_conflicts;
             DROP TABLE canonical_memory_version_sources;
             DROP TABLE canonical_memory_versions;
