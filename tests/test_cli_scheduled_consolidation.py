@@ -107,6 +107,10 @@ class ScheduledConsolidationTests(unittest.TestCase):
                 "900",
                 "--cost-limit-usd",
                 "0.25",
+                "--input-cost-per-million-usd",
+                "1.0",
+                "--output-cost-per-million-usd",
+                "2.0",
                 "--root",
                 str(instance_root),
                 "--format",
@@ -124,6 +128,8 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(authorization["batch_size"], 3)
             self.assertEqual(authorization["token_limit"], 900)
             self.assertEqual(authorization["cost_limit_usd"], 0.25)
+            self.assertEqual(authorization["input_cost_per_million_usd"], 1.0)
+            self.assertEqual(authorization["output_cost_per_million_usd"], 2.0)
 
             revoked = run_cli(
                 "revoke-scheduled-consolidation",
@@ -159,11 +165,151 @@ class ScheduledConsolidationTests(unittest.TestCase):
                 "900",
                 "--cost-limit-usd",
                 "0.25",
+                "--input-cost-per-million-usd",
+                "1.0",
+                "--output-cost-per-million-usd",
+                "2.0",
                 "--root",
                 str(instance_root),
             )
             self.assertEqual(invalid.returncode, 2)
             self.assertIn("local-only", invalid.stderr)
+
+    def test_scheduled_cloud_run_excludes_local_only_and_obeys_batch_and_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            configuration_path = instance_root / "myoutbrain.toml"
+            configuration = configuration_path.read_text(encoding="utf-8")
+            configuration = configuration.replace(
+                'provider = "openai"\nmodel = "gpt-5-mini"',
+                'provider = "fake"\nmodel = "analysis-v1"',
+                1,
+            )
+            configuration_path.write_text(configuration, encoding="utf-8")
+            private = remember_digest(
+                temporary_root,
+                instance_root,
+                name="scheduled-private",
+                digest="Private salary correction must remain local.",
+                task="cloud-nightly",
+                sensitivity="local-only",
+            )
+            shareable = remember_digest(
+                temporary_root,
+                instance_root,
+                name="scheduled-shareable",
+                digest="Shareable launch correction may be analyzed remotely.",
+                task="cloud-nightly",
+                sensitivity="cloud-allowed",
+            )
+            deferred = remember_digest(
+                temporary_root,
+                instance_root,
+                name="scheduled-deferred",
+                digest="Second shareable item waits for the next bounded batch.",
+                task="cloud-nightly",
+                sensitivity="cloud-allowed",
+            )
+            authorized = run_cli(
+                "authorize-scheduled-consolidation",
+                "--provider",
+                "fake",
+                "--model",
+                "analysis-v1",
+                "--allowed-sensitivity",
+                "cloud-allowed",
+                "--batch-size",
+                "1",
+                "--token-limit",
+                "2000",
+                "--cost-limit-usd",
+                "0.01",
+                "--input-cost-per-million-usd",
+                "1.0",
+                "--output-cost-per-million-usd",
+                "2.0",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(authorized.returncode, 0, authorized.stderr)
+            scheduled = run_cli(
+                "schedule-consolidation",
+                "cloud-nightly",
+                "--task",
+                "cloud-nightly",
+                "--run-at",
+                "2026-07-20T03:00:00+08:00",
+                "--every-hours",
+                "24",
+                "--mode",
+                "cloud",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+            request_path = temporary_root / "scheduled-request.json"
+            candidate_text = (
+                "Remote analysis proposes the shareable launch correction."
+            )
+            response = {
+                "candidates": [
+                    {
+                        "text": candidate_text,
+                        "supporting_evidence": [
+                            {
+                                "source_id": shareable["digest_id"],
+                                "locator": "memory-buffer",
+                            }
+                        ],
+                        "contrary_evidence": [],
+                        "derivation": "Bounded comparison of the supplied digest.",
+                    }
+                ],
+                "insufficient_evidence": False,
+            }
+
+            run_result = run_cli(
+                "run-scheduled-consolidation",
+                "cloud-nightly",
+                "--now",
+                "2026-07-20T03:00:00+08:00",
+                "--conversation-state",
+                "active",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_FAKE_REQUEST_FILE": str(request_path),
+                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": json.dumps(response),
+                },
+            )
+
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
+            run = json.loads(run_result.stdout)
+            self.assertEqual(run["mode"], "cloud")
+            self.assertEqual(run["canonical_changes"], 0)
+            self.assertEqual(len(run["proposals"]), 1)
+            self.assertEqual(
+                run["proposals"][0]["proposed_understanding"],
+                candidate_text,
+            )
+            recorded = json.loads(request_path.read_text(encoding="utf-8"))
+            serialized_request = json.dumps(recorded, ensure_ascii=False)
+            self.assertIn(str(shareable["digest_id"]), serialized_request)
+            self.assertNotIn(str(private["digest_id"]), serialized_request)
+            self.assertNotIn(str(deferred["digest_id"]), serialized_request)
+            self.assertEqual(recorded["authorization"], {"allow_cloud": True})
+            self.assertEqual(recorded["purpose"], "scheduled-consolidation")
+            self.assertLessEqual(recorded["max_output_tokens"], 2000)
+            self.assertEqual(recorded["max_cost_usd"], 0.01)
 
     def test_explicit_local_schedule_runs_when_due_and_only_creates_proposals(
         self,

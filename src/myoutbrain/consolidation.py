@@ -9,6 +9,15 @@ from typing import Literal, cast
 import uuid
 
 from myoutbrain.core_types import ConfigurationConflict, IntegrityError, UserInputError
+from myoutbrain.generation import (
+    Citation,
+    CloudAuthorization,
+    EvidenceItem,
+    EvidencePackage,
+    GenerationProvider,
+    GenerationRequest,
+    ProviderFailure,
+)
 from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
 from myoutbrain.persistence import (
     atomic_commit,
@@ -32,6 +41,8 @@ class ScheduledCloudAuthorization:
     batch_size: int
     token_limit: int
     cost_limit_usd: float
+    input_cost_per_million_usd: float
+    output_cost_per_million_usd: float
     status: AuthorizationStatus
     authorized_at: str
     revoked_at: str | None = None
@@ -46,6 +57,8 @@ class ScheduledCloudAuthorization:
         batch_size: int,
         token_limit: int,
         cost_limit_usd: float,
+        input_cost_per_million_usd: float,
+        output_cost_per_million_usd: float,
     ) -> ScheduledCloudAuthorization:
         normalized_provider = _required_text("provider", provider)
         normalized_model = _required_text("model", model)
@@ -59,6 +72,8 @@ class ScheduledCloudAuthorization:
             raise UserInputError("scheduled cloud token-limit must be positive")
         if cost_limit_usd <= 0:
             raise UserInputError("scheduled cloud cost-limit-usd must be positive")
+        if input_cost_per_million_usd <= 0 or output_cost_per_million_usd <= 0:
+            raise UserInputError("scheduled cloud token pricing must be positive")
         return cls(
             provider=normalized_provider,
             model=normalized_model,
@@ -66,6 +81,8 @@ class ScheduledCloudAuthorization:
             batch_size=batch_size,
             token_limit=token_limit,
             cost_limit_usd=cost_limit_usd,
+            input_cost_per_million_usd=input_cost_per_million_usd,
+            output_cost_per_million_usd=output_cost_per_million_usd,
             status="active",
             authorized_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -78,6 +95,8 @@ class ScheduledCloudAuthorization:
             "batch_size": self.batch_size,
             "token_limit": self.token_limit,
             "cost_limit_usd": self.cost_limit_usd,
+            "input_cost_per_million_usd": self.input_cost_per_million_usd,
+            "output_cost_per_million_usd": self.output_cost_per_million_usd,
             "status": self.status,
             "authorized_at": self.authorized_at,
             "revoked_at": self.revoked_at,
@@ -141,6 +160,8 @@ class ConsolidationScheduler:
         batch_size: int,
         token_limit: int,
         cost_limit_usd: float,
+        input_cost_per_million_usd: float,
+        output_cost_per_million_usd: float,
     ) -> ScheduledCloudAuthorization:
         authorization = ScheduledCloudAuthorization.create(
             provider=provider,
@@ -149,6 +170,8 @@ class ConsolidationScheduler:
             batch_size=batch_size,
             token_limit=token_limit,
             cost_limit_usd=cost_limit_usd,
+            input_cost_per_million_usd=input_cost_per_million_usd,
+            output_cost_per_million_usd=output_cost_per_million_usd,
         )
         self._write_authorization(authorization, event_type="authorized")
         return authorization
@@ -242,13 +265,13 @@ class ConsolidationScheduler:
                 raise UserInputError(
                     f"scheduled consolidation is not due: {normalized_schedule_id}"
                 )
+        external_audit: dict[str, object] | None = None
         if schedule.mode == "cloud":
-            raise UserInputError(
-                "scheduled cloud analysis requires a configured capability adapter"
+            proposals, external_audit = self._run_cloud_analysis(schedule)
+        else:
+            proposals = LocalMemoryCore(self._root).propose_manual_consolidation(
+                schedule.task
             )
-        proposals = LocalMemoryCore(self._root).propose_manual_consolidation(
-            schedule.task
-        )
         due_at = datetime.fromisoformat(schedule.next_run_at)
         next_run_at = (due_at + timedelta(hours=schedule.every_hours)).isoformat()
         run_id = "run_" + hashlib.sha256(
@@ -294,11 +317,123 @@ class ConsolidationScheduler:
                                 proposal.proposal_id for proposal in proposals
                             ],
                             "canonical_changes": 0,
+                            "external_analysis": external_audit,
                         },
                     ),
                 ],
             )
         return run
+
+    def _run_cloud_analysis(
+        self,
+        schedule: ConsolidationSchedule,
+        *,
+        provider: GenerationProvider | None = None,
+    ) -> tuple[tuple[IntegrationProposal, ...], dict[str, object]]:
+        authorization = self.authorization()
+        if authorization.status != "active":
+            raise UserInputError("scheduled cloud authorization has been revoked")
+        if provider is None:
+            from myoutbrain.library import configured_generation_provider
+
+            provider = configured_generation_provider(self._root)
+        if (
+            provider.name != authorization.provider
+            or provider.model != authorization.model
+        ):
+            raise UserInputError(
+                "scheduled cloud provider/model exceeds standing authorization"
+            )
+        core = LocalMemoryCore(self._root)
+        batch = core.buffered_consolidation_batch(
+            schedule.task,
+            sensitivity="cloud-allowed",
+            limit=authorization.batch_size,
+        )
+        if not batch:
+            return (), {
+                "provider": provider.name,
+                "model": provider.model,
+                "evidence_memory_ids": [],
+                "result": "no-eligible-evidence",
+            }
+        evidence = tuple(
+            EvidenceItem(
+                citation=Citation(
+                    source_id=item.digest_id,
+                    locator="memory-buffer",
+                ),
+                content=item.content,
+            )
+            for item in batch
+        )
+        package = EvidencePackage(
+            question=(
+                "Prepare one bounded integration proposal from these memory digests."
+            ),
+            items=evidence,
+        )
+        serialized_input = json.dumps(
+            package.to_data(), ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        input_token_upper_bound = len(serialized_input) + 256
+        max_output_tokens = authorization.token_limit - input_token_upper_bound
+        if max_output_tokens <= 0:
+            raise UserInputError(
+                "scheduled cloud request exceeds the authorized token limit"
+            )
+        max_estimated_cost_usd = (
+            input_token_upper_bound
+            * authorization.input_cost_per_million_usd
+            + max_output_tokens
+            * authorization.output_cost_per_million_usd
+        ) / 1_000_000
+        if max_estimated_cost_usd > authorization.cost_limit_usd:
+            raise UserInputError(
+                "scheduled cloud request exceeds the authorized cost limit"
+            )
+        request = GenerationRequest(
+            purpose="scheduled-consolidation",
+            authorization=CloudAuthorization(allow_cloud=True),
+            evidence_package=package,
+            max_output_tokens=max_output_tokens,
+            max_cost_usd=authorization.cost_limit_usd,
+        )
+        reflection = provider.reflect(request)
+        allowed_citations = {item.citation for item in evidence}
+        for candidate in reflection.candidates:
+            if any(
+                citation not in allowed_citations
+                for citation in (
+                    *candidate.supporting_evidence,
+                    *candidate.contrary_evidence,
+                )
+            ):
+                raise ProviderFailure(
+                    "scheduled cloud analysis cited evidence outside its batch"
+                )
+        if reflection.insufficient_evidence:
+            proposals: tuple[IntegrationProposal, ...] = ()
+        else:
+            if len(reflection.candidates) != 1:
+                raise ProviderFailure(
+                    "scheduled cloud analysis must return exactly one candidate"
+                )
+            proposals = core.propose_manual_consolidation(
+                schedule.task,
+                digest_ids=tuple(item.digest_id for item in batch),
+                proposed_understanding=reflection.candidates[0].text,
+            )
+        return proposals, {
+            "provider": provider.name,
+            "model": provider.model,
+            "evidence_memory_ids": [item.digest_id for item in batch],
+            "input_token_upper_bound": input_token_upper_bound,
+            "max_output_tokens": max_output_tokens,
+            "max_estimated_cost_usd": max_estimated_cost_usd,
+            "cost_limit_usd": authorization.cost_limit_usd,
+            "result": "proposed" if proposals else "insufficient-evidence",
+        }
 
     def _write_authorization(
         self,
@@ -330,6 +465,12 @@ class ConsolidationScheduler:
                             "batch_size": authorization.batch_size,
                             "token_limit": authorization.token_limit,
                             "cost_limit_usd": authorization.cost_limit_usd,
+                            "input_cost_per_million_usd": (
+                                authorization.input_cost_per_million_usd
+                            ),
+                            "output_cost_per_million_usd": (
+                                authorization.output_cost_per_million_usd
+                            ),
                         },
                     ),
                 ],
@@ -352,6 +493,12 @@ class ConsolidationScheduler:
                 batch_size=cast(int, raw["batch_size"]),
                 token_limit=cast(int, raw["token_limit"]),
                 cost_limit_usd=float(cast(int | float, raw["cost_limit_usd"])),
+                input_cost_per_million_usd=float(
+                    cast(int | float, raw["input_cost_per_million_usd"])
+                ),
+                output_cost_per_million_usd=float(
+                    cast(int | float, raw["output_cost_per_million_usd"])
+                ),
                 status=cast(AuthorizationStatus, status),
                 authorized_at=cast(str, raw["authorized_at"]),
                 revoked_at=cast(str | None, raw.get("revoked_at")),

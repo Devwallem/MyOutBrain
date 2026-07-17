@@ -191,6 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--cost-limit-usd", type=float, required=True
     )
     scheduled_authorization_parser.add_argument(
+        "--input-cost-per-million-usd", type=float, required=True
+    )
+    scheduled_authorization_parser.add_argument(
+        "--output-cost-per-million-usd", type=float, required=True
+    )
+    scheduled_authorization_parser.add_argument(
         "--root", type=Path, default=Path.cwd()
     )
     scheduled_authorization_parser.add_argument(
@@ -937,6 +943,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 batch_size=parsed_arguments.batch_size,
                 token_limit=parsed_arguments.token_limit,
                 cost_limit_usd=parsed_arguments.cost_limit_usd,
+                input_cost_per_million_usd=(
+                    parsed_arguments.input_cost_per_million_usd
+                ),
+                output_cost_per_million_usd=(
+                    parsed_arguments.output_cost_per_million_usd
+                ),
             )
             return _render_scheduled_authorization(
                 authorization.to_data(), parsed_arguments.format

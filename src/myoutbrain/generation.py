@@ -58,13 +58,20 @@ class GenerationRequest:
     purpose: str
     authorization: CloudAuthorization
     evidence_package: EvidencePackage
+    max_output_tokens: int | None = None
+    max_cost_usd: float | None = None
 
     def to_data(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "purpose": self.purpose,
             "authorization": self.authorization.to_data(),
             "evidence_package": self.evidence_package.to_data(),
         }
+        if self.max_output_tokens is not None:
+            data["max_output_tokens"] = self.max_output_tokens
+        if self.max_cost_usd is not None:
+            data["max_cost_usd"] = self.max_cost_usd
+        return data
 
 
 @dataclass(frozen=True)
@@ -283,6 +290,8 @@ class OpenAIGenerationProvider:
                 }
             },
         }
+        if request.max_output_tokens is not None:
+            body["max_output_tokens"] = request.max_output_tokens
         api_request = url_request.Request(
             endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -334,6 +334,15 @@ class RecallableMemory:
     @property
     def confirmed(self) -> bool:
         return self.memory_state is MemoryState.CANONICAL
+
+
+@dataclass(frozen=True)
+class BufferedConsolidationItem:
+    digest_id: str
+    content: str
+    source_id: str
+    task: str
+    sensitivity: Sensitivity
 
 
 @dataclass(frozen=True)
@@ -939,8 +948,15 @@ class LocalMemoryCore:
         task: str,
         *,
         embedding_provider: EmbeddingProvider | None = None,
+        digest_ids: tuple[str, ...] | None = None,
+        proposed_understanding: str | None = None,
     ) -> tuple[IntegrationProposal, ...]:
         normalized_task = _required_text("consolidation task", task)
+        normalized_digest_ids = (
+            tuple(_required_text("digest id", value) for value in digest_ids)
+            if digest_ids is not None
+            else None
+        )
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
             raise ConfigurationConflict(
@@ -951,8 +967,16 @@ class LocalMemoryCore:
             self._validate_database(database_path)
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
+                    digest_filter = ""
+                    parameters: list[str] = [normalized_task]
+                    if normalized_digest_ids is not None:
+                        if not normalized_digest_ids:
+                            return ()
+                        placeholders = ", ".join("?" for _ in normalized_digest_ids)
+                        digest_filter = f" AND d.digest_id IN ({placeholders})"
+                        parameters.extend(normalized_digest_ids)
                     rows = connection.execute(
-                        """
+                        f"""
                         SELECT d.digest_id, d.content, e.source_id, e.sensitivity
                         FROM buffered_digests AS d
                         JOIN experiences AS e
@@ -964,9 +988,10 @@ class LocalMemoryCore:
                               FROM integration_proposal_buffered AS proposed
                               WHERE proposed.digest_id = d.digest_id
                           )
+                          {digest_filter}
                         ORDER BY d.created_at, d.digest_id
                         """,
-                        (normalized_task,),
+                        parameters,
                     ).fetchall()
                     canonical_rows = connection.execute(
                         """
@@ -996,6 +1021,23 @@ class LocalMemoryCore:
                 canonical_candidates,
                 embedding_provider or LocalMultilingualEmbeddingProvider(),
             )
+            if proposed_understanding is not None:
+                normalized_understanding = _required_text(
+                    "proposed understanding", proposed_understanding
+                )
+                if len(normalized_understanding) > 500:
+                    raise UserInputError(
+                        "proposed understanding must not exceed 500 characters"
+                    )
+                if len(drafts) != 1:
+                    raise UserInputError(
+                        "cloud analysis must map to exactly one bounded proposal"
+                    )
+                drafts = (
+                    replace(
+                        drafts[0], proposed_understanding=normalized_understanding
+                    ),
+                )
             staged_database = self._database_with_integration_proposals(
                 database_path,
                 drafts=drafts,
@@ -1020,6 +1062,62 @@ class LocalMemoryCore:
                 ],
             )
         return tuple(draft.as_proposal() for draft in drafts)
+
+    def buffered_consolidation_batch(
+        self,
+        task: str,
+        *,
+        sensitivity: Sensitivity,
+        limit: int,
+    ) -> tuple[BufferedConsolidationItem, ...]:
+        normalized_task = _required_text("consolidation task", task)
+        if sensitivity not in ("local-only", "cloud-allowed"):
+            raise UserInputError(f"invalid sensitivity: {sensitivity}")
+        if limit <= 0:
+            raise UserInputError("consolidation batch limit must be positive")
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT d.digest_id, d.content, e.source_id, e.task,
+                               e.sensitivity
+                        FROM buffered_digests AS d
+                        JOIN experiences AS e
+                          ON e.experience_id = d.experience_id
+                        WHERE d.state = 'buffered'
+                          AND e.task = ?
+                          AND e.sensitivity = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM integration_proposal_buffered AS proposed
+                              WHERE proposed.digest_id = d.digest_id
+                          )
+                        ORDER BY d.created_at, d.digest_id
+                        LIMIT ?
+                        """,
+                        (normalized_task, sensitivity, limit),
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise IntegrityError(
+                    "cannot select bounded consolidation batch"
+                ) from error
+        return tuple(
+            BufferedConsolidationItem(
+                digest_id=row[0],
+                content=row[1],
+                source_id=row[2],
+                task=row[3],
+                sensitivity=row[4],
+            )
+            for row in rows
+        )
 
     def review_integration_proposal(
         self,
