@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 from typing import Literal
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from myoutbrain.generation import ProviderFailure
 
@@ -44,8 +46,14 @@ class PublicQueryUnavailable(Exception):
     """Raised when no trusted local adapter can produce a public-safe query."""
 
 
-def sanitized_public_query(question: str) -> str:
-    configured = os.environ.get("MYOUTBRAIN_FAKE_SANITIZED_QUERY")
+def sanitized_public_query(
+    question: str,
+    *,
+    trusted_query: str | None = None,
+) -> str:
+    configured = trusted_query
+    if configured is None:
+        configured = os.environ.get("MYOUTBRAIN_FAKE_SANITIZED_QUERY")
     if configured is None:
         raise PublicQueryUnavailable(
             "no trusted local sanitizer produced a public-safe query"
@@ -71,6 +79,8 @@ def search_public_sources(
         )
     serialized = os.environ.get("MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE")
     if serialized is None:
+        serialized = _search_configured_endpoint(query)
+    if serialized is None:
         return ()
     try:
         response = json.loads(serialized)
@@ -90,6 +100,31 @@ def search_public_sources(
     sources = tuple(accepted_sources)
     sources = tuple(source for source in sources if _is_current(source, time_sensitive))
     return sources
+
+
+def _search_configured_endpoint(query: str) -> str | None:
+    endpoint = os.environ.get("MYOUTBRAIN_PUBLIC_SEARCH_ENDPOINT")
+    if endpoint is None:
+        return None
+    parsed_endpoint = urlparse(endpoint)
+    if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
+        raise ProviderFailure("public search endpoint must use HTTPS")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    api_key = os.environ.get("MYOUTBRAIN_PUBLIC_SEARCH_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = Request(
+        endpoint,
+        data=json.dumps({"query": query}, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            response_body: bytes = response.read()
+            return response_body.decode("utf-8")
+    except (HTTPError, URLError, TimeoutError, UnicodeError, OSError) as error:
+        raise ProviderFailure("public search provider request failed") from error
 
 
 def public_sources_conflict(sources: tuple[PublicSource, ...]) -> bool:

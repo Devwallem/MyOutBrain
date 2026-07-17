@@ -73,6 +73,10 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 "atlas-planning",
                 "--access",
                 "local-trusted",
+                "--risk-level",
+                "standard",
+                "--freshness",
+                "stable",
                 "--format",
                 "json",
                 environment={
@@ -176,10 +180,11 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 "--access",
                 "local-trusted",
                 "--time-sensitive",
+                "--public-query",
+                public_query,
                 "--format",
                 "json",
                 environment={
-                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": public_query,
                     "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": search_response,
                     "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_REQUEST_FILE": str(
                         search_request
@@ -267,6 +272,10 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 str(instance_root),
                 "--task",
                 "architecture-history",
+                "--risk-level",
+                "standard",
+                "--freshness",
+                "stable",
                 "--format",
                 "json",
                 environment={
@@ -289,6 +298,31 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(len(result["unresolved_gaps"]), 1)
             self.assertEqual(len(result["next_steps"]), 1)
             self.assertIsNone(result["memory_update_id"])
+            text_answer = run_cli(
+                "answer",
+                "Why did the project choose its final architecture?",
+                "--root",
+                str(instance_root),
+                "--task",
+                "architecture-history",
+                "--risk-level",
+                "standard",
+                "--freshness",
+                "stable",
+                "--public-query",
+                "project architecture history",
+                "--format",
+                "text",
+                environment={
+                    "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": search_response,
+                    "MYOUTBRAIN_FAKE_RESPONSE": generated_response,
+                },
+            )
+            self.assertEqual(text_answer.returncode, 0, text_answer.stderr)
+            self.assertIn("Public source: Partial history", text_answer.stdout)
+            self.assertIn(url, text_answer.stdout)
+            self.assertIn("published 2025-01-01T09:00:00+00:00", text_answer.stdout)
+            self.assertIn("retrieved 2026-07-17T09:00:00+00:00", text_answer.stdout)
 
     def test_local_only_memory_never_reaches_cloud_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -660,6 +694,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(answered.returncode, 0, answered.stderr)
             self.assertIn("Official Nova release", answered.stdout)
             self.assertIn(url, answered.stdout)
+            self.assertIn("Companion inference: Nova releases", answered.stdout)
+            self.assertIn("Evidence origin (public-evidence)", answered.stdout)
             self.assertIn("published 2026-07-16T09:00:00+00:00", answered.stdout)
             self.assertIn("retrieved 2026-07-17T09:00:00+00:00", answered.stdout)
 
@@ -724,6 +760,10 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 memory_id,
                 "--query-sensitivity",
                 "cloud-allowed",
+                "--risk-level",
+                "standard",
+                "--freshness",
+                "stable",
                 "--format",
                 "json",
                 environment={"MYOUTBRAIN_FAKE_RESPONSE": generated_response},

@@ -7,7 +7,13 @@ from pathlib import Path
 import shutil
 import sys
 
-from myoutbrain.answering import AnswerRequest, CompanionAnswerService
+from myoutbrain.answering import (
+    AnswerRequest,
+    CompanionAnswer,
+    CompanionAnswerService,
+    FreshnessRequirement,
+    RiskLevel,
+)
 from myoutbrain.evaluation import (
     evaluate_recall,
     load_recall_dataset,
@@ -121,6 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
     answer_parser.add_argument("--limit", type=int, default=5)
     answer_parser.add_argument("--high-risk", action="store_true")
     answer_parser.add_argument("--time-sensitive", action="store_true")
+    answer_parser.add_argument(
+        "--risk-level",
+        choices=("unclassified", "standard", "high-risk"),
+        default="unclassified",
+        help="Trusted risk classification; unclassified requires public verification",
+    )
+    answer_parser.add_argument(
+        "--freshness",
+        choices=("unclassified", "stable", "time-sensitive"),
+        default="unclassified",
+        help="Trusted freshness classification; unclassified requires current evidence",
+    )
+    answer_parser.add_argument(
+        "--public-query",
+        help="Explicit public-safe query; private context must be removed before use",
+    )
     answer_parser.add_argument("--allow-cloud", action="store_true")
     answer_parser.add_argument(
         "--query-sensitivity",
@@ -324,6 +346,9 @@ def _answer(
     limit: int,
     high_risk: bool,
     time_sensitive: bool,
+    risk_level: RiskLevel,
+    freshness: FreshnessRequirement,
+    public_query: str | None,
     allow_cloud: bool,
     query_sensitivity: Sensitivity,
     output_format: str,
@@ -336,8 +361,9 @@ def _answer(
             memory_ids=tuple(memory_ids),
             source_ids=tuple(source_ids),
             limit=limit,
-            high_risk=high_risk,
-            time_sensitive=time_sensitive,
+            risk_level="high-risk" if high_risk else risk_level,
+            freshness="time-sensitive" if time_sensitive else freshness,
+            public_query=public_query,
             allow_cloud=allow_cloud,
             query_sensitivity=query_sensitivity,
         )
@@ -349,22 +375,30 @@ def _answer(
         print("The answer remains unknown.")
         for fact in result.verified_facts:
             print(f"Verified: {fact}")
+        _print_public_sources(result)
         for gap in result.unresolved_gaps:
             print(f"Unresolved: {gap}")
         for step in result.next_steps:
             print(f"Next: {step}")
         return 0
     for claim in result.claims:
-        print(claim.text)
-        print(f"Evidence ({claim.origin}): {', '.join(claim.source_ids)}")
+        print(f"Companion inference: {claim.text}")
+        print(
+            f"Evidence origin ({', '.join(claim.evidence_origins)}): "
+            f"{', '.join(claim.source_ids)}"
+        )
+    _print_public_sources(result)
+    if result.companion_inference is not None:
+        print(f"Inference: {result.companion_inference}")
+    return 0
+
+
+def _print_public_sources(result: CompanionAnswer) -> None:
     for source in result.public_sources:
         print(
             f"Public source: {source.title} — {source.url} "
             f"(published {source.published_at}; retrieved {source.retrieved_at})"
         )
-    if result.companion_inference is not None:
-        print(f"Inference: {result.companion_inference}")
-    return 0
 
 
 def _render_migration_summary(
@@ -652,6 +686,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 limit=parsed_arguments.limit,
                 high_risk=parsed_arguments.high_risk,
                 time_sensitive=parsed_arguments.time_sensitive,
+                risk_level=parsed_arguments.risk_level,
+                freshness=parsed_arguments.freshness,
+                public_query=parsed_arguments.public_query,
                 allow_cloud=parsed_arguments.allow_cloud,
                 query_sensitivity=parsed_arguments.query_sensitivity,
                 output_format=parsed_arguments.format,

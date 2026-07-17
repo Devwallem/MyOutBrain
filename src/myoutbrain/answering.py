@@ -39,6 +39,8 @@ from myoutbrain.public_search import (
 
 
 AnswerStatus = Literal["answered", "unknown"]
+RiskLevel = Literal["unclassified", "standard", "high-risk"]
+FreshnessRequirement = Literal["unclassified", "stable", "time-sensitive"]
 AnswerOrigin = Literal[
     "common-knowledge",
     "public-evidence",
@@ -53,8 +55,9 @@ class AnswerRequest:
     access: MemoryAccess
     query_sensitivity: Sensitivity = "local-only"
     allow_cloud: bool = False
-    high_risk: bool = False
-    time_sensitive: bool = False
+    risk_level: RiskLevel = "unclassified"
+    freshness: FreshnessRequirement = "unclassified"
+    public_query: str | None = None
     memory_ids: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
     limit: int = 5
@@ -144,11 +147,10 @@ class CompanionAnswerService:
         internal_sensitivity = {
             item.memory_id: item.sensitivity for item in package.items
         }
-        time_sensitive = request.time_sensitive or _is_time_sensitive(question)
+        time_sensitive = request.freshness != "stable"
         requires_public_verification = (
-            request.high_risk
-            or time_sensitive
-            or _is_high_risk(question)
+            request.risk_level != "standard"
+            or request.freshness != "stable"
             or bool(package.unresolved_conflicts)
             or _contains_stale_internal_evidence(package.items)
         )
@@ -182,7 +184,10 @@ class CompanionAnswerService:
                 verified_facts = tuple(claim.text for claim in generated.claims)
 
         try:
-            public_query = sanitized_public_query(question)
+            public_query = sanitized_public_query(
+                question,
+                trusted_query=request.public_query,
+            )
         except PublicQueryUnavailable:
             return _unknown_answer(question, verified_facts=verified_facts)
         public_sources = search_public_sources(
@@ -428,49 +433,6 @@ def _eligible_internal_evidence(
         item
         for item, sensitivity in zip(evidence, sensitivities, strict=True)
         if sensitivity == "cloud-allowed"
-    )
-
-
-def _is_time_sensitive(question: str) -> bool:
-    folded = question.casefold()
-    return any(
-        marker in folded
-        for marker in (
-            "current",
-            "latest",
-            "today",
-            "now",
-            "price",
-            "schedule",
-            "release date",
-            "目前",
-            "最新",
-            "今天",
-            "价格",
-            "时间表",
-        )
-    )
-
-
-def _is_high_risk(question: str) -> bool:
-    folded = question.casefold()
-    return any(
-        marker in folded
-        for marker in (
-            "medical",
-            "diagnosis",
-            "legal",
-            "tax",
-            "investment",
-            "financial",
-            "safety",
-            "健康",
-            "诊断",
-            "法律",
-            "税务",
-            "投资",
-            "安全",
-        )
     )
 
 
