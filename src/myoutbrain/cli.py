@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 
+from myoutbrain.answering import AnswerRequest, CompanionAnswerService
 from myoutbrain.evaluation import (
     evaluate_recall,
     load_recall_dataset,
@@ -103,6 +104,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly classify whether the query itself may leave this machine",
     )
     recall_parser.add_argument("--format", choices=("json", "text"), default="text")
+    answer_parser = subcommands.add_parser(
+        "answer",
+        help="Answer from common knowledge with sanitized public-research fallback",
+    )
+    answer_parser.add_argument("question")
+    answer_parser.add_argument("--root", type=Path, default=Path.cwd())
+    answer_parser.add_argument("--task", required=True)
+    answer_parser.add_argument(
+        "--access",
+        choices=tuple(level.value for level in MemoryAccess),
+        default=MemoryAccess.TASK_SCOPED.value,
+    )
+    answer_parser.add_argument("--memory-id", action="append", default=[])
+    answer_parser.add_argument("--source-id", action="append", default=[])
+    answer_parser.add_argument("--limit", type=int, default=5)
+    answer_parser.add_argument("--high-risk", action="store_true")
+    answer_parser.add_argument("--time-sensitive", action="store_true")
+    answer_parser.add_argument("--allow-cloud", action="store_true")
+    answer_parser.add_argument(
+        "--query-sensitivity",
+        choices=("local-only", "cloud-allowed"),
+        default="local-only",
+    )
+    answer_parser.add_argument("--format", choices=("json", "text"), default="text")
     consolidate_parser = subcommands.add_parser(
         "consolidate",
         help="Manually prepare buffered memory for natural review",
@@ -285,6 +310,55 @@ def _recall(
             f"{item.memory_id} ({item.memory_state.value}, {item.match.value}): "
             f"{item.content}"
         )
+    return 0
+
+
+def _answer(
+    root: Path,
+    question: str,
+    *,
+    task: str,
+    access: str,
+    memory_ids: Sequence[str],
+    source_ids: Sequence[str],
+    limit: int,
+    high_risk: bool,
+    time_sensitive: bool,
+    allow_cloud: bool,
+    query_sensitivity: Sensitivity,
+    output_format: str,
+) -> int:
+    result = CompanionAnswerService(root).answer(
+        AnswerRequest(
+            question=question,
+            task=task,
+            access=MemoryAccess(access),
+            memory_ids=tuple(memory_ids),
+            source_ids=tuple(source_ids),
+            limit=limit,
+            high_risk=high_risk,
+            time_sensitive=time_sensitive,
+            allow_cloud=allow_cloud,
+            query_sensitivity=query_sensitivity,
+        )
+    )
+    if output_format == "json":
+        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+        return 0
+    if result.status == "unknown":
+        print("The answer remains unknown.")
+        for fact in result.verified_facts:
+            print(f"Verified: {fact}")
+        for gap in result.unresolved_gaps:
+            print(f"Unresolved: {gap}")
+        for step in result.next_steps:
+            print(f"Next: {step}")
+        return 0
+    for claim in result.claims:
+        print(claim.text)
+        print(f"Evidence ({claim.origin}): {', '.join(claim.source_ids)}")
+    if result.companion_inference is not None:
+        print(f"Inference: {result.companion_inference}")
     return 0
 
 
@@ -559,6 +633,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 memory_ids=parsed_arguments.memory_id,
                 source_ids=parsed_arguments.source_id,
                 limit=parsed_arguments.limit,
+                query_sensitivity=parsed_arguments.query_sensitivity,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "answer":
+            return _answer(
+                parsed_arguments.root,
+                parsed_arguments.question,
+                task=parsed_arguments.task,
+                access=parsed_arguments.access,
+                memory_ids=parsed_arguments.memory_id,
+                source_ids=parsed_arguments.source_id,
+                limit=parsed_arguments.limit,
+                high_risk=parsed_arguments.high_risk,
+                time_sensitive=parsed_arguments.time_sensitive,
+                allow_cloud=parsed_arguments.allow_cloud,
                 query_sensitivity=parsed_arguments.query_sensitivity,
                 output_format=parsed_arguments.format,
             )
