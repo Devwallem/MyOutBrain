@@ -23,7 +23,7 @@ from myoutbrain.core_types import (
 )
 from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.generation import ProviderFailure
-from myoutbrain.local_core import LocalMemoryCore
+from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
 from myoutbrain.memory_gateway import (
     MemoryAccess,
     MemoryGateway,
@@ -102,6 +102,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly classify whether the query itself may leave this machine",
     )
     recall_parser.add_argument("--format", choices=("json", "text"), default="text")
+    consolidate_parser = subcommands.add_parser(
+        "consolidate",
+        help="Manually prepare buffered memory for natural review",
+    )
+    consolidate_parser.add_argument("--root", type=Path, default=Path.cwd())
+    consolidate_parser.add_argument("--task", required=True)
+    consolidate_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    memory_review_parser = subcommands.add_parser(
+        "review-memory",
+        help="List or naturally review memory integration proposals",
+    )
+    memory_review_parser.add_argument("proposal_id", nargs="?")
+    memory_review_parser.add_argument("instruction", nargs="?")
+    memory_review_parser.add_argument("--history", action="store_true")
+    memory_review_parser.add_argument("--root", type=Path, default=Path.cwd())
+    memory_review_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
     ask_parser.add_argument("source_id")
     ask_parser.add_argument("question")
@@ -244,6 +264,84 @@ def _recall(
     return 0
 
 
+def _render_integration_proposals(
+    proposals: Sequence[IntegrationProposal],
+    *,
+    output_format: str,
+) -> int:
+    proposal_data = [proposal.to_data() for proposal in proposals]
+    if output_format == "json":
+        print(json.dumps({"proposals": proposal_data}, ensure_ascii=False, sort_keys=True))
+        return 0
+    if not proposal_data:
+        print("No memory integration proposals are pending.")
+        return 0
+    for proposal in proposal_data:
+        print(f"Proposal: {proposal['proposal_id']}")
+        print(f"Topic: {proposal['topic']}")
+        print(f"Proposed understanding: {proposal['proposed_understanding']}")
+        print(f"Possible impact: {proposal['possible_impact']}")
+        source_scope = proposal["source_scope"]
+        if not isinstance(source_scope, list) or not all(
+            isinstance(source, str) for source in source_scope
+        ):
+            raise IntegrityError("integration proposal has invalid source scope")
+        print("Sources: " + ", ".join(source_scope))
+    return 0
+
+
+def _consolidate(root: Path, task: str, output_format: str) -> int:
+    proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
+    return _render_integration_proposals(proposals, output_format=output_format)
+
+
+def _review_memory(
+    root: Path,
+    proposal_id: str | None,
+    instruction: str | None,
+    history: bool,
+    output_format: str,
+) -> int:
+    if history:
+        if proposal_id is not None or instruction is not None:
+            raise UserInputError(
+                "review-memory --history does not accept a proposal instruction"
+            )
+        reviews = LocalMemoryCore(root).integration_review_history()
+        if output_format == "json":
+            print(
+                json.dumps(
+                    {"reviews": [review.to_data() for review in reviews]},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        else:
+            if not reviews:
+                print("No memory integration reviews have been recorded.")
+            for review in reviews:
+                print(f"{review.proposal_id}: {review.decision}")
+        return 0
+    if proposal_id is not None or instruction is not None:
+        if proposal_id is None or instruction is None:
+            raise UserInputError(
+                "review-memory requires both a proposal id and natural instruction"
+            )
+        result = LocalMemoryCore(root).review_integration_proposal(
+            proposal_id,
+            instruction,
+        )
+        if output_format == "json":
+            print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+        else:
+            print(f"Integration proposal {result.proposal_id}: {result.decision}")
+            if result.canonical_memory_id is not None:
+                print(f"Canonical memory: {result.canonical_memory_id}")
+        return 0
+    proposals = LocalMemoryCore(root).pending_integration_proposals()
+    return _render_integration_proposals(proposals, output_format=output_format)
+
+
 def _ask(root: Path, source_id: str, question: str, allow_cloud: bool) -> int:
     result = KnowledgeWorkflow(root).ask(source_id, question, allow_cloud=allow_cloud)
     if result.insufficient_evidence:
@@ -374,6 +472,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 limit=parsed_arguments.limit,
                 query_sensitivity=parsed_arguments.query_sensitivity,
                 output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "consolidate":
+            return _consolidate(
+                parsed_arguments.root,
+                parsed_arguments.task,
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "review-memory":
+            return _review_memory(
+                parsed_arguments.root,
+                parsed_arguments.proposal_id,
+                parsed_arguments.instruction,
+                parsed_arguments.history,
+                parsed_arguments.format,
             )
         if parsed_arguments.command == "ask":
             return _ask(

@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
+import math
+import re
 import sqlite3
 import tempfile
 from typing import Literal
@@ -18,6 +20,14 @@ from myoutbrain.core_types import (
     Sensitivity,
     UserInputError,
 )
+from myoutbrain.embeddings import (
+    EmbeddingFailure,
+    EmbeddingProvider,
+    LocalMultilingualEmbeddingProvider,
+    SEMANTIC_SIMILARITY_THRESHOLD,
+    cosine_similarity,
+    validate_embeddings,
+)
 from myoutbrain.persistence import (
     atomic_commit,
     event_journal_change,
@@ -27,7 +37,7 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 2
+MEMORY_SCHEMA_VERSION = 3
 MEMORY_DATABASE = "store/memory.sqlite3"
 
 
@@ -58,7 +68,7 @@ CREATE TABLE buffered_digests (
     experience_id TEXT NOT NULL UNIQUE REFERENCES experiences(experience_id),
     content TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state = 'buffered'),
+    state TEXT NOT NULL CHECK (state IN ('buffered', 'integrated')),
     created_at TEXT NOT NULL
 );
 
@@ -76,6 +86,45 @@ CREATE TABLE canonical_memory_sources (
     memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
     source_id TEXT NOT NULL REFERENCES source_objects(source_id),
     PRIMARY KEY (memory_id, source_id)
+);
+
+CREATE TABLE integration_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    topic TEXT NOT NULL,
+    proposed_understanding TEXT NOT NULL,
+    possible_impact TEXT NOT NULL,
+    sensitivity TEXT NOT NULL CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT
+);
+
+CREATE TABLE integration_proposal_buffered (
+    proposal_id TEXT NOT NULL REFERENCES integration_proposals(proposal_id),
+    digest_id TEXT NOT NULL REFERENCES buffered_digests(digest_id),
+    PRIMARY KEY (proposal_id, digest_id)
+);
+
+CREATE TABLE integration_proposal_related (
+    proposal_id TEXT NOT NULL REFERENCES integration_proposals(proposal_id),
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    PRIMARY KEY (proposal_id, memory_id)
+);
+
+CREATE TABLE integration_proposal_sources (
+    proposal_id TEXT NOT NULL REFERENCES integration_proposals(proposal_id),
+    source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+    PRIMARY KEY (proposal_id, source_id)
+);
+
+CREATE TABLE integration_reviews (
+    review_id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES integration_proposals(proposal_id),
+    decision TEXT NOT NULL CHECK (decision IN ('accepted', 'edited', 'rejected')),
+    reviewed_content TEXT,
+    reason TEXT,
+    canonical_memory_id TEXT REFERENCES canonical_memories(memory_id),
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE memory_events (
@@ -182,6 +231,85 @@ class RecallableMemory:
         return self.memory_state is MemoryState.CANONICAL
 
 
+@dataclass(frozen=True)
+class IntegrationProposal:
+    proposal_id: str
+    topic: str
+    proposed_understanding: str
+    evidence_memory_ids: tuple[str, ...]
+    source_scope: tuple[str, ...]
+    related_canonical_memory_ids: tuple[str, ...]
+    possible_impact: str
+    sensitivity: Sensitivity
+    status: str
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "proposal_id": self.proposal_id,
+            "topic": self.topic,
+            "proposed_understanding": self.proposed_understanding,
+            "evidence_memory_ids": list(self.evidence_memory_ids),
+            "source_scope": list(self.source_scope),
+            "related_canonical_memory_ids": list(
+                self.related_canonical_memory_ids
+            ),
+            "possible_impact": self.possible_impact,
+            "sensitivity": self.sensitivity,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class IntegrationReviewResult:
+    proposal_id: str
+    decision: str
+    canonical_memory_id: str | None
+    canonical_content: str | None
+    reason: str | None
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "proposal_id": self.proposal_id,
+            "decision": self.decision,
+            "canonical_memory_id": self.canonical_memory_id,
+            "canonical_content": self.canonical_content,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class _ReviewInstruction:
+    decision: Literal["accepted", "edited", "rejected"]
+    content: str | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class _IntegrationProposalDraft:
+    proposal_id: str
+    topic: str
+    proposed_understanding: str
+    possible_impact: str
+    sensitivity: Sensitivity
+    digest_ids: tuple[str, ...]
+    source_ids: tuple[str, ...]
+    related_memory_ids: tuple[str, ...]
+    created_at: str
+
+    def as_proposal(self) -> IntegrationProposal:
+        return IntegrationProposal(
+            proposal_id=self.proposal_id,
+            topic=self.topic,
+            proposed_understanding=self.proposed_understanding,
+            evidence_memory_ids=self.digest_ids,
+            source_scope=self.source_ids,
+            related_canonical_memory_ids=self.related_memory_ids,
+            possible_impact=self.possible_impact,
+            sensitivity=self.sensitivity,
+            status="pending",
+        )
+
+
 class LocalMemoryCore:
     """Own the durable private-instance memory state."""
 
@@ -201,6 +329,10 @@ class LocalMemoryCore:
                 version = self._database_version(database_path)
                 if version == 1:
                     migrated = self._migrate_v1_database(database_path)
+                    atomic_commit(self._root, [(database_path, migrated)])
+                    version = 2
+                if version == 2:
+                    migrated = self._migrate_v2_database(database_path)
                     atomic_commit(self._root, [(database_path, migrated)])
                 self._validate_database(database_path)
                 return
@@ -421,6 +553,266 @@ class LocalMemoryCore:
         )
         return canonical + buffered
 
+    def propose_manual_consolidation(
+        self,
+        task: str,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> tuple[IntegrationProposal, ...]:
+        normalized_task = _required_text("consolidation task", task)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT d.digest_id, d.content, e.source_id, e.sensitivity
+                        FROM buffered_digests AS d
+                        JOIN experiences AS e
+                          ON e.experience_id = d.experience_id
+                        WHERE d.state = 'buffered'
+                          AND e.task = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM integration_proposal_buffered AS proposed
+                              WHERE proposed.digest_id = d.digest_id
+                          )
+                        ORDER BY d.created_at, d.digest_id
+                        """,
+                        (normalized_task,),
+                    ).fetchall()
+                    canonical_rows = connection.execute(
+                        """
+                        SELECT c.memory_id, c.content, c.sensitivity,
+                               GROUP_CONCAT(source.source_id, ',')
+                        FROM canonical_memories AS c
+                        LEFT JOIN canonical_memory_sources AS source
+                          ON source.memory_id = c.memory_id
+                        WHERE c.state = 'active'
+                        GROUP BY c.memory_id, c.content, c.sensitivity
+                        ORDER BY c.memory_id
+                        """
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot select memory for consolidation") from error
+            if not rows:
+                return self._query_integration_proposals(
+                    database_path,
+                    status="pending",
+                    topic=normalized_task,
+                )
+            candidates = _validated_consolidation_rows(rows)
+            canonical_candidates = _validated_canonical_rows(canonical_rows)
+            drafts = _integration_proposal_drafts(
+                normalized_task,
+                candidates,
+                canonical_candidates,
+                embedding_provider or LocalMultilingualEmbeddingProvider(),
+            )
+            staged_database = self._database_with_integration_proposals(
+                database_path,
+                drafts=drafts,
+            )
+            events = tuple(
+                {
+                    "id": f"evt_{uuid.uuid4().hex}",
+                    "type": "integration.proposed",
+                    "occurred_at": draft.created_at,
+                    "proposal_id": draft.proposal_id,
+                    "topic": draft.topic,
+                    "evidence_memory_ids": list(draft.digest_ids),
+                    "source_scope": list(draft.source_ids),
+                }
+                for draft in drafts
+            )
+            atomic_commit(
+                self._root,
+                [
+                    (database_path, staged_database),
+                    event_journal_change(self._root, *events),
+                ],
+            )
+        return tuple(draft.as_proposal() for draft in drafts)
+
+    def review_integration_proposal(
+        self,
+        proposal_id: str,
+        instruction: str,
+    ) -> IntegrationReviewResult:
+        normalized_proposal_id = _required_text("integration proposal id", proposal_id)
+        review = _parse_review_instruction(instruction)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            proposals = self._query_integration_proposals(
+                database_path,
+                status="pending",
+            )
+            proposal = next(
+                (
+                    candidate
+                    for candidate in proposals
+                    if candidate.proposal_id == normalized_proposal_id
+                ),
+                None,
+            )
+            if proposal is None:
+                raise UserInputError(
+                    f"pending integration proposal does not exist: {normalized_proposal_id}"
+                )
+            canonical_content = (
+                proposal.proposed_understanding
+                if review.decision == "accepted"
+                else review.content
+            )
+            canonical_memory_id = (
+                f"mem_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
+                if review.decision != "rejected"
+                else None
+            )
+            reviewed_at = datetime.now(timezone.utc).isoformat()
+            staged_database = self._database_with_integration_review(
+                database_path,
+                proposal=proposal,
+                review=review,
+                canonical_memory_id=canonical_memory_id,
+                canonical_content=canonical_content,
+                reviewed_at=reviewed_at,
+            )
+            event_id = f"evt_{uuid.uuid4().hex}"
+            event = {
+                "id": event_id,
+                "type": f"integration.{review.decision}",
+                "occurred_at": reviewed_at,
+                "proposal_id": proposal.proposal_id,
+                "decision": review.decision,
+                "canonical_memory_id": canonical_memory_id,
+                "source_scope": list(proposal.source_scope),
+            }
+            atomic_commit(
+                self._root,
+                [
+                    (database_path, staged_database),
+                    event_journal_change(self._root, event),
+                ],
+                fault_injections={0: "integration-review-after-database"},
+            )
+        return IntegrationReviewResult(
+            proposal_id=proposal.proposal_id,
+            decision=review.decision,
+            canonical_memory_id=canonical_memory_id,
+            canonical_content=canonical_content,
+            reason=review.reason,
+        )
+
+    def integration_review_history(self) -> tuple[IntegrationReviewResult, ...]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT proposal_id, decision, canonical_memory_id,
+                               reviewed_content, reason
+                        FROM integration_reviews
+                        ORDER BY created_at, review_id
+                        """
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot read integration review history") from error
+        return tuple(
+            IntegrationReviewResult(
+                proposal_id=row[0],
+                decision=row[1],
+                canonical_memory_id=row[2],
+                canonical_content=row[3],
+                reason=row[4],
+            )
+            for row in rows
+        )
+
+    def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            return self._query_integration_proposals(
+                database_path,
+                status="pending",
+            )
+
+    @staticmethod
+    def _query_integration_proposals(
+        database_path: Path,
+        *,
+        status: str,
+        topic: str | None = None,
+    ) -> tuple[IntegrationProposal, ...]:
+        parameters: list[str] = [status]
+        topic_filter = ""
+        if topic is not None:
+            topic_filter = " AND p.topic = ?"
+            parameters.append(topic)
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT p.proposal_id, p.topic, p.proposed_understanding,
+                           p.possible_impact, p.sensitivity, p.status,
+                           GROUP_CONCAT(DISTINCT buffered.digest_id),
+                           GROUP_CONCAT(DISTINCT source.source_id),
+                           GROUP_CONCAT(DISTINCT related.memory_id)
+                    FROM integration_proposals AS p
+                    LEFT JOIN integration_proposal_buffered AS buffered
+                      ON buffered.proposal_id = p.proposal_id
+                    LEFT JOIN integration_proposal_sources AS source
+                      ON source.proposal_id = p.proposal_id
+                    LEFT JOIN integration_proposal_related AS related
+                      ON related.proposal_id = p.proposal_id
+                    WHERE p.status = ?{topic_filter}
+                    GROUP BY p.proposal_id
+                    ORDER BY p.created_at, p.proposal_id
+                    """,
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot read integration proposals") from error
+        return tuple(
+            IntegrationProposal(
+                proposal_id=row[0],
+                topic=row[1],
+                proposed_understanding=row[2],
+                possible_impact=row[3],
+                sensitivity=row[4],
+                status=row[5],
+                evidence_memory_ids=_split_group(row[6]),
+                source_scope=_split_group(row[7]),
+                related_canonical_memory_ids=_split_group(row[8]),
+            )
+            for row in rows
+        )
+
     @staticmethod
     def _duplicate_receipt(
         database_path: Path,
@@ -552,6 +944,177 @@ class LocalMemoryCore:
                 temporary_path.unlink(missing_ok=True)
 
     @staticmethod
+    def _database_with_integration_proposals(
+        database_path: Path,
+        *,
+        drafts: tuple[_IntegrationProposalDraft, ...],
+    ) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-proposal.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                for draft in drafts:
+                    connection.execute(
+                        """
+                        INSERT INTO integration_proposals
+                            (proposal_id, topic, proposed_understanding,
+                             possible_impact, sensitivity, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                        """,
+                        (
+                            draft.proposal_id,
+                            draft.topic,
+                            draft.proposed_understanding,
+                            draft.possible_impact,
+                            draft.sensitivity,
+                            draft.created_at,
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO integration_proposal_buffered
+                            (proposal_id, digest_id)
+                        VALUES (?, ?)
+                        """,
+                        (
+                            (draft.proposal_id, digest_id)
+                            for digest_id in draft.digest_ids
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO integration_proposal_sources
+                            (proposal_id, source_id)
+                        VALUES (?, ?)
+                        """,
+                        (
+                            (draft.proposal_id, source_id)
+                            for source_id in draft.source_ids
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO integration_proposal_related
+                            (proposal_id, memory_id)
+                        VALUES (?, ?)
+                        """,
+                        (
+                            (draft.proposal_id, memory_id)
+                            for memory_id in draft.related_memory_ids
+                        ),
+                    )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage integration proposal") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _database_with_integration_review(
+        database_path: Path,
+        *,
+        proposal: IntegrationProposal,
+        review: _ReviewInstruction,
+        canonical_memory_id: str | None,
+        canonical_content: str | None,
+        reviewed_at: str,
+    ) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-review.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                proposal_status = (
+                    "rejected" if review.decision == "rejected" else "accepted"
+                )
+                if canonical_memory_id is not None and canonical_content is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO canonical_memories
+                            (memory_id, content, current_version, sensitivity,
+                             state, created_at, updated_at)
+                        VALUES (?, ?, 1, ?, 'active', ?, ?)
+                        """,
+                        (
+                            canonical_memory_id,
+                            canonical_content,
+                            proposal.sensitivity,
+                            reviewed_at,
+                            reviewed_at,
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO canonical_memory_sources (memory_id, source_id)
+                        VALUES (?, ?)
+                        """,
+                        (
+                            (canonical_memory_id, source_id)
+                            for source_id in proposal.source_scope
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        UPDATE buffered_digests
+                        SET state = 'integrated'
+                        WHERE digest_id = ?
+                        """,
+                        ((digest_id,) for digest_id in proposal.evidence_memory_ids),
+                    )
+                connection.execute(
+                    """
+                    UPDATE integration_proposals
+                    SET status = ?, reviewed_at = ?
+                    WHERE proposal_id = ? AND status = 'pending'
+                    """,
+                    (proposal_status, reviewed_at, proposal.proposal_id),
+                )
+                review_id = f"rev_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
+                connection.execute(
+                    """
+                    INSERT INTO integration_reviews
+                        (review_id, proposal_id, decision, reviewed_content,
+                         reason, canonical_memory_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        review_id,
+                        proposal.proposal_id,
+                        review.decision,
+                        canonical_content,
+                        review.reason,
+                        canonical_memory_id,
+                        reviewed_at,
+                    ),
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage integration review") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
     def _new_database_content(parent: Path) -> bytes:
         temporary_path: Path | None = None
         try:
@@ -569,6 +1132,90 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v2_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.executescript(
+                    """
+                    CREATE TABLE buffered_digests_v3 (
+                        digest_id TEXT PRIMARY KEY,
+                        experience_id TEXT NOT NULL UNIQUE REFERENCES experiences(experience_id),
+                        content TEXT NOT NULL,
+                        fingerprint TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('buffered', 'integrated')),
+                        created_at TEXT NOT NULL
+                    );
+                    INSERT INTO buffered_digests_v3
+                        (digest_id, experience_id, content, fingerprint, state, created_at)
+                    SELECT digest_id, experience_id, content, fingerprint, state, created_at
+                    FROM buffered_digests;
+                    DROP TABLE buffered_digests;
+                    ALTER TABLE buffered_digests_v3 RENAME TO buffered_digests;
+
+                    CREATE TABLE integration_proposals (
+                        proposal_id TEXT PRIMARY KEY,
+                        topic TEXT NOT NULL,
+                        proposed_understanding TEXT NOT NULL,
+                        possible_impact TEXT NOT NULL,
+                        sensitivity TEXT NOT NULL
+                            CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+                        status TEXT NOT NULL
+                            CHECK (status IN ('pending', 'accepted', 'rejected')),
+                        created_at TEXT NOT NULL,
+                        reviewed_at TEXT
+                    );
+                    CREATE TABLE integration_proposal_buffered (
+                        proposal_id TEXT NOT NULL
+                            REFERENCES integration_proposals(proposal_id),
+                        digest_id TEXT NOT NULL REFERENCES buffered_digests(digest_id),
+                        PRIMARY KEY (proposal_id, digest_id)
+                    );
+                    CREATE TABLE integration_proposal_related (
+                        proposal_id TEXT NOT NULL
+                            REFERENCES integration_proposals(proposal_id),
+                        memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+                        PRIMARY KEY (proposal_id, memory_id)
+                    );
+                    CREATE TABLE integration_proposal_sources (
+                        proposal_id TEXT NOT NULL
+                            REFERENCES integration_proposals(proposal_id),
+                        source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+                        PRIMARY KEY (proposal_id, source_id)
+                    );
+                    CREATE TABLE integration_reviews (
+                        review_id TEXT PRIMARY KEY,
+                        proposal_id TEXT NOT NULL UNIQUE
+                            REFERENCES integration_proposals(proposal_id),
+                        decision TEXT NOT NULL
+                            CHECK (decision IN ('accepted', 'edited', 'rejected')),
+                        reviewed_content TEXT,
+                        reason TEXT,
+                        canonical_memory_id TEXT REFERENCES canonical_memories(memory_id),
+                        created_at TEXT NOT NULL
+                    );
+                    """
+                )
+                connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -634,7 +1281,7 @@ class LocalMemoryCore:
                     );
                     """
                 )
-                connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
+                connection.execute("PRAGMA user_version = 2")
                 connection.commit()
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
@@ -664,6 +1311,242 @@ def _required_text(name: str, value: str) -> str:
     if not normalized:
         raise UserInputError(f"{name} must not be blank")
     return normalized
+
+
+def _without_evidence_marker(content: str) -> str:
+    return re.sub(r"\s*\[evidence:\s+src_[0-9a-f]+\]\s*$", "", content).strip()
+
+
+def _parse_review_instruction(instruction: str) -> _ReviewInstruction:
+    normalized = _required_text("review instruction", instruction)
+    folded = normalized.casefold()
+    if folded in ("accept", "接受"):
+        return _ReviewInstruction(decision="accepted", content=None, reason=None)
+    for prefix in ("edit:", "accept with changes:", "修改为:", "修改为："):
+        if folded.startswith(prefix.casefold()):
+            content = _required_text(
+                "edited canonical understanding",
+                normalized[len(prefix) :],
+            )
+            if len(content) > 500:
+                raise UserInputError(
+                    "edited canonical understanding must not exceed 500 characters"
+                )
+            return _ReviewInstruction(
+                decision="edited",
+                content=content,
+                reason=None,
+            )
+    if folded in ("reject", "拒绝"):
+        return _ReviewInstruction(decision="rejected", content=None, reason=None)
+    for prefix in ("reject because:", "拒绝:", "拒绝："):
+        if folded.startswith(prefix.casefold()):
+            reason = _required_text("rejection reason", normalized[len(prefix) :])
+            return _ReviewInstruction(
+                decision="rejected",
+                content=None,
+                reason=reason,
+            )
+    raise UserInputError(
+        "review instruction must naturally accept, edit, or reject the proposal"
+    )
+
+
+def _split_group(value: str | None) -> tuple[str, ...]:
+    if value is None or not value:
+        return ()
+    return tuple(sorted(value.split(",")))
+
+
+_ConsolidationRow = tuple[str, str, str, Sensitivity]
+_CanonicalCandidate = tuple[str, str, Sensitivity, tuple[str, ...]]
+
+
+def _validated_consolidation_rows(
+    rows: list[tuple[object, ...]],
+) -> tuple[_ConsolidationRow, ...]:
+    validated: list[_ConsolidationRow] = []
+    for row in rows:
+        if (
+            len(row) != 4
+            or not isinstance(row[0], str)
+            or not isinstance(row[1], str)
+            or not isinstance(row[2], str)
+            or row[3] not in ("local-only", "cloud-allowed")
+        ):
+            raise IntegrityError("buffered memory has invalid consolidation fields")
+        validated.append((row[0], row[1], row[2], row[3]))
+    return tuple(validated)
+
+
+def _validated_canonical_rows(
+    rows: list[tuple[object, ...]],
+) -> tuple[_CanonicalCandidate, ...]:
+    validated: list[_CanonicalCandidate] = []
+    for row in rows:
+        if (
+            len(row) != 4
+            or not isinstance(row[0], str)
+            or not isinstance(row[1], str)
+            or row[2] not in ("local-only", "cloud-allowed")
+            or (row[3] is not None and not isinstance(row[3], str))
+        ):
+            raise IntegrityError("canonical memory has invalid consolidation fields")
+        validated.append(
+            (
+                row[0],
+                row[1],
+                row[2],
+                _split_group(row[3]),
+            )
+        )
+    return tuple(validated)
+
+
+def _integration_proposal_drafts(
+    task: str,
+    candidates: tuple[_ConsolidationRow, ...],
+    canonical_candidates: tuple[_CanonicalCandidate, ...],
+    embedding_provider: EmbeddingProvider,
+) -> tuple[_IntegrationProposalDraft, ...]:
+    semantic_vectors = _semantic_vectors(
+        tuple(row[1] for row in candidates)
+        + tuple(row[1] for row in canonical_candidates),
+        embedding_provider,
+    )
+    groups = _group_related_buffered_memory(candidates, semantic_vectors)
+    drafts: list[_IntegrationProposalDraft] = []
+    for group in groups:
+        digest_ids = tuple(sorted(row[0] for row in group))
+        bodies = tuple(
+            dict.fromkeys(_without_evidence_marker(row[1]) for row in group)
+        )
+        related = tuple(
+            candidate
+            for candidate in canonical_candidates
+            if any(
+                _memory_bodies_are_related(
+                    row[1], candidate[1], semantic_vectors
+                )
+                for row in group
+            )
+        )
+        source_ids = tuple(
+            sorted(
+                {row[2] for row in group}
+                | {
+                    source_id
+                    for candidate in related
+                    for source_id in candidate[3]
+                }
+            )
+        )
+        proposed_understanding = " ".join(bodies)
+        sensitivity: Sensitivity = (
+            "local-only"
+            if any(row[3] == "local-only" for row in group)
+            or any(candidate[2] == "local-only" for candidate in related)
+            else "cloud-allowed"
+        )
+        identity = json.dumps(
+            {"task": task, "digest_ids": digest_ids},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        topic = task
+        if len(groups) > 1:
+            topic = f"{task}: {' '.join(bodies[0].split()[:6])}"
+        drafts.append(
+            _IntegrationProposalDraft(
+                proposal_id=f"prp_{hashlib.sha256(identity).hexdigest()}",
+                topic=topic,
+                proposed_understanding=proposed_understanding,
+                possible_impact=(
+                    "Creates one canonical understanding from the approved buffered "
+                    "evidence; no semantic change occurs before review."
+                ),
+                sensitivity=sensitivity,
+                digest_ids=digest_ids,
+                source_ids=source_ids,
+                related_memory_ids=tuple(candidate[0] for candidate in related),
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+    return tuple(drafts)
+
+
+def _group_related_buffered_memory(
+    candidates: tuple[_ConsolidationRow, ...],
+    semantic_vectors: dict[str, tuple[float, ...]],
+) -> tuple[tuple[_ConsolidationRow, ...], ...]:
+    remaining = list(candidates)
+    groups: list[tuple[_ConsolidationRow, ...]] = []
+    while remaining:
+        group = [remaining.pop(0)]
+        changed = True
+        while changed:
+            changed = False
+            for candidate in tuple(remaining):
+                if any(
+                    _memory_bodies_are_related(
+                        candidate[1], row[1], semantic_vectors
+                    )
+                    for row in group
+                ):
+                    group.append(candidate)
+                    remaining.remove(candidate)
+                    changed = True
+        groups.append(tuple(group))
+    return tuple(groups)
+
+
+def _semantic_vectors(
+    bodies: tuple[str, ...],
+    provider: EmbeddingProvider,
+) -> dict[str, tuple[float, ...]]:
+    unique_bodies = tuple(
+        dict.fromkeys(_without_evidence_marker(body) for body in bodies)
+    )
+    if not unique_bodies:
+        return {}
+    try:
+        vectors = validate_embeddings(
+            provider.space,
+            unique_bodies,
+            provider.embed(unique_bodies),
+        )
+    except EmbeddingFailure:
+        return {}
+    return dict(zip(unique_bodies, vectors))
+
+
+def _memory_bodies_are_related(
+    left: str,
+    right: str,
+    semantic_vectors: dict[str, tuple[float, ...]],
+) -> bool:
+    from myoutbrain.retrieval import lexical_terms
+
+    left_body = _without_evidence_marker(left)
+    right_body = _without_evidence_marker(right)
+    if " ".join(left_body.casefold().split()) == " ".join(
+        right_body.casefold().split()
+    ):
+        return True
+    left_terms = lexical_terms(left_body)
+    right_terms = lexical_terms(right_body)
+    smaller = min(len(left_terms), len(right_terms))
+    overlap = len(left_terms.intersection(right_terms))
+    if smaller >= 2 and overlap >= math.ceil(smaller * 0.6):
+        return True
+    left_vector = semantic_vectors.get(left_body)
+    right_vector = semantic_vectors.get(right_body)
+    return (
+        left_vector is not None
+        and right_vector is not None
+        and cosine_similarity(left_vector, right_vector)
+        >= SEMANTIC_SIMILARITY_THRESHOLD
+    )
 
 
 def _validated_time(value: str) -> str:
