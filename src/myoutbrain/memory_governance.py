@@ -7,13 +7,16 @@ from myoutbrain.local_core import (
     CanonicalMemoryStateChange,
     LocalMemoryCore,
     MemoryDeletionImpact,
+    MemoryDeletionResult,
 )
+from myoutbrain.knowledge_views import KnowledgeViewService, VIEW_MANIFEST
 
 
 class MemoryGovernanceService:
     """Apply natural, reversible memory lifecycle instructions."""
 
     def __init__(self, root: Path) -> None:
+        self._root = root
         self._core = LocalMemoryCore(root)
 
     def forget(self, memory_id: str, instruction: str) -> CanonicalMemoryStateChange:
@@ -55,7 +58,7 @@ class MemoryGovernanceService:
         memory_id: str,
         *,
         confirmation: str | None,
-    ) -> MemoryDeletionImpact:
+    ) -> MemoryDeletionImpact | MemoryDeletionResult:
         impact = self._core.preview_permanent_deletion(memory_id)
         if confirmation is None:
             return impact
@@ -63,6 +66,13 @@ class MemoryGovernanceService:
             raise UserInputError(
                 "permanent deletion confirmation does not match the current impact"
             )
-        raise UserInputError(
-            "permanent deletion execution is not available until cascade validation"
+        views = KnowledgeViewService(self._root)
+        if (self._root / VIEW_MANIFEST).is_file():
+            views.rebuild()
+        result = self._core.permanently_delete(
+            memory_id,
+            confirmation_token=confirmation,
         )
+        if (self._root / VIEW_MANIFEST).is_file():
+            views.rebuild()
+        return result

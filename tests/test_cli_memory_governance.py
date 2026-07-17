@@ -174,6 +174,136 @@ class MemoryGovernanceTests(unittest.TestCase):
                 [memory_id],
             )
 
+    def test_confirmed_permanent_deletion_cascades_and_cannot_be_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            conversation = temporary_root / "delete-me.txt"
+            secret_text = "Project Elm private launch phrase is silver lantern."
+            conversation.write_text(
+                f"Private planning record. {secret_text} End of record.",
+                encoding="utf-8",
+            )
+            remembered = run_cli(
+                "remember",
+                str(conversation),
+                "--root",
+                str(instance_root),
+                "--occurred-at",
+                "2026-07-17T12:00:00+08:00",
+                "--entrance",
+                "codex",
+                "--task",
+                "delete-elm",
+                "--digest",
+                secret_text,
+                "--sensitivity",
+                "local-only",
+                "--visible-context",
+                "permanent deletion acceptance",
+                "--context-gap",
+                "earlier history unavailable",
+                "--format",
+                "json",
+            )
+            self.assertEqual(remembered.returncode, 0, remembered.stderr)
+            receipt = json.loads(remembered.stdout)
+            memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "delete-elm")["proposal_id"],
+            )
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            old_view = instance_root / json.loads(built.stdout)["view_paths"][0]
+            previewed = run_cli(
+                "delete-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            token = json.loads(previewed.stdout)["confirmation_token"]
+
+            deleted = run_cli(
+                "delete-memory",
+                memory_id,
+                "--confirm",
+                token,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            recalled = run_cli(
+                "recall",
+                "silver lantern",
+                "--root",
+                str(instance_root),
+                "--task",
+                "post-delete",
+                "--access",
+                "local-trusted",
+                "--format",
+                "json",
+            )
+            rebuilt = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            reimported = run_cli(
+                "remember",
+                str(conversation),
+                "--root",
+                str(instance_root),
+                "--occurred-at",
+                "2026-07-18T12:00:00+08:00",
+                "--entrance",
+                "codex",
+                "--task",
+                "reimport-elm",
+                "--digest",
+                secret_text,
+                "--sensitivity",
+                "local-only",
+                "--visible-context",
+                "attempted reimport",
+                "--context-gap",
+                "earlier history unavailable",
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(deleted.returncode, 0, deleted.stderr)
+            deletion = json.loads(deleted.stdout)
+            self.assertEqual(deletion["disposition"], "deleted")
+            self.assertEqual(deletion["memory_id"], memory_id)
+            self.assertEqual(deletion["removed_source_ids"], [receipt["source_id"]])
+            self.assertEqual(recalled.returncode, 0, recalled.stderr)
+            self.assertEqual(json.loads(recalled.stdout)["items"], [])
+            self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+            self.assertEqual(json.loads(rebuilt.stdout)["view_count"], 0)
+            self.assertFalse(old_view.exists())
+            self.assertNotEqual(reimported.returncode, 0)
+            self.assertIn("permanently deleted", reimported.stderr)
+            object_files = [
+                path
+                for path in (instance_root / "store" / "objects").rglob("*")
+                if path.is_file()
+            ]
+            self.assertEqual(object_files, [])
+
 
 if __name__ == "__main__":
     unittest.main()

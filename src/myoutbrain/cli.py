@@ -37,6 +37,7 @@ from myoutbrain.local_core import (
     CanonicalMemoryAudit,
     IntegrationProposal,
     LocalMemoryCore,
+    MemoryDeletionImpact,
 )
 from myoutbrain.memory_gateway import (
     MemoryAccess,
@@ -828,7 +829,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                         sort_keys=True,
                     )
                 )
-            else:
+            elif isinstance(deletion, MemoryDeletionImpact):
                 print(f"Permanent deletion preview for {deletion.memory_id}:")
                 print(f"Sources: {', '.join(deletion.source_ids) or 'none'}")
                 print(
@@ -836,6 +837,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     + (", ".join(deletion.shared_source_ids) or "none")
                 )
                 print(f"Confirm with --confirm {deletion.confirmation_token}")
+            else:
+                print(
+                    f"Permanently deleted {deletion.memory_id}; removed "
+                    f"{len(deletion.removed_source_ids)} unshared source(s)."
+                )
             return 0
         if parsed_arguments.command == "migrate-v1":
             return _render_migration_summary(

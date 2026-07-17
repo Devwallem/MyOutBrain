@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import sqlite3
 import tempfile
 from typing import Literal
@@ -38,7 +39,7 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 5
+MEMORY_SCHEMA_VERSION = 6
 MEMORY_DATABASE = "store/memory.sqlite3"
 
 
@@ -220,6 +221,15 @@ CREATE TABLE legacy_knowledge_metadata (
     legacy_path TEXT NOT NULL,
     candidate_id TEXT,
     relations_json TEXT NOT NULL
+);
+
+CREATE TABLE deletion_markers (
+    marker_id TEXT PRIMARY KEY,
+    subject_kind TEXT NOT NULL
+        CHECK (subject_kind IN ('canonical-memory', 'source')),
+    subject_fingerprint TEXT NOT NULL UNIQUE,
+    deleted_at TEXT NOT NULL,
+    backup_exclusion_after TEXT NOT NULL
 );
 """
 
@@ -533,6 +543,30 @@ class MemoryDeletionImpact:
 
 
 @dataclass(frozen=True)
+class MemoryDeletionResult:
+    memory_id: str
+    removed_source_ids: tuple[str, ...]
+    retained_shared_source_ids: tuple[str, ...]
+    removed_digest_ids: tuple[str, ...]
+    removed_proposal_ids: tuple[str, ...]
+    deleted_at: str
+    backup_exclusion_after: str
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "disposition": "deleted",
+            "scope": "one-canonical-memory",
+            "memory_id": self.memory_id,
+            "removed_source_ids": list(self.removed_source_ids),
+            "retained_shared_source_ids": list(self.retained_shared_source_ids),
+            "removed_digest_ids": list(self.removed_digest_ids),
+            "removed_proposal_ids": list(self.removed_proposal_ids),
+            "deleted_at": self.deleted_at,
+            "backup_exclusion_after": self.backup_exclusion_after,
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
     state: Literal["active", "inactive"]
@@ -594,6 +628,10 @@ class LocalMemoryCore:
                 if version == 4:
                     migrated = self._migrate_v4_database(database_path)
                     atomic_commit(self._root, [(database_path, migrated)])
+                    version = 5
+                if version == 5:
+                    migrated = self._migrate_v5_database(database_path)
+                    atomic_commit(self._root, [(database_path, migrated)])
                 self._validate_database(database_path)
                 return
             database_content = self._new_database_content(database_path.parent)
@@ -653,6 +691,14 @@ class LocalMemoryCore:
             hold_writer_lock_for_acceptance_test()
             recover_transactions(self._root)
             self._validate_database(database_path)
+            if self._has_deletion_marker(
+                database_path,
+                subject_kind="source",
+                subject_id=source_id,
+            ):
+                raise UserInputError(
+                    "source was permanently deleted and cannot be re-imported"
+                )
             _validate_content_object(object_path, body, source_digest)
             duplicate = self._duplicate_receipt(
                 database_path,
@@ -1224,117 +1270,219 @@ class LocalMemoryCore:
             self._validate_database(database_path)
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
-                    if connection.execute(
-                        "SELECT 1 FROM canonical_memories WHERE memory_id = ?",
-                        (normalized_memory_id,),
-                    ).fetchone() is None:
-                        raise UserInputError(
-                            "canonical memory does not exist: "
-                            f"{normalized_memory_id}"
-                        )
-                    source_ids = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT source_id FROM canonical_memory_sources
-                            WHERE memory_id = ? ORDER BY source_id
-                            """,
-                            (normalized_memory_id,),
-                        ).fetchall()
-                    )
-                    shared_source_ids = tuple(
-                        source_id
-                        for source_id in source_ids
-                        if connection.execute(
-                            """
-                            SELECT 1 FROM canonical_memory_sources
-                            WHERE source_id = ? AND memory_id <> ? LIMIT 1
-                            """,
-                            (source_id, normalized_memory_id),
-                        ).fetchone()
-                        is not None
-                    )
-                    derived_digest_ids = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT DISTINCT digest.digest_id
-                            FROM buffered_digests AS digest
-                            JOIN experiences AS experience
-                              ON experience.experience_id = digest.experience_id
-                            JOIN canonical_memory_sources AS source
-                              ON source.source_id = experience.source_id
-                            WHERE source.memory_id = ?
-                            ORDER BY digest.digest_id
-                            """,
-                            (normalized_memory_id,),
-                        ).fetchall()
-                    )
-                    related_memory_ids = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT CASE WHEN memory_id = ? THEN related_memory_id
-                                        ELSE memory_id END
-                            FROM canonical_memory_relations
-                            WHERE memory_id = ? OR related_memory_id = ?
-                            ORDER BY 1
-                            """,
-                            (
-                                normalized_memory_id,
-                                normalized_memory_id,
-                                normalized_memory_id,
-                            ),
-                        ).fetchall()
-                    )
-                    conflict_memory_ids = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT CASE WHEN first_memory_id = ? THEN second_memory_id
-                                        ELSE first_memory_id END
-                            FROM canonical_memory_conflicts
-                            WHERE first_memory_id = ? OR second_memory_id = ?
-                            ORDER BY 1
-                            """,
-                            (
-                                normalized_memory_id,
-                                normalized_memory_id,
-                                normalized_memory_id,
-                            ),
-                        ).fetchall()
-                    )
-                    pending_proposal_ids = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            """
-                            SELECT DISTINCT proposal.proposal_id
-                            FROM integration_proposals AS proposal
-                            LEFT JOIN integration_proposal_related AS related
-                              ON related.proposal_id = proposal.proposal_id
-                            LEFT JOIN integration_proposal_sources AS source
-                              ON source.proposal_id = proposal.proposal_id
-                            WHERE proposal.status = 'pending'
-                              AND (proposal.target_memory_id = ?
-                                   OR related.memory_id = ?
-                                   OR source.source_id IN (
-                                       SELECT source_id
-                                       FROM canonical_memory_sources
-                                       WHERE memory_id = ?
-                                   ))
-                            ORDER BY proposal.proposal_id
-                            """,
-                            (
-                                normalized_memory_id,
-                                normalized_memory_id,
-                                normalized_memory_id,
-                            ),
-                        ).fetchall()
+                    impact = self._deletion_impact_for_connection(
+                        connection,
+                        normalized_memory_id,
                     )
             except sqlite3.Error as error:
                 raise IntegrityError("cannot preview permanent deletion") from error
-        return MemoryDeletionImpact(
+        return impact
+
+    def permanently_delete(
+        self,
+        memory_id: str,
+        *,
+        confirmation_token: str,
+    ) -> MemoryDeletionResult:
+        normalized_memory_id = _required_text("canonical memory id", memory_id)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    impact = self._deletion_impact_for_connection(
+                        connection,
+                        normalized_memory_id,
+                    )
+                    if confirmation_token != impact.confirmation_token:
+                        raise UserInputError(
+                            "permanent deletion confirmation does not match "
+                            "the current impact"
+                        )
+                    removed_source_ids = tuple(
+                        source_id
+                        for source_id in impact.source_ids
+                        if source_id not in impact.shared_source_ids
+                    )
+                    object_references = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT object_reference FROM source_objects
+                            WHERE source_id IN (
+                                SELECT source_id FROM canonical_memory_sources
+                                WHERE memory_id = ?
+                                EXCEPT
+                                SELECT source_id FROM canonical_memory_sources
+                                WHERE memory_id <> ?
+                            )
+                            ORDER BY object_reference
+                            """,
+                            (normalized_memory_id, normalized_memory_id),
+                        ).fetchall()
+                    )
+                    removed_digest_ids = self._digest_ids_for_sources(
+                        connection,
+                        removed_source_ids,
+                    )
+                    removed_proposal_ids = self._proposal_ids_for_deletion(
+                        connection,
+                        impact,
+                        removed_digest_ids,
+                    )
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot plan permanent deletion") from error
+
+            deleted_at = datetime.now(timezone.utc).isoformat()
+            staged_database = self._database_with_permanent_deletion(
+                database_path,
+                impact=impact,
+                removed_source_ids=removed_source_ids,
+                removed_digest_ids=removed_digest_ids,
+                removed_proposal_ids=removed_proposal_ids,
+                deleted_at=deleted_at,
+            )
+            event_id = f"evt_{uuid.uuid4().hex}"
+            atomic_commit(
+                self._root,
+                [
+                    (database_path, staged_database),
+                    event_journal_change(
+                        self._root,
+                        {
+                            "id": event_id,
+                            "type": "memory.permanently-deleted",
+                            "occurred_at": deleted_at,
+                            "subject_fingerprint": _deletion_fingerprint(
+                                normalized_memory_id
+                            ),
+                            "removed_source_count": len(removed_source_ids),
+                        },
+                    ),
+                ],
+            )
+            for object_reference in object_references:
+                object_path = _resolved_object_reference(
+                    self._root,
+                    object_reference,
+                )
+                object_path.unlink(missing_ok=True)
+                _remove_empty_parents(
+                    object_path.parent,
+                    stop=self._root / "store" / "objects",
+                )
+            for rebuildable in (
+                self._root / "runtime" / "indexes" / "semantic",
+                self._root / "runtime" / "indexes" / "fulltext",
+            ):
+                shutil.rmtree(rebuildable, ignore_errors=True)
+        return MemoryDeletionResult(
             memory_id=normalized_memory_id,
+            removed_source_ids=removed_source_ids,
+            retained_shared_source_ids=impact.shared_source_ids,
+            removed_digest_ids=removed_digest_ids,
+            removed_proposal_ids=removed_proposal_ids,
+            deleted_at=deleted_at,
+            backup_exclusion_after=deleted_at,
+        )
+
+    @staticmethod
+    def _deletion_impact_for_connection(
+        connection: sqlite3.Connection,
+        memory_id: str,
+    ) -> MemoryDeletionImpact:
+        if connection.execute(
+            "SELECT 1 FROM canonical_memories WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone() is None:
+            raise UserInputError(f"canonical memory does not exist: {memory_id}")
+        source_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT source_id FROM canonical_memory_sources
+                WHERE memory_id = ? ORDER BY source_id
+                """,
+                (memory_id,),
+            ).fetchall()
+        )
+        shared_source_ids = tuple(
+            source_id
+            for source_id in source_ids
+            if connection.execute(
+                """
+                SELECT 1 FROM canonical_memory_sources
+                WHERE source_id = ? AND memory_id <> ? LIMIT 1
+                """,
+                (source_id, memory_id),
+            ).fetchone()
+            is not None
+        )
+        derived_digest_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT DISTINCT digest.digest_id
+                FROM buffered_digests AS digest
+                JOIN experiences AS experience
+                  ON experience.experience_id = digest.experience_id
+                JOIN canonical_memory_sources AS source
+                  ON source.source_id = experience.source_id
+                WHERE source.memory_id = ? ORDER BY digest.digest_id
+                """,
+                (memory_id,),
+            ).fetchall()
+        )
+        related_memory_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT CASE WHEN memory_id = ? THEN related_memory_id ELSE memory_id END
+                FROM canonical_memory_relations
+                WHERE memory_id = ? OR related_memory_id = ? ORDER BY 1
+                """,
+                (memory_id, memory_id, memory_id),
+            ).fetchall()
+        )
+        conflict_memory_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT CASE WHEN first_memory_id = ? THEN second_memory_id
+                            ELSE first_memory_id END
+                FROM canonical_memory_conflicts
+                WHERE first_memory_id = ? OR second_memory_id = ? ORDER BY 1
+                """,
+                (memory_id, memory_id, memory_id),
+            ).fetchall()
+        )
+        pending_proposal_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT DISTINCT proposal.proposal_id
+                FROM integration_proposals AS proposal
+                LEFT JOIN integration_proposal_related AS related
+                  ON related.proposal_id = proposal.proposal_id
+                LEFT JOIN integration_proposal_sources AS source
+                  ON source.proposal_id = proposal.proposal_id
+                WHERE proposal.status = 'pending'
+                  AND (proposal.target_memory_id = ? OR related.memory_id = ?
+                       OR source.source_id IN (
+                           SELECT source_id FROM canonical_memory_sources
+                           WHERE memory_id = ?))
+                ORDER BY proposal.proposal_id
+                """,
+                (memory_id, memory_id, memory_id),
+            ).fetchall()
+        )
+        return MemoryDeletionImpact(
+            memory_id=memory_id,
             source_ids=source_ids,
             shared_source_ids=shared_source_ids,
             derived_digest_ids=derived_digest_ids,
@@ -1342,6 +1490,240 @@ class LocalMemoryCore:
             conflict_memory_ids=conflict_memory_ids,
             pending_proposal_ids=pending_proposal_ids,
         )
+
+    @staticmethod
+    def _digest_ids_for_sources(
+        connection: sqlite3.Connection,
+        source_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if not source_ids:
+            return ()
+        placeholders = ", ".join("?" for _ in source_ids)
+        return tuple(
+            row[0]
+            for row in connection.execute(
+                f"""
+                SELECT digest.digest_id
+                FROM buffered_digests AS digest
+                JOIN experiences AS experience
+                  ON experience.experience_id = digest.experience_id
+                WHERE experience.source_id IN ({placeholders})
+                ORDER BY digest.digest_id
+                """,
+                source_ids,
+            ).fetchall()
+        )
+
+    @staticmethod
+    def _proposal_ids_for_deletion(
+        connection: sqlite3.Connection,
+        impact: MemoryDeletionImpact,
+        removed_digest_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        proposal_ids = set(impact.pending_proposal_ids)
+        proposal_ids.update(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT proposal_id FROM integration_proposals
+                WHERE target_memory_id = ?
+                UNION
+                SELECT proposal_id FROM integration_proposal_related
+                WHERE memory_id = ?
+                UNION
+                SELECT proposal_id FROM integration_reviews
+                WHERE canonical_memory_id = ?
+                """,
+                (impact.memory_id, impact.memory_id, impact.memory_id),
+            ).fetchall()
+        )
+        for table, column, values in (
+            ("integration_proposal_buffered", "digest_id", removed_digest_ids),
+            ("integration_proposal_sources", "source_id", impact.source_ids),
+        ):
+            if not values:
+                continue
+            placeholders = ", ".join("?" for _ in values)
+            proposal_ids.update(
+                row[0]
+                for row in connection.execute(
+                    f"SELECT proposal_id FROM {table} "
+                    f"WHERE {column} IN ({placeholders})",
+                    values,
+                ).fetchall()
+            )
+        return tuple(sorted(proposal_ids))
+
+    @staticmethod
+    def _database_with_permanent_deletion(
+        database_path: Path,
+        *,
+        impact: MemoryDeletionImpact,
+        removed_source_ids: tuple[str, ...],
+        removed_digest_ids: tuple[str, ...],
+        removed_proposal_ids: tuple[str, ...],
+        deleted_at: str,
+    ) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-delete.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                experience_ids = _select_ids_for_values(
+                    connection,
+                    table="experiences",
+                    result_column="experience_id",
+                    filter_column="source_id",
+                    values=removed_source_ids,
+                )
+                for table in (
+                    "integration_reviews",
+                    "integration_proposal_buffered",
+                    "integration_proposal_related",
+                    "integration_proposal_sources",
+                ):
+                    _delete_rows_for_ids(
+                        connection,
+                        table=table,
+                        column="proposal_id",
+                        values=removed_proposal_ids,
+                    )
+                _delete_rows_for_ids(
+                    connection,
+                    table="integration_proposals",
+                    column="proposal_id",
+                    values=removed_proposal_ids,
+                )
+                connection.execute(
+                    """
+                    DELETE FROM canonical_memory_conflicts
+                    WHERE first_memory_id = ? OR second_memory_id = ?
+                    """,
+                    (impact.memory_id, impact.memory_id),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM canonical_memory_relations
+                    WHERE memory_id = ? OR related_memory_id = ?
+                    """,
+                    (impact.memory_id, impact.memory_id),
+                )
+                connection.execute(
+                    "DELETE FROM legacy_knowledge_metadata WHERE memory_id = ?",
+                    (impact.memory_id,),
+                )
+                connection.execute(
+                    "DELETE FROM canonical_memory_version_sources WHERE memory_id = ?",
+                    (impact.memory_id,),
+                )
+                connection.execute(
+                    "DELETE FROM canonical_memory_versions WHERE memory_id = ?",
+                    (impact.memory_id,),
+                )
+                connection.execute(
+                    "DELETE FROM canonical_memory_sources WHERE memory_id = ?",
+                    (impact.memory_id,),
+                )
+                connection.execute(
+                    "DELETE FROM canonical_memories WHERE memory_id = ?",
+                    (impact.memory_id,),
+                )
+                _delete_rows_for_ids(
+                    connection,
+                    table="memory_events",
+                    column="subject_id",
+                    values=(
+                        impact.memory_id,
+                        *removed_source_ids,
+                        *removed_digest_ids,
+                        *experience_ids,
+                    ),
+                )
+                _delete_rows_for_ids(
+                    connection,
+                    table="buffered_digests",
+                    column="digest_id",
+                    values=removed_digest_ids,
+                )
+                _delete_rows_for_ids(
+                    connection,
+                    table="experiences",
+                    column="experience_id",
+                    values=experience_ids,
+                )
+                _delete_rows_for_ids(
+                    connection,
+                    table="legacy_source_metadata",
+                    column="source_id",
+                    values=removed_source_ids,
+                )
+                _delete_rows_for_ids(
+                    connection,
+                    table="source_objects",
+                    column="source_id",
+                    values=removed_source_ids,
+                )
+                for subject_kind, subject_id in (
+                    ("canonical-memory", impact.memory_id),
+                    *(("source", source_id) for source_id in removed_source_ids),
+                ):
+                    fingerprint = _deletion_fingerprint(subject_id)
+                    marker_id = "del_" + hashlib.sha256(
+                        f"{subject_kind}:{fingerprint}".encode("utf-8")
+                    ).hexdigest()
+                    connection.execute(
+                        """
+                        INSERT INTO deletion_markers
+                            (marker_id, subject_kind, subject_fingerprint,
+                             deleted_at, backup_exclusion_after)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            marker_id,
+                            subject_kind,
+                            fingerprint,
+                            deleted_at,
+                            deleted_at,
+                        ),
+                    )
+                connection.commit()
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise IntegrityError(
+                        "permanent deletion would leave dangling memory references"
+                    )
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage permanent deletion") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _has_deletion_marker(
+        database_path: Path,
+        *,
+        subject_kind: str,
+        subject_id: str,
+    ) -> bool:
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                return connection.execute(
+                    """
+                    SELECT 1 FROM deletion_markers
+                    WHERE subject_kind = ? AND subject_fingerprint = ?
+                    """,
+                    (subject_kind, _deletion_fingerprint(subject_id)),
+                ).fetchone() is not None
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot check permanent deletion markers") from error
 
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
         database_path = self._root / MEMORY_DATABASE
@@ -1986,6 +2368,43 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v5_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    CREATE TABLE deletion_markers (
+                        marker_id TEXT PRIMARY KEY,
+                        subject_kind TEXT NOT NULL
+                            CHECK (subject_kind IN
+                                ('canonical-memory', 'source')),
+                        subject_fingerprint TEXT NOT NULL UNIQUE,
+                        deleted_at TEXT NOT NULL,
+                        backup_exclusion_after TEXT NOT NULL
+                    );
+                    PRAGMA user_version = 6;
+                    """
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -2835,6 +3254,66 @@ def _validated_time(value: str) -> str:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise UserInputError("occurred-at must include a UTC offset")
     return parsed.isoformat()
+
+
+def _deletion_fingerprint(subject_id: str) -> str:
+    return "sha256:" + hashlib.sha256(subject_id.encode("utf-8")).hexdigest()
+
+
+def _select_ids_for_values(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    result_column: str,
+    filter_column: str,
+    values: tuple[str, ...],
+) -> tuple[str, ...]:
+    if not values:
+        return ()
+    placeholders = ", ".join("?" for _ in values)
+    return tuple(
+        row[0]
+        for row in connection.execute(
+            f"SELECT {result_column} FROM {table} "
+            f"WHERE {filter_column} IN ({placeholders}) ORDER BY {result_column}",
+            values,
+        ).fetchall()
+    )
+
+
+def _delete_rows_for_ids(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    column: str,
+    values: tuple[str, ...],
+) -> None:
+    if not values:
+        return
+    placeholders = ", ".join("?" for _ in values)
+    connection.execute(
+        f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+        values,
+    )
+
+
+def _resolved_object_reference(root: Path, object_reference: str) -> Path:
+    object_root = (root / "store" / "objects").resolve()
+    candidate = (object_root / object_reference).resolve()
+    if candidate == object_root or object_root not in candidate.parents:
+        raise IntegrityError("source object reference escapes the object store")
+    return candidate
+
+
+def _remove_empty_parents(path: Path, *, stop: Path) -> None:
+    resolved_stop = stop.resolve()
+    current = path.resolve()
+    while current != resolved_stop and resolved_stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def _validate_content_object(path: Path, body: bytes, digest: str) -> None:
