@@ -30,6 +30,7 @@ from myoutbrain.core_types import (
 )
 from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.legacy_migration import MigrationSummary, V1PermanentKnowledgeMigrator
+from myoutbrain.knowledge_views import KnowledgeViewService
 from myoutbrain.generation import ProviderFailure
 from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
 from myoutbrain.memory_gateway import (
@@ -191,6 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migration_status_parser.add_argument("--root", type=Path, default=Path.cwd())
     migration_status_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    build_views_parser = subcommands.add_parser(
+        "build-views",
+        help="Generate disposable Obsidian views from canonical memory",
+    )
+    build_views_parser.add_argument("--root", type=Path, default=Path.cwd())
+    build_views_parser.add_argument("--open", action="store_true")
+    build_views_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
@@ -723,6 +733,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 V1PermanentKnowledgeMigrator(parsed_arguments.root).status(),
                 output_format=parsed_arguments.format,
             )
+        if parsed_arguments.command == "build-views":
+            result = KnowledgeViewService(parsed_arguments.root).rebuild(
+                open_index=parsed_arguments.open
+            )
+            if parsed_arguments.format == "json":
+                print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+            else:
+                print(
+                    f"Generated {len(result.view_paths)} knowledge views at "
+                    f"{result.index_path}."
+                )
+                if result.obsidian_warning is not None:
+                    print(f"Warning: {result.obsidian_warning}", file=sys.stderr)
+            return 0
         if parsed_arguments.command == "ask":
             return _ask(
                 parsed_arguments.root,

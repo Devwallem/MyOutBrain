@@ -1113,6 +1113,28 @@ class LocalMemoryCore:
             unresolved_conflicts=conflicts,
         )
 
+    def canonical_memory_audits(self) -> tuple[CanonicalMemoryAudit, ...]:
+        """Return complete audit snapshots without consulting human projections."""
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    memory_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT memory_id FROM canonical_memories ORDER BY memory_id"
+                        ).fetchall()
+                    )
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot list canonical memory audits") from error
+        return tuple(self.explain_canonical_memory(memory_id) for memory_id in memory_ids)
+
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
