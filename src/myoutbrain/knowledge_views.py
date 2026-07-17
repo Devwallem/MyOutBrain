@@ -8,7 +8,11 @@ import json
 import re
 
 from myoutbrain.local_core import CanonicalMemoryAudit, LocalMemoryCore
-from myoutbrain.core_types import IntegrityError, UserInputError
+from myoutbrain.core_types import (
+    IntegrityError,
+    UserInputError,
+    is_canonical_memory_id,
+)
 from myoutbrain.obsidian import create_obsidian_adapter
 from myoutbrain.persistence import atomic_commit, recover_transactions, writer_lock
 
@@ -65,41 +69,49 @@ class KnowledgeViewService:
         self._root = root
 
     def rebuild(self, *, open_index: bool = False) -> KnowledgeViewBuild:
-        audits = LocalMemoryCore(self._root).canonical_memory_audits()
-        relative_paths = {
-            audit.memory_id: VIEW_ROOT / _view_filename(audit)
-            for audit in audits
-        }
-        changes: list[tuple[Path, bytes]] = []
-        manifest_views: list[dict[str, str]] = []
-        for audit in audits:
-            relative_path = relative_paths[audit.memory_id]
-            content = _render_view(audit, relative_paths)
-            encoded = content.encode("utf-8")
-            changes.append((self._root / relative_path, encoded))
-            manifest_views.append(
-                {
-                    "memory_id": audit.memory_id,
-                    "path": relative_path.as_posix(),
-                    "content_hash": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
-                }
-            )
-        index_content = _render_index(audits, relative_paths).encode("utf-8")
-        changes.append((self._root / VIEW_INDEX, index_content))
-        manifest = json.dumps(
-            {"schema_version": 1, "views": manifest_views},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ).encode("utf-8") + b"\n"
-        changes.append((self._root / VIEW_MANIFEST, manifest))
-        previous_paths = _previous_view_paths(self._root)
-        with writer_lock(self._root):
-            recover_transactions(self._root)
+        core = LocalMemoryCore(self._root)
+        with core.canonical_memory_audit_snapshot() as audits:
+            dirty_views = _dirty_view_paths(self._root)
+            if dirty_views:
+                raise UserInputError(
+                    "knowledge views contain unsynchronized edits; run "
+                    "sync-view-edits before rebuilding: "
+                    + ", ".join(path.as_posix() for path in dirty_views)
+                )
+            relative_paths = {
+                audit.memory_id: VIEW_ROOT / _view_filename(audit)
+                for audit in audits
+            }
+            changes: list[tuple[Path, bytes]] = []
+            manifest_views: list[dict[str, str]] = []
+            for audit in audits:
+                relative_path = relative_paths[audit.memory_id]
+                content = _render_view(audit, relative_paths)
+                encoded = content.encode("utf-8")
+                changes.append((self._root / relative_path, encoded))
+                manifest_views.append(
+                    {
+                        "memory_id": audit.memory_id,
+                        "path": relative_path.as_posix(),
+                        "content_hash": (
+                            f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+                        ),
+                    }
+                )
+            index_content = _render_index(audits, relative_paths).encode("utf-8")
+            changes.append((self._root / VIEW_INDEX, index_content))
+            manifest = json.dumps(
+                {"schema_version": 1, "views": manifest_views},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8") + b"\n"
+            changes.append((self._root / VIEW_MANIFEST, manifest))
+            previous_paths = _previous_view_paths(self._root)
             atomic_commit(self._root, changes)
             current_paths = {path for path in relative_paths.values()}
             for relative_path in previous_paths - current_paths:
-                (self._root / relative_path).unlink(missing_ok=True)
+                _resolved_view_path(self._root, relative_path).unlink(missing_ok=True)
         warning = None
         if open_index:
             warning = create_obsidian_adapter().open_note(
@@ -123,7 +135,7 @@ class KnowledgeViewService:
         edits: list[KnowledgeViewEdit] = []
         for item in views:
             memory_id, relative_path, expected_hash = _manifest_view(item)
-            view_path = self._root / relative_path
+            view_path = _resolved_view_path(self._root, relative_path)
             if not view_path.is_file():
                 continue
             try:
@@ -323,7 +335,7 @@ def _manifest_view(item: object) -> tuple[str, Path, str]:
     relative_path = Path(path_value) if isinstance(path_value, str) else Path(".")
     if (
         not isinstance(memory_id, str)
-        or re.fullmatch(r"mem_[0-9a-f]{64}", memory_id) is None
+        or not is_canonical_memory_id(memory_id)
         or not isinstance(path_value, str)
         or not relative_path.is_relative_to(VIEW_ROOT)
         or not isinstance(content_hash, str)
@@ -331,6 +343,37 @@ def _manifest_view(item: object) -> tuple[str, Path, str]:
     ):
         raise IntegrityError("knowledge view manifest entry is invalid")
     return memory_id, relative_path, content_hash
+
+
+def _dirty_view_paths(root: Path) -> tuple[Path, ...]:
+    manifest_path = root / VIEW_MANIFEST
+    if not manifest_path.is_file():
+        return ()
+    manifest = _load_manifest(root)
+    views = manifest.get("views")
+    if not isinstance(views, list):
+        raise IntegrityError("knowledge view manifest has invalid views")
+    dirty: list[Path] = []
+    for item in views:
+        _, relative_path, expected_hash = _manifest_view(item)
+        view_path = _resolved_view_path(root, relative_path)
+        if not view_path.is_file():
+            continue
+        try:
+            actual_hash = f"sha256:{hashlib.sha256(view_path.read_bytes()).hexdigest()}"
+        except OSError as error:
+            raise IntegrityError(f"cannot read knowledge view: {view_path}") from error
+        if actual_hash != expected_hash:
+            dirty.append(relative_path)
+    return tuple(dirty)
+
+
+def _resolved_view_path(root: Path, relative_path: Path) -> Path:
+    view_root = (root / VIEW_ROOT).resolve()
+    candidate = (root / relative_path).resolve()
+    if not candidate.is_relative_to(view_root):
+        raise IntegrityError("knowledge view path escapes the managed view directory")
+    return candidate
 
 
 def _current_understanding(text: str, path: Path) -> str:

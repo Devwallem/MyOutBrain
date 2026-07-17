@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1011,110 +1012,23 @@ class LocalMemoryCore:
             self._validate_database(database_path)
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
-                    current = connection.execute(
-                        """
-                        SELECT content, current_version, state
-                        FROM canonical_memories
-                        WHERE memory_id = ?
-                        """,
-                        (normalized_memory_id,),
-                    ).fetchone()
-                    version_rows = connection.execute(
-                        """
-                        SELECT version.version, version.content, version.action,
-                               version.change_reason, version.superseded_at,
-                               version.supersession_reason,
-                               GROUP_CONCAT(source.source_id, ',')
-                        FROM canonical_memory_versions AS version
-                        LEFT JOIN canonical_memory_version_sources AS source
-                          ON source.memory_id = version.memory_id
-                         AND source.version = version.version
-                        WHERE version.memory_id = ?
-                        GROUP BY version.memory_id, version.version
-                        ORDER BY version.version
-                        """,
-                        (normalized_memory_id,),
-                    ).fetchall()
-                    conflict_rows = connection.execute(
-                        """
-                        SELECT other.memory_id, other.content, conflict.reason,
-                               GROUP_CONCAT(source.source_id, ',')
-                        FROM canonical_memory_conflicts AS conflict
-                        JOIN canonical_memories AS other
-                          ON other.memory_id = CASE
-                              WHEN conflict.first_memory_id = ?
-                              THEN conflict.second_memory_id
-                              ELSE conflict.first_memory_id
-                          END
-                        LEFT JOIN canonical_memory_version_sources AS source
-                          ON source.memory_id = other.memory_id
-                         AND source.version = other.current_version
-                        WHERE conflict.status = 'unresolved'
-                          AND (? = conflict.first_memory_id
-                               OR ? = conflict.second_memory_id)
-                        GROUP BY conflict.conflict_id, other.memory_id
-                        ORDER BY other.memory_id
-                        """,
-                        (
-                            normalized_memory_id,
-                            normalized_memory_id,
-                            normalized_memory_id,
-                        ),
-                    ).fetchall()
+                    return _canonical_memory_audit(
+                        connection,
+                        normalized_memory_id,
+                    )
             except sqlite3.Error as error:
                 raise IntegrityError("cannot explain canonical memory") from error
-        if (
-            current is None
-            or not isinstance(current[0], str)
-            or not isinstance(current[1], int)
-            or current[2] not in ("active", "inactive")
-        ):
-            raise UserInputError(
-                f"canonical memory does not exist: {normalized_memory_id}"
-            )
-        versions = tuple(
-            CanonicalMemoryVersion(
-                version=row[0],
-                content=row[1],
-                action=row[2],
-                change_reason=row[3],
-                status="superseded" if row[4] is not None else "current",
-                supersession_reason=row[5],
-                source_ids=_split_group(row[6]),
-            )
-            for row in version_rows
-        )
-        conflicts = tuple(
-            UnresolvedMemoryConflict(
-                memory_id=row[0],
-                content=row[1],
-                reason=row[2],
-                source_ids=_split_group(row[3]),
-            )
-            for row in conflict_rows
-        )
-        current_version = current[1]
-        current_sources = next(
-            (
-                version.source_ids
-                for version in versions
-                if version.version == current_version
-            ),
-            (),
-        )
-        return CanonicalMemoryAudit(
-            memory_id=normalized_memory_id,
-            state=current[2],
-            confirmation_status="conflicted" if conflicts else "confirmed",
-            current_version=current_version,
-            current_content=current[0],
-            current_source_ids=current_sources,
-            versions=versions,
-            unresolved_conflicts=conflicts,
-        )
 
     def canonical_memory_audits(self) -> tuple[CanonicalMemoryAudit, ...]:
         """Return complete audit snapshots without consulting human projections."""
+        with self.canonical_memory_audit_snapshot() as audits:
+            return audits
+
+    @contextmanager
+    def canonical_memory_audit_snapshot(
+        self,
+    ) -> Iterator[tuple[CanonicalMemoryAudit, ...]]:
+        """Hold the single-writer boundary while a projection consumes one snapshot."""
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
             raise ConfigurationConflict(
@@ -1125,15 +1039,20 @@ class LocalMemoryCore:
             self._validate_database(database_path)
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
+                    connection.execute("BEGIN")
                     memory_ids = tuple(
                         row[0]
                         for row in connection.execute(
                             "SELECT memory_id FROM canonical_memories ORDER BY memory_id"
                         ).fetchall()
                     )
+                    audits = tuple(
+                        _canonical_memory_audit(connection, memory_id)
+                        for memory_id in memory_ids
+                    )
+                    yield audits
             except sqlite3.Error as error:
                 raise IntegrityError("cannot list canonical memory audits") from error
-        return tuple(self.explain_canonical_memory(memory_id) for memory_id in memory_ids)
 
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
         database_path = self._root / MEMORY_DATABASE
@@ -2072,6 +1991,104 @@ def _required_text(name: str, value: str) -> str:
 
 def _without_evidence_marker(content: str) -> str:
     return re.sub(r"\s*\[evidence:\s+src_[0-9a-f]+\]\s*$", "", content).strip()
+
+
+def _canonical_memory_audit(
+    connection: sqlite3.Connection,
+    memory_id: str,
+) -> CanonicalMemoryAudit:
+    current = connection.execute(
+        """
+        SELECT content, current_version, state
+        FROM canonical_memories
+        WHERE memory_id = ?
+        """,
+        (memory_id,),
+    ).fetchone()
+    version_rows = connection.execute(
+        """
+        SELECT version.version, version.content, version.action,
+               version.change_reason, version.superseded_at,
+               version.supersession_reason,
+               GROUP_CONCAT(source.source_id, ',')
+        FROM canonical_memory_versions AS version
+        LEFT JOIN canonical_memory_version_sources AS source
+          ON source.memory_id = version.memory_id
+         AND source.version = version.version
+        WHERE version.memory_id = ?
+        GROUP BY version.memory_id, version.version
+        ORDER BY version.version
+        """,
+        (memory_id,),
+    ).fetchall()
+    conflict_rows = connection.execute(
+        """
+        SELECT other.memory_id, other.content, conflict.reason,
+               GROUP_CONCAT(source.source_id, ',')
+        FROM canonical_memory_conflicts AS conflict
+        JOIN canonical_memories AS other
+          ON other.memory_id = CASE
+              WHEN conflict.first_memory_id = ?
+              THEN conflict.second_memory_id
+              ELSE conflict.first_memory_id
+          END
+        LEFT JOIN canonical_memory_version_sources AS source
+          ON source.memory_id = other.memory_id
+         AND source.version = other.current_version
+        WHERE conflict.status = 'unresolved'
+          AND (? = conflict.first_memory_id OR ? = conflict.second_memory_id)
+        GROUP BY conflict.conflict_id, other.memory_id
+        ORDER BY other.memory_id
+        """,
+        (memory_id, memory_id, memory_id),
+    ).fetchall()
+    if (
+        current is None
+        or not isinstance(current[0], str)
+        or not isinstance(current[1], int)
+        or current[2] not in ("active", "inactive")
+    ):
+        raise UserInputError(f"canonical memory does not exist: {memory_id}")
+    versions = tuple(
+        CanonicalMemoryVersion(
+            version=row[0],
+            content=row[1],
+            action=row[2],
+            change_reason=row[3],
+            status="superseded" if row[4] is not None else "current",
+            supersession_reason=row[5],
+            source_ids=_split_group(row[6]),
+        )
+        for row in version_rows
+    )
+    conflicts = tuple(
+        UnresolvedMemoryConflict(
+            memory_id=row[0],
+            content=row[1],
+            reason=row[2],
+            source_ids=_split_group(row[3]),
+        )
+        for row in conflict_rows
+    )
+    current_version = current[1]
+    current_sources = next(
+        (
+            version.source_ids
+            for version in versions
+            if version.version == current_version
+        ),
+        (),
+    )
+    return CanonicalMemoryAudit(
+        memory_id=memory_id,
+        state=current[2],
+        confirmation_status="conflicted" if conflicts else "confirmed",
+        current_version=current_version,
+        current_content=current[0],
+        current_source_ids=current_sources,
+        versions=versions,
+        unresolved_conflicts=conflicts,
+    )
 
 
 def _normalized_memory_body(content: str) -> str:

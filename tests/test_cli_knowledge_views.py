@@ -8,9 +8,111 @@ import unittest
 
 from tests.cli_support import run_cli
 from tests.test_cli_memory_evolution import accept_new, propose, remember_evidence
+from tests.test_cli_promote import create_derived_insight
 
 
 class ObsidianKnowledgeViewTests(unittest.TestCase):
+    def test_manifest_path_cannot_escape_the_disposable_view_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            remember_evidence(
+                temporary_root,
+                instance_root,
+                name="safe-view",
+                digest="Canonical memory must survive a tampered view manifest.",
+                task="safe-view",
+            )
+            memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "safe-view")["proposal_id"],
+            )
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            manifest_path = (
+                instance_root / "runtime" / "knowledge-views" / "manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["views"][0]["path"] = (
+                "vault/Knowledge Views/../../store/memory.sqlite3"
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            rejected = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            audit = run_cli(
+                "why-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("escapes", rejected.stderr)
+            self.assertEqual(audit.returncode, 0, audit.stderr)
+            self.assertEqual(json.loads(audit.stdout)["memory_id"], memory_id)
+
+    def test_migrated_canonical_identity_accepts_controlled_view_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            instance_root, insight_id, _, _ = create_derived_insight(
+                Path(temporary_directory)
+            )
+            migrated = run_cli(
+                "migrate-v1",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(migrated.returncode, 0, migrated.stderr)
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            result = json.loads(built.stdout)
+            view_path = instance_root / result["view_paths"][0]
+            generated = view_path.read_text(encoding="utf-8")
+            view_path.write_text(
+                generated.replace(
+                    "## Current understanding\n\n",
+                    "## Current understanding\n\nHuman clarification: ",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            synced = run_cli(
+                "sync-view-edits",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(synced.returncode, 0, synced.stderr)
+            sync_result = json.loads(synced.stdout)
+            self.assertEqual(sync_result["edit_count"], 1)
+            self.assertEqual(sync_result["edits"][0]["memory_id"], insight_id)
+
     def test_canonical_memory_generates_a_traceable_linked_obsidian_view(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -196,6 +298,20 @@ class ObsidianKnowledgeViewTests(unittest.TestCase):
                     ),
                 ),
                 encoding="utf-8",
+            )
+
+            blocked_rebuild = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(blocked_rebuild.returncode, 2)
+            self.assertIn("sync-view-edits", blocked_rebuild.stderr)
+            self.assertIn(
+                "Project Atlas review cadence is monthly.",
+                view_path.read_text(encoding="utf-8"),
             )
 
             synced = run_cli(

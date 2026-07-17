@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from enum import StrEnum
+import re
 from typing import Literal
 
 
 Sensitivity = Literal["local-only", "cloud-allowed"]
+
+
+def is_canonical_memory_id(value: str) -> bool:
+    """Accept native and migrated stable canonical-memory identities."""
+    return re.fullmatch(
+        r"(?:mem_[0-9a-f]{64}|ins_[0-9a-f]{32}|cog_[0-9a-f]{32})",
+        value,
+    ) is not None
 
 
 class MemoryState(StrEnum):
