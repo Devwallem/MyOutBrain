@@ -9,11 +9,11 @@ import sys
 from myoutbrain.dialogue_learning_prototype_logic import (
     PrototypeState,
     accept_selected,
-    capture_scenario,
+    capture_dialogue,
     distill,
     recall,
     reject_selected,
-    select_next_draft,
+    select_draft,
     selected_markdown,
     storage_summary,
 )
@@ -54,7 +54,7 @@ def render(state: PrototypeState, *, clear: bool = True) -> None:
         for index, draft in enumerate(state.drafts):
             marker = ">" if index == state.selected_draft else " "
             label = ARTIFACT_LABELS[draft.artifact_type.value]
-            print(f"{marker} [{label}] {draft.title}")
+            print(f"{marker} [{index + 1}] [{label}] {draft.title}")
     else:
         print("  （空）")
     print(f"\n{BOLD}已接受的可复用记忆{RESET}")
@@ -78,12 +78,14 @@ def render(state: PrototypeState, *, clear: bool = True) -> None:
     )
     print(f"\n{BOLD}当前候选 Markdown{RESET}")
     print(selected_markdown(state))
-    print(
-        f"\n{BOLD}[1]{RESET} GitHub 失败  {BOLD}[2]{RESET} Vault 索引  "
-        f"{BOLD}[3]{RESET} 重复教训  {BOLD}[4]{RESET} 普通闲聊"
+    selection_hint = (
+        f"{BOLD}[1-{len(state.drafts)}]{RESET} 选择动态候选  "
+        if state.drafts
+        else ""
     )
     print(
-        f"{BOLD}[x]{RESET} 提炼  {BOLD}[n]{RESET} 下一个  {BOLD}[a]{RESET} 接受  "
+        f"\n{BOLD}[x]{RESET} 输入对话并提炼  {selection_hint}"
+        f"{BOLD}[a]{RESET} 接受  "
         f"{BOLD}[r]{RESET} 拒绝  {BOLD}[/]{RESET} 提出新问题  {BOLD}[q]{RESET} 退出"
     )
 
@@ -93,12 +95,13 @@ def run_interactive() -> None:
     while True:
         render(state)
         command = input("\n> ").strip().lower()
-        if command in {"1", "2", "3", "4"}:
-            state = capture_scenario(state, command)
-        elif command == "x":
+        if command == "x":
+            user_text = input("输入这次对话中的用户内容：").strip()
+            assistant_text = input("输入智能体回应（可留空）：").strip()
+            state = capture_dialogue(state, user_text, assistant_text)
             state = distill(state)
-        elif command == "n":
-            state = select_next_draft(state)
+        elif command.isdigit():
+            state = select_draft(state, int(command))
         elif command == "a":
             state = accept_selected(state)
         elif command == "r":
@@ -110,10 +113,18 @@ def run_interactive() -> None:
 
 
 def run_demo() -> None:
-    state = capture_scenario(PrototypeState(), "1")
+    state = capture_dialogue(
+        PrototypeState(),
+        "请把当前分支上传到 GitHub main。",
+        "GitHub 认证和网络连接失败；应先检查连通性和 gh auth status。",
+    )
     state = distill(state)
     state = accept_selected(state)
-    state = capture_scenario(state, "3")
+    state = capture_dialogue(
+        state,
+        "再次尝试上传到 GitHub。",
+        "应先验证网络和认证，避免重复失败。",
+    )
     state = distill(state)
     state = recall(state, "上传 GitHub 前应该检查什么？")
     render(state, clear=False)

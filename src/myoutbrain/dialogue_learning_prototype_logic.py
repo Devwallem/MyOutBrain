@@ -1,4 +1,4 @@
-"""原型：对话沉淀为可复用经验的纯状态转换。"""
+"""原型：任意可见对话经提炼后进入动态编号的审阅队列。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class PrototypeState:
     rejected_fingerprints: frozenset[str] = frozenset()
     last_query: str = ""
     recalled_memory_ids: tuple[str, ...] = ()
-    last_event: str = "准备就绪，请先采集一段示例对话。"
+    last_event: str = "准备就绪；按 x 输入当前可见对话并提炼。"
 
 
 @dataclass(frozen=True)
@@ -61,34 +61,6 @@ class ExtractionRule:
     title: str
     trigger: str
     practice: str
-
-
-SCENARIOS: dict[str, tuple[tuple[str, str], ...]] = {
-    "1": (
-        ("user", "请把当前分支上传到 GitHub main。"),
-        ("assistant", "GitHub 认证和网络连接失败，推送没有发生。"),
-        ("user", "似乎是 GitHub 网络出问题了，先停止上传。"),
-    ),
-    "2": (
-        ("user", "现在可以构建 Obsidian 文件框架了吗？"),
-        (
-            "assistant",
-            "创建索引笔记前先检查 rebuild；索引不能伪造 id frontmatter，"
-            "否则会被当成正式知识记录。",
-        ),
-    ),
-    "3": (
-        ("user", "再次尝试上传到 GitHub。"),
-        (
-            "assistant",
-            "应先验证 GitHub 网络和 gh auth status，再创建发布提交，避免重复失败。",
-        ),
-    ),
-    "4": (
-        ("user", "今天天气不错。"),
-        ("assistant", "是的，适合出去走走。"),
-    ),
-}
 
 
 RULES = (
@@ -115,8 +87,21 @@ RULES = (
 )
 
 
-def capture_scenario(state: PrototypeState, scenario_key: str) -> PrototypeState:
-    scenario = SCENARIOS[scenario_key]
+def capture_dialogue(
+    state: PrototypeState,
+    user_text: str,
+    assistant_text: str = "",
+) -> PrototypeState:
+    visible_turns = tuple(
+        (speaker, text.strip())
+        for speaker, text in (
+            ("user", user_text),
+            ("assistant", assistant_text),
+        )
+        if text.strip()
+    )
+    if not visible_turns:
+        return replace(state, last_event="没有输入可见对话，状态未改变。")
     first_number = len(state.turns) + 1
     captured = tuple(
         DialogueTurn(
@@ -124,12 +109,12 @@ def capture_scenario(state: PrototypeState, scenario_key: str) -> PrototypeState
             speaker=speaker,
             text=text,
         )
-        for offset, (speaker, text) in enumerate(scenario)
+        for offset, (speaker, text) in enumerate(visible_turns)
     )
     return replace(
         state,
         turns=state.turns + captured,
-        last_event=f"已将场景 {scenario_key} 采集为一份不可变对话来源。",
+        last_event="已将当前可见对话采集为一份不可变来源，等待提炼。",
     )
 
 
@@ -140,6 +125,9 @@ def distill(state: PrototypeState) -> PrototypeState:
         memory.fingerprint for memory in state.memories
     } | set(state.rejected_fingerprints)
     new_drafts: list[ArtifactDraft] = []
+    latest_turns = _latest_dialogue(state.turns)
+    latest_turn_ids = {turn.turn_id for turn in latest_turns}
+    latest_matched_rule = False
     for rule in RULES:
         evidence = tuple(
             turn.turn_id
@@ -148,6 +136,8 @@ def distill(state: PrototypeState) -> PrototypeState:
         )
         if not evidence:
             continue
+        if latest_turn_ids.intersection(evidence):
+            latest_matched_rule = True
         fingerprint = _fingerprint(rule)
         if fingerprint in existing:
             continue
@@ -161,6 +151,10 @@ def distill(state: PrototypeState) -> PrototypeState:
                 evidence_turn_ids=evidence,
             )
         )
+    if latest_turns and not latest_matched_rule:
+        generic = _generic_draft(latest_turns)
+        if generic is not None and generic.fingerprint not in existing:
+            new_drafts.append(generic)
     event = (
         f"已提炼 {len(new_drafts)} 个新候选；重复项和已拒绝项继续受到抑制。"
         if new_drafts
@@ -176,13 +170,14 @@ def distill(state: PrototypeState) -> PrototypeState:
     )
 
 
-def select_next_draft(state: PrototypeState) -> PrototypeState:
-    if not state.drafts:
-        return replace(state, last_event="当前没有可供选择的候选。")
+def select_draft(state: PrototypeState, number: int) -> PrototypeState:
+    index = number - 1
+    if index < 0 or index >= len(state.drafts):
+        return replace(state, last_event=f"候选 {number} 不存在，选择未改变。")
     return replace(
         state,
-        selected_draft=(state.selected_draft + 1) % len(state.drafts),
-        last_event="已选择下一个候选。",
+        selected_draft=index,
+        last_event=f"已选择候选 {number}。",
     )
 
 
@@ -283,6 +278,55 @@ def storage_summary(state: PrototypeState) -> tuple[int, int, int]:
 def _fingerprint(rule: ExtractionRule) -> str:
     canonical = f"{rule.artifact_type.value}\n{rule.title}\n{rule.trigger}\n{rule.practice}"
     return sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _latest_dialogue(
+    turns: tuple[DialogueTurn, ...],
+) -> tuple[DialogueTurn, ...]:
+    if not turns:
+        return ()
+    latest_user_index = max(
+        (index for index, turn in enumerate(turns) if turn.speaker == "user"),
+        default=len(turns) - 1,
+    )
+    return turns[latest_user_index:]
+
+
+def _generic_draft(
+    turns: tuple[DialogueTurn, ...],
+) -> ArtifactDraft | None:
+    combined = " ".join(turn.text.strip() for turn in turns if turn.text.strip())
+    normalized = combined.casefold()
+    if not combined or any(
+        phrase in normalized
+        for phrase in ("今天天气", "早上好", "晚上好", "你好", "谢谢", "再见")
+    ):
+        return None
+    if any(term in normalized for term in ("步骤", "流程", "如何", "方法", "checklist")):
+        artifact_type = ArtifactType.SKILL
+    elif any(
+        term in normalized
+        for term in ("失败", "避免", "不要", "应先", "教训", "错误")
+    ):
+        artifact_type = ArtifactType.LESSON
+    else:
+        artifact_type = ArtifactType.KNOWLEDGE
+    user_text = next(
+        (turn.text.strip() for turn in turns if turn.speaker == "user"),
+        combined,
+    )
+    title = user_text if len(user_text) <= 32 else user_text[:31] + "…"
+    trigger = f"再次遇到与“{title}”相关的问题时"
+    practice = "回看这些证据轮次并核对这次对话形成的结论：" + combined
+    canonical = f"{artifact_type.value}\n{title}\n{trigger}\n{practice}"
+    return ArtifactDraft(
+        fingerprint=sha256(canonical.encode("utf-8")).hexdigest()[:16],
+        artifact_type=artifact_type,
+        title=title,
+        trigger=trigger,
+        practice=practice,
+        evidence_turn_ids=tuple(turn.turn_id for turn in turns),
+    )
 
 
 def _terms(text: str) -> frozenset[str]:
