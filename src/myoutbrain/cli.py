@@ -164,6 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     consolidate_parser.add_argument("--root", type=Path, default=Path.cwd())
     consolidate_parser.add_argument("--task", required=True)
+    consolidate_parser.add_argument("--force", action="store_true")
+    consolidate_parser.add_argument(
+        "--conversation-state",
+        choices=("active", "inactive"),
+        help="Explicit delivery state; required for forced consolidation",
+    )
     consolidate_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
@@ -492,10 +498,22 @@ def _render_integration_proposals(
     proposals: Sequence[IntegrationProposal],
     *,
     output_format: str,
+    trigger: str = "manual",
+    delivery: str | None = None,
 ) -> int:
     proposal_data = [proposal.to_data() for proposal in proposals]
     if output_format == "json":
-        print(json.dumps({"proposals": proposal_data}, ensure_ascii=False, sort_keys=True))
+        result: dict[str, object] = {"proposals": proposal_data}
+        if trigger != "manual":
+            result.update(
+                {
+                    "trigger": trigger,
+                    "scope": "task-related",
+                    "delivery": delivery,
+                    "canonical_changes": 0,
+                }
+            )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     if not proposal_data:
         print("No memory integration proposals are pending.")
@@ -531,9 +549,35 @@ def _render_integration_proposals(
     return 0
 
 
-def _consolidate(root: Path, task: str, output_format: str) -> int:
+def _consolidate(
+    root: Path,
+    task: str,
+    output_format: str,
+    *,
+    force: bool,
+    conversation_state: str | None,
+) -> int:
+    if force and conversation_state is None:
+        raise UserInputError(
+            "forced consolidation requires an explicit --conversation-state"
+        )
+    if not force and conversation_state is not None:
+        raise UserInputError(
+            "--conversation-state is only valid with forced consolidation"
+        )
     proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
-    return _render_integration_proposals(proposals, output_format=output_format)
+    return _render_integration_proposals(
+        proposals,
+        output_format=output_format,
+        trigger="forced" if force else "manual",
+        delivery=(
+            "active-conversation"
+            if conversation_state == "active"
+            else "pending-review-queue"
+            if conversation_state == "inactive"
+            else None
+        ),
+    )
 
 
 def _review_memory(
@@ -780,6 +824,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 parsed_arguments.task,
                 parsed_arguments.format,
+                force=parsed_arguments.force,
+                conversation_state=parsed_arguments.conversation_state,
             )
         if parsed_arguments.command == "review-memory":
             return _review_memory(
