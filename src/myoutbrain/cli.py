@@ -15,6 +15,7 @@ from myoutbrain.answering import (
     RiskLevel,
 )
 from myoutbrain.cognitive_audit import CognitiveAuditService
+from myoutbrain.consolidation import ConsolidationScheduler
 from myoutbrain.evaluation import (
     evaluate_recall,
     load_recall_dataset,
@@ -171,6 +172,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit delivery state; required for forced consolidation",
     )
     consolidate_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    scheduled_authorization_parser = subcommands.add_parser(
+        "authorize-scheduled-consolidation",
+        help="Create bounded revocable standing authority for cloud analysis",
+    )
+    scheduled_authorization_parser.add_argument("--provider", required=True)
+    scheduled_authorization_parser.add_argument("--model", required=True)
+    scheduled_authorization_parser.add_argument(
+        "--allowed-sensitivity",
+        choices=("cloud-allowed", "local-only"),
+        required=True,
+    )
+    scheduled_authorization_parser.add_argument("--batch-size", type=int, required=True)
+    scheduled_authorization_parser.add_argument("--token-limit", type=int, required=True)
+    scheduled_authorization_parser.add_argument(
+        "--cost-limit-usd", type=float, required=True
+    )
+    scheduled_authorization_parser.add_argument(
+        "--root", type=Path, default=Path.cwd()
+    )
+    scheduled_authorization_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    revoke_scheduled_parser = subcommands.add_parser(
+        "revoke-scheduled-consolidation",
+        help="Revoke standing scheduled cloud authority",
+    )
+    revoke_scheduled_parser.add_argument("--root", type=Path, default=Path.cwd())
+    revoke_scheduled_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    scheduled_status_parser = subcommands.add_parser(
+        "scheduled-consolidation-authorization",
+        help="Show scheduled cloud authority and its bounds",
+    )
+    scheduled_status_parser.add_argument("--root", type=Path, default=Path.cwd())
+    scheduled_status_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     memory_review_parser = subcommands.add_parser(
@@ -580,6 +619,29 @@ def _consolidate(
     )
 
 
+def _render_scheduled_authorization(
+    authorization: dict[str, object],
+    output_format: str,
+) -> int:
+    if output_format == "json":
+        print(json.dumps(authorization, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            "Scheduled cloud consolidation authorization: "
+            f"{authorization['status']}"
+        )
+        print(
+            f"Provider/model: {authorization['provider']}/"
+            f"{authorization['model']}"
+        )
+        print(
+            f"Bounds: {authorization['batch_size']} items, "
+            f"{authorization['token_limit']} tokens, "
+            f"USD {authorization['cost_limit_usd']}"
+        )
+    return 0
+
+
 def _review_memory(
     root: Path,
     proposal_id: str | None,
@@ -826,6 +888,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.format,
                 force=parsed_arguments.force,
                 conversation_state=parsed_arguments.conversation_state,
+            )
+        if parsed_arguments.command == "authorize-scheduled-consolidation":
+            authorization = ConsolidationScheduler(
+                parsed_arguments.root
+            ).authorize_cloud(
+                provider=parsed_arguments.provider,
+                model=parsed_arguments.model,
+                allowed_sensitivity=parsed_arguments.allowed_sensitivity,
+                batch_size=parsed_arguments.batch_size,
+                token_limit=parsed_arguments.token_limit,
+                cost_limit_usd=parsed_arguments.cost_limit_usd,
+            )
+            return _render_scheduled_authorization(
+                authorization.to_data(), parsed_arguments.format
+            )
+        if parsed_arguments.command == "revoke-scheduled-consolidation":
+            authorization = ConsolidationScheduler(
+                parsed_arguments.root
+            ).revoke_cloud()
+            return _render_scheduled_authorization(
+                authorization.to_data(), parsed_arguments.format
+            )
+        if parsed_arguments.command == "scheduled-consolidation-authorization":
+            authorization = ConsolidationScheduler(
+                parsed_arguments.root
+            ).authorization()
+            return _render_scheduled_authorization(
+                authorization.to_data(), parsed_arguments.format
             )
         if parsed_arguments.command == "review-memory":
             return _review_memory(

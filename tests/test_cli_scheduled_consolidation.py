@@ -85,6 +85,86 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(ambiguous.returncode, 2)
             self.assertIn("conversation-state", ambiguous.stderr)
 
+    def test_scheduled_cloud_authorization_is_bounded_and_revocable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            instance_root = Path(temporary_directory) / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+
+            authorized = run_cli(
+                "authorize-scheduled-consolidation",
+                "--provider",
+                "fake-cloud",
+                "--model",
+                "analysis-v1",
+                "--allowed-sensitivity",
+                "cloud-allowed",
+                "--batch-size",
+                "3",
+                "--token-limit",
+                "900",
+                "--cost-limit-usd",
+                "0.25",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(authorized.returncode, 0, authorized.stderr)
+            authorization = json.loads(authorized.stdout)
+            self.assertEqual(authorization["status"], "active")
+            self.assertEqual(authorization["provider"], "fake-cloud")
+            self.assertEqual(authorization["model"], "analysis-v1")
+            self.assertEqual(
+                authorization["allowed_sensitivity"], "cloud-allowed"
+            )
+            self.assertEqual(authorization["batch_size"], 3)
+            self.assertEqual(authorization["token_limit"], 900)
+            self.assertEqual(authorization["cost_limit_usd"], 0.25)
+
+            revoked = run_cli(
+                "revoke-scheduled-consolidation",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            status = run_cli(
+                "scheduled-consolidation-authorization",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(revoked.returncode, 0, revoked.stderr)
+            self.assertEqual(json.loads(revoked.stdout)["status"], "revoked")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(json.loads(status.stdout)["status"], "revoked")
+
+            invalid = run_cli(
+                "authorize-scheduled-consolidation",
+                "--provider",
+                "fake-cloud",
+                "--model",
+                "analysis-v1",
+                "--allowed-sensitivity",
+                "local-only",
+                "--batch-size",
+                "3",
+                "--token-limit",
+                "900",
+                "--cost-limit-usd",
+                "0.25",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("local-only", invalid.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
