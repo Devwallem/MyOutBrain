@@ -248,6 +248,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_scheduled_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    pending_reviews_parser = subcommands.add_parser(
+        "pending-consolidation-reviews",
+        help="List offline consolidation runs awaiting natural review",
+    )
+    pending_reviews_parser.add_argument("--root", type=Path, default=Path.cwd())
+    pending_reviews_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     memory_review_parser = subcommands.add_parser(
         "review-memory",
         help="List or naturally review memory integration proposals",
@@ -984,6 +992,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
             return _render_simple_data(
                 scheduled_run.to_data(), parsed_arguments.format
+            )
+        if parsed_arguments.command == "pending-consolidation-reviews":
+            pending_reviews = ConsolidationScheduler(
+                parsed_arguments.root
+            ).pending_reviews()
+            return _render_simple_data(
+                {"pending_reviews": list(pending_reviews)},
+                parsed_arguments.format,
             )
         if parsed_arguments.command == "review-memory":
             return _review_memory(

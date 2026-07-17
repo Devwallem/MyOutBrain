@@ -9,6 +9,7 @@ from typing import Literal, cast
 import uuid
 
 from myoutbrain.core_types import ConfigurationConflict, IntegrityError, UserInputError
+from myoutbrain.embeddings import EmbeddingFailure, LocalMultilingualEmbeddingProvider
 from myoutbrain.generation import (
     Citation,
     CloudAuthorization,
@@ -19,6 +20,13 @@ from myoutbrain.generation import (
     ProviderFailure,
 )
 from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
+from myoutbrain.notifications import (
+    LocalNotification,
+    LocalNotifier,
+    NotificationFailure,
+    create_local_notifier,
+)
+from myoutbrain.semantic_index import SemanticRecallIndex
 from myoutbrain.persistence import (
     atomic_commit,
     event_journal_change,
@@ -130,6 +138,9 @@ class ScheduledConsolidationRun:
     delivery: Literal["active-conversation", "pending-review-queue"]
     proposals: tuple[IntegrationProposal, ...]
     next_run_at: str
+    attempt_count: int
+    notification_status: Literal["not-required", "pending", "delivered", "failed"]
+    deterministic_maintenance: dict[str, object]
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -142,6 +153,9 @@ class ScheduledConsolidationRun:
             "canonical_changes": 0,
             "proposals": [proposal.to_data() for proposal in self.proposals],
             "next_run_at": self.next_run_at,
+            "attempt_count": self.attempt_count,
+            "notification_status": self.notification_status,
+            "deterministic_maintenance": self.deterministic_maintenance,
         }
 
 
@@ -248,6 +262,7 @@ class ConsolidationScheduler:
         *,
         now: str,
         conversation_state: str,
+        notifier: LocalNotifier | None = None,
     ) -> ScheduledConsolidationRun:
         self._ensure_initialized()
         normalized_schedule_id = _required_text("schedule id", schedule_id)
@@ -265,18 +280,71 @@ class ConsolidationScheduler:
                 raise UserInputError(
                     f"scheduled consolidation is not due: {normalized_schedule_id}"
                 )
-        external_audit: dict[str, object] | None = None
-        if schedule.mode == "cloud":
-            proposals, external_audit = self._run_cloud_analysis(schedule)
-        else:
-            proposals = LocalMemoryCore(self._root).propose_manual_consolidation(
-                schedule.task
+            run_id = "run_" + hashlib.sha256(
+                f"{schedule.schedule_id}:{schedule.next_run_at}".encode("utf-8")
+            ).hexdigest()
+            runs = _state_mapping(state, "runs")
+            previous = runs.get(run_id)
+            previous_attempts = 0
+            if previous is not None:
+                if not isinstance(previous, dict):
+                    raise IntegrityError("scheduled consolidation run is invalid")
+                if previous.get("status") == "running":
+                    raise UserInputError(
+                        f"scheduled consolidation is already running: {run_id}"
+                    )
+                raw_attempts = previous.get("attempt_count")
+                if not isinstance(raw_attempts, int) or isinstance(raw_attempts, bool):
+                    raise IntegrityError("scheduled consolidation attempt count is invalid")
+                previous_attempts = raw_attempts
+            attempt_count = previous_attempts + 1
+            started_at = datetime.now(timezone.utc).isoformat()
+            runs[run_id] = {
+                "run_id": run_id,
+                "schedule_id": schedule.schedule_id,
+                "due_at": schedule.next_run_at,
+                "mode": schedule.mode,
+                "status": "running",
+                "attempt_count": attempt_count,
+                "started_at": started_at,
+            }
+            state["runs"] = runs
+            atomic_commit(
+                self._root,
+                [
+                    (state_path, json_document(state)),
+                    event_journal_change(
+                        self._root,
+                        {
+                            "id": f"evt_{uuid.uuid4().hex}",
+                            "type": "consolidation.schedule-started",
+                            "occurred_at": started_at,
+                            "run_id": run_id,
+                            "schedule_id": schedule.schedule_id,
+                            "attempt_count": attempt_count,
+                        },
+                    ),
+                ],
             )
+        external_audit: dict[str, object] | None = None
+        try:
+            if schedule.mode == "cloud":
+                proposals, external_audit = self._run_cloud_analysis(schedule)
+            else:
+                proposals = LocalMemoryCore(self._root).propose_manual_consolidation(
+                    schedule.task
+                )
+        except (IntegrityError, ProviderFailure, UserInputError) as error:
+            self._record_retryable_run(
+                run_id=run_id,
+                schedule=schedule,
+                attempt_count=attempt_count,
+                error=str(error),
+            )
+            raise
         due_at = datetime.fromisoformat(schedule.next_run_at)
+        deterministic_maintenance = _run_deterministic_maintenance(self._root)
         next_run_at = (due_at + timedelta(hours=schedule.every_hours)).isoformat()
-        run_id = "run_" + hashlib.sha256(
-            f"{schedule.schedule_id}:{schedule.next_run_at}".encode("utf-8")
-        ).hexdigest()
         delivery: Literal["active-conversation", "pending-review-queue"] = (
             "active-conversation"
             if conversation_state == "active"
@@ -290,6 +358,11 @@ class ConsolidationScheduler:
             delivery=delivery,
             proposals=proposals,
             next_run_at=next_run_at,
+            attempt_count=attempt_count,
+            notification_status=(
+                "not-required" if conversation_state == "active" else "pending"
+            ),
+            deterministic_maintenance=deterministic_maintenance,
         )
         updated_schedule = replace(schedule, next_run_at=next_run_at)
         with writer_lock(self._root):
@@ -299,6 +372,20 @@ class ConsolidationScheduler:
             schedules[schedule.schedule_id] = updated_schedule.to_data()
             runs = _state_mapping(state, "runs")
             runs[run.run_id] = run.to_data()
+            if conversation_state == "inactive":
+                pending_reviews = _state_list(state, "pending_reviews")
+                pending_reviews.append(
+                    {
+                        "run_id": run.run_id,
+                        "schedule_id": run.schedule_id,
+                        "proposal_ids": [
+                            proposal.proposal_id for proposal in proposals
+                        ],
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "notification_status": "pending",
+                    }
+                )
+                state["pending_reviews"] = pending_reviews
             state["schedules"] = schedules
             state["runs"] = runs
             atomic_commit(
@@ -307,6 +394,13 @@ class ConsolidationScheduler:
                     (state_path, json_document(state)),
                     event_journal_change(
                         self._root,
+                        {
+                            "id": f"evt_{uuid.uuid4().hex}",
+                            "type": "consolidation.deterministic-maintenance",
+                            "occurred_at": datetime.now(timezone.utc).isoformat(),
+                            "run_id": run.run_id,
+                            **deterministic_maintenance,
+                        },
                         {
                             "id": f"evt_{uuid.uuid4().hex}",
                             "type": "consolidation.schedule-completed",
@@ -322,7 +416,129 @@ class ConsolidationScheduler:
                     ),
                 ],
             )
+        if conversation_state == "inactive":
+            notification_status = self._deliver_pending_review_notification(
+                run,
+                notifier=notifier,
+            )
+            run = replace(run, notification_status=notification_status)
         return run
+
+    def pending_reviews(self) -> tuple[dict[str, object], ...]:
+        self._ensure_initialized()
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            state = _load_state(self._root / SCHEDULED_CONSOLIDATION_STATE)
+            return tuple(_state_list(state, "pending_reviews"))
+
+    def _deliver_pending_review_notification(
+        self,
+        run: ScheduledConsolidationRun,
+        *,
+        notifier: LocalNotifier | None,
+    ) -> Literal["delivered", "failed"]:
+        proposal_ids = tuple(proposal.proposal_id for proposal in run.proposals)
+        notification = LocalNotification(
+            title="Memory review is ready",
+            body=(
+                "Review proposals: " + ", ".join(proposal_ids)
+                if proposal_ids
+                else "Scheduled consolidation completed with no proposals."
+            ),
+            action=f"myoutbrain://pending-review/{run.run_id}",
+        )
+        error_message: str | None = None
+        try:
+            (notifier or create_local_notifier()).notify(notification)
+            status: Literal["delivered", "failed"] = "delivered"
+        except NotificationFailure as error:
+            status = "failed"
+            error_message = str(error)
+        state_path = self._root / SCHEDULED_CONSOLIDATION_STATE
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            state = _load_state(state_path)
+            runs = _state_mapping(state, "runs")
+            raw_run = runs.get(run.run_id)
+            if not isinstance(raw_run, dict):
+                raise IntegrityError("completed scheduled consolidation run is missing")
+            raw_run["notification_status"] = status
+            runs[run.run_id] = raw_run
+            pending_reviews = _state_list(state, "pending_reviews")
+            matched = False
+            for pending_review in pending_reviews:
+                if pending_review.get("run_id") == run.run_id:
+                    pending_review["notification_status"] = status
+                    if error_message is not None:
+                        pending_review["notification_error"] = error_message
+                    matched = True
+            if not matched:
+                raise IntegrityError("pending consolidation review is missing")
+            state["runs"] = runs
+            state["pending_reviews"] = pending_reviews
+            atomic_commit(
+                self._root,
+                [
+                    (state_path, json_document(state)),
+                    event_journal_change(
+                        self._root,
+                        {
+                            "id": f"evt_{uuid.uuid4().hex}",
+                            "type": f"consolidation.notification-{status}",
+                            "occurred_at": occurred_at,
+                            "run_id": run.run_id,
+                            "proposal_ids": list(proposal_ids),
+                            "error": error_message,
+                        },
+                    ),
+                ],
+            )
+        return status
+
+    def _record_retryable_run(
+        self,
+        *,
+        run_id: str,
+        schedule: ConsolidationSchedule,
+        attempt_count: int,
+        error: str,
+    ) -> None:
+        state_path = self._root / SCHEDULED_CONSOLIDATION_STATE
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            state = _load_state(state_path)
+            runs = _state_mapping(state, "runs")
+            runs[run_id] = {
+                "run_id": run_id,
+                "schedule_id": schedule.schedule_id,
+                "due_at": schedule.next_run_at,
+                "mode": schedule.mode,
+                "status": "retryable",
+                "attempt_count": attempt_count,
+                "last_error": error,
+                "updated_at": occurred_at,
+            }
+            state["runs"] = runs
+            atomic_commit(
+                self._root,
+                [
+                    (state_path, json_document(state)),
+                    event_journal_change(
+                        self._root,
+                        {
+                            "id": f"evt_{uuid.uuid4().hex}",
+                            "type": "consolidation.schedule-retryable",
+                            "occurred_at": occurred_at,
+                            "run_id": run_id,
+                            "schedule_id": schedule.schedule_id,
+                            "attempt_count": attempt_count,
+                            "error": error,
+                        },
+                    ),
+                ],
+            )
 
     def _run_cloud_analysis(
         self,
@@ -557,6 +773,16 @@ def _state_mapping(state: dict[str, object], key: str) -> dict[str, object]:
     return {str(item_key): value for item_key, value in raw.items()}
 
 
+def _state_list(state: dict[str, object], key: str) -> list[dict[str, object]]:
+    raw = state.get(key, [])
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise IntegrityError(f"scheduled consolidation {key} state is invalid")
+    return [
+        {str(item_key): value for item_key, value in item.items()}
+        for item in raw
+    ]
+
+
 def _schedule_from_state(
     state: dict[str, object], schedule_id: str
 ) -> ConsolidationSchedule:
@@ -576,3 +802,24 @@ def _schedule_from_state(
         )
     except (KeyError, TypeError) as error:
         raise IntegrityError(f"invalid consolidation schedule: {schedule_id}") from error
+
+
+def _run_deterministic_maintenance(root: Path) -> dict[str, object]:
+    memories = LocalMemoryCore(root).recallable_memories()
+    if not memories:
+        index_status = "current-empty"
+    else:
+        try:
+            SemanticRecallIndex(root).scores(
+                "deterministic index maintenance",
+                memories,
+                LocalMultilingualEmbeddingProvider(),
+            )
+            index_status = "rebuilt"
+        except (EmbeddingFailure, OSError, RuntimeError, TypeError, ValueError):
+            index_status = "deferred"
+    return {
+        "semantic_change": False,
+        "content_deduplication": "content-addressed-on-write",
+        "index_status": index_status,
+    }
