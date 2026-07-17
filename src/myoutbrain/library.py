@@ -383,6 +383,17 @@ def _generation_configuration(
     return provider, model
 
 
+def configured_generation_provider(root: Path) -> GenerationProvider:
+    """Create the instance generation adapter through the shared config boundary."""
+    configuration_path = root / "myoutbrain.toml"
+    configuration = _load_validated_configuration(configuration_path)
+    provider_name, model = _generation_configuration(
+        configuration,
+        configuration_path,
+    )
+    return create_generation_provider(provider_name, model)
+
+
 def _candidate_ttl_days(configuration: dict[str, object], path: Path) -> int:
     reflection = configuration.get("reflection")
     if reflection is None:

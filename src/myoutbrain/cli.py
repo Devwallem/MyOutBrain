@@ -357,6 +357,11 @@ def _answer(
     for claim in result.claims:
         print(claim.text)
         print(f"Evidence ({claim.origin}): {', '.join(claim.source_ids)}")
+    for source in result.public_sources:
+        print(
+            f"Public source: {source.title} — {source.url} "
+            f"(published {source.published_at}; retrieved {source.retrieved_at})"
+        )
     if result.companion_inference is not None:
         print(f"Inference: {result.companion_inference}")
     return 0

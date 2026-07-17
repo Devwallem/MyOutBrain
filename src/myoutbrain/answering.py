@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import tempfile
-import tomllib
 from typing import Literal
 
-from myoutbrain.core_types import ConfigurationConflict, Sensitivity, UserInputError
+from myoutbrain.core_types import Sensitivity, UserInputError
 from myoutbrain.generation import (
     Citation,
     CloudAuthorization,
@@ -20,17 +19,20 @@ from myoutbrain.generation import (
     GeneratedAnswer,
     GeneratedClaim,
     ProviderFailure,
-    create_generation_provider,
 )
+from myoutbrain.library import configured_generation_provider
 from myoutbrain.local_core import LocalMemoryCore
 from myoutbrain.memory_gateway import (
     MemoryAccess,
+    MemoryEvidence,
     MemoryGateway,
     QueryPurpose,
     RecallRequest,
 )
 from myoutbrain.public_search import (
+    PublicQueryUnavailable,
     PublicSource,
+    public_sources_conflict,
     sanitized_public_query,
     search_public_sources,
 )
@@ -63,12 +65,14 @@ class TraceableClaim:
     text: str
     source_ids: tuple[str, ...]
     origin: AnswerOrigin
+    evidence_origins: tuple[Literal["common-knowledge", "public-evidence"], ...]
 
     def to_data(self) -> dict[str, object]:
         return {
             "text": self.text,
             "source_ids": list(self.source_ids),
             "origin": self.origin,
+            "evidence_origins": list(self.evidence_origins),
         }
 
 
@@ -140,13 +144,16 @@ class CompanionAnswerService:
         internal_sensitivity = {
             item.memory_id: item.sensitivity for item in package.items
         }
+        time_sensitive = request.time_sensitive or _is_time_sensitive(question)
+        requires_public_verification = (
+            request.high_risk
+            or time_sensitive
+            or _is_high_risk(question)
+            or bool(package.unresolved_conflicts)
+            or _contains_stale_internal_evidence(package.items)
+        )
         verified_facts: tuple[str, ...] = ()
-        if (
-            evidence
-            and not package.unresolved_conflicts
-            and not request.high_risk
-            and not request.time_sensitive
-        ):
+        if evidence and not requires_public_verification:
             provider = self._generation_provider(request)
             eligible_internal = _eligible_internal_evidence(
                 provider,
@@ -174,10 +181,13 @@ class CompanionAnswerService:
                     )
                 verified_facts = tuple(claim.text for claim in generated.claims)
 
-        public_query = sanitized_public_query(question)
+        try:
+            public_query = sanitized_public_query(question)
+        except PublicQueryUnavailable:
+            return _unknown_answer(question, verified_facts=verified_facts)
         public_sources = search_public_sources(
             public_query,
-            time_sensitive=request.time_sensitive,
+            time_sensitive=time_sensitive,
         )
         public_evidence = tuple(
             EvidenceItem(
@@ -196,15 +206,26 @@ class CompanionAnswerService:
                 public_query=public_query,
                 public_sources=public_sources,
             )
+        if public_sources_conflict(public_sources):
+            return _unknown_answer(
+                question,
+                verified_facts=verified_facts,
+                public_query=public_query,
+                public_sources=public_sources,
+            )
         provider = self._generation_provider(request)
         eligible_internal = _eligible_internal_evidence(
             provider,
             evidence,
             tuple(item.sensitivity for item in package.items),
         )
-        combined_evidence = eligible_internal + public_evidence
+        combined_evidence = (
+            public_evidence
+            if package.unresolved_conflicts
+            else eligible_internal + public_evidence
+        )
         generated = _generate(provider, request, question, combined_evidence)
-        if generated.insufficient_evidence or package.unresolved_conflicts:
+        if generated.insufficient_evidence:
             return _unknown_answer(
                 question,
                 verified_facts=verified_facts
@@ -225,29 +246,15 @@ class CompanionAnswerService:
         )
 
     def _generation_provider(self, request: AnswerRequest) -> GenerationProvider:
-        configuration_path = self._root / "myoutbrain.toml"
-        try:
-            with configuration_path.open("rb") as configuration_file:
-                configuration = tomllib.load(configuration_file)
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            raise ConfigurationConflict(
-                f"invalid configuration: {configuration_path}"
-            ) from error
-        generation = configuration.get("generation")
-        if not isinstance(generation, dict):
-            raise ConfigurationConflict("generation configuration is missing")
-        provider_name = generation.get("provider")
-        model = generation.get("model")
-        if not isinstance(provider_name, str) or not isinstance(model, str):
-            raise ConfigurationConflict("generation configuration is invalid")
-        if provider_name == "openai" and (
+        provider = configured_generation_provider(self._root)
+        if provider.name == "openai" and (
             not request.allow_cloud or request.query_sensitivity != "cloud-allowed"
         ):
             raise UserInputError(
                 "cloud answer generation requires explicit authorization and a "
                 "cloud-allowed query"
             )
-        return create_generation_provider(provider_name, model)
+        return provider
 
     def _answered(
         self,
@@ -397,10 +404,13 @@ def _traceable_claims(
         TraceableClaim(
             text=claim.text,
             source_ids=(claim.citation.source_id,),
-            origin=(
-                "public-evidence"
-                if claim.citation.source_id in public_source_ids
-                else "common-knowledge"
+            origin="companion-inference",
+            evidence_origins=(
+                (
+                    "public-evidence"
+                    if claim.citation.source_id in public_source_ids
+                    else "common-knowledge"
+                ),
             ),
         )
         for claim in claims
@@ -419,3 +429,62 @@ def _eligible_internal_evidence(
         for item, sensitivity in zip(evidence, sensitivities, strict=True)
         if sensitivity == "cloud-allowed"
     )
+
+
+def _is_time_sensitive(question: str) -> bool:
+    folded = question.casefold()
+    return any(
+        marker in folded
+        for marker in (
+            "current",
+            "latest",
+            "today",
+            "now",
+            "price",
+            "schedule",
+            "release date",
+            "目前",
+            "最新",
+            "今天",
+            "价格",
+            "时间表",
+        )
+    )
+
+
+def _is_high_risk(question: str) -> bool:
+    folded = question.casefold()
+    return any(
+        marker in folded
+        for marker in (
+            "medical",
+            "diagnosis",
+            "legal",
+            "tax",
+            "investment",
+            "financial",
+            "safety",
+            "健康",
+            "诊断",
+            "法律",
+            "税务",
+            "投资",
+            "安全",
+        )
+    )
+
+
+def _contains_stale_internal_evidence(
+    items: tuple[MemoryEvidence, ...],
+) -> bool:
+    now = datetime.now(timezone.utc)
+    for item in items:
+        try:
+            occurred_at = datetime.fromisoformat(item.occurred_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            return True
+        if now - occurred_at > timedelta(days=365):
+            return True
+    return False

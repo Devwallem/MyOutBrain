@@ -3,11 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.cli_support import run_cli
 from tests.test_cli_ask import configure_fake_generation
+from tests.test_cli_memory_evolution import accept_new, propose, remember_evidence
 
 
 class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
@@ -92,7 +95,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                     {
                         "text": "Project Atlas is reviewed every Friday.",
                         "source_ids": [memory_id],
-                        "origin": "common-knowledge",
+                        "origin": "companion-inference",
+                        "evidence_origins": ["common-knowledge"],
                     }
                 ],
             )
@@ -143,6 +147,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "published_at": "2026-07-16T09:00:00+00:00",
                             "retrieved_at": "2026-07-17T09:00:00+00:00",
                             "source_type": "official",
+                            "fact_key": "nova-2-release-date",
+                            "fact_value": "2026-08-01",
                         }
                     ]
                 }
@@ -188,7 +194,11 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(result["answerability"], "sufficient")
             self.assertTrue(result["public_search_performed"])
             self.assertEqual(result["public_query"], public_query)
-            self.assertEqual(result["claims"][0]["origin"], "public-evidence")
+            self.assertEqual(result["claims"][0]["origin"], "companion-inference")
+            self.assertEqual(
+                result["claims"][0]["evidence_origins"],
+                ["public-evidence"],
+            )
             self.assertEqual(result["claims"][0]["source_ids"], [web_source_id])
             self.assertEqual(
                 result["public_sources"],
@@ -200,6 +210,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                         "published_at": "2026-07-16T09:00:00+00:00",
                         "retrieved_at": "2026-07-17T09:00:00+00:00",
                         "source_type": "official",
+                        "fact_key": "nova-2-release-date",
+                        "fact_value": "2026-08-01",
                     }
                 ],
             )
@@ -229,6 +241,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "published_at": "2025-01-01T09:00:00+00:00",
                             "retrieved_at": "2026-07-17T09:00:00+00:00",
                             "source_type": "reference",
+                            "fact_key": "project-start-year",
+                            "fact_value": "2019",
                         }
                     ]
                 }
@@ -355,6 +369,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "published_at": "2025-01-01T09:00:00+00:00",
                             "retrieved_at": "2026-07-17T09:00:00+00:00",
                             "source_type": "official",
+                            "fact_key": "launch-date",
+                            "fact_value": "may",
                         }
                     ]
                 }
@@ -367,7 +383,6 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 str(instance_root),
                 "--task",
                 "launch-check",
-                "--time-sensitive",
                 "--format",
                 "json",
                 environment={
@@ -387,6 +402,266 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(result["status"], "unknown")
             self.assertEqual(result["public_sources"], [])
             self.assertIsNone(result["memory_update_id"])
+
+    def test_public_research_fails_closed_without_a_trusted_sanitizer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            configure_fake_generation(instance_root)
+            search_request = temporary_root / "public-search-request.json"
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("MYOUTBRAIN_FAKE_SANITIZED_QUERY", None)
+                answered = run_cli(
+                    "answer",
+                    "Li Wei's unreleased Project Cinder price is $499. Is it current?",
+                    "--root",
+                    str(instance_root),
+                    "--task",
+                    "private-pricing",
+                    "--format",
+                    "json",
+                    environment={
+                        "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_REQUEST_FILE": str(
+                            search_request
+                        )
+                    },
+                )
+
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            result = json.loads(answered.stdout)
+            self.assertEqual(result["status"], "unknown")
+            self.assertFalse(result["public_search_performed"])
+            self.assertIsNone(result["public_query"])
+            self.assertFalse(search_request.exists())
+
+    def test_conflicting_public_sources_cannot_pass_the_second_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            configure_fake_generation(instance_root)
+            first_url = "https://official.example/nova/schedule"
+            second_url = "https://primary.example/nova/calendar"
+            first_id = f"web_{hashlib.sha256(first_url.encode()).hexdigest()}"
+            search_response = json.dumps(
+                {
+                    "results": [
+                        {
+                            "url": first_url,
+                            "title": "Nova schedule",
+                            "content": "Nova launches on August 1.",
+                            "published_at": "2026-07-16T09:00:00+00:00",
+                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "source_type": "official",
+                            "fact_key": "nova-launch-date",
+                            "fact_value": "2026-08-01",
+                        },
+                        {
+                            "url": second_url,
+                            "title": "Nova calendar",
+                            "content": "Nova launches on August 8.",
+                            "published_at": "2026-07-16T10:00:00+00:00",
+                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "source_type": "primary",
+                            "fact_key": "nova-launch-date",
+                            "fact_value": "2026-08-08",
+                        },
+                    ]
+                }
+            )
+            answered = run_cli(
+                "answer",
+                "What is the current Nova launch date?",
+                "--root",
+                str(instance_root),
+                "--task",
+                "nova-launch",
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": "current Nova launch date",
+                    "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": search_response,
+                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "text": "Nova launches on August 1.",
+                                    "source_id": first_id,
+                                    "locator": first_url,
+                                }
+                            ],
+                            "insufficient_evidence": False,
+                        }
+                    ),
+                },
+            )
+
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            result = json.loads(answered.stdout)
+            self.assertEqual(result["status"], "unknown")
+            self.assertTrue(result["public_search_performed"])
+            self.assertEqual(len(result["public_sources"]), 2)
+            self.assertIsNone(result["memory_update_id"])
+
+    def test_authoritative_public_evidence_can_resolve_an_internal_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            configure_fake_generation(instance_root)
+            remember_evidence(
+                temporary_root,
+                instance_root,
+                name="weekly-evidence",
+                digest="Project Atlas review cadence is weekly.",
+                task="weekly-view",
+                sensitivity="cloud-allowed",
+            )
+            weekly_id = accept_new(
+                instance_root,
+                propose(instance_root, "weekly-view")["proposal_id"],
+            )
+            remember_evidence(
+                temporary_root,
+                instance_root,
+                name="daily-evidence",
+                digest="Project Atlas review cadence is daily.",
+                task="daily-view",
+            )
+            conflict_proposal = propose(instance_root, "daily-view")
+            preserved = run_cli(
+                "review-memory",
+                str(conflict_proposal["proposal_id"]),
+                (
+                    f"preserve conflict with {weekly_id} because: "
+                    "the available evidence disagrees"
+                ),
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(preserved.returncode, 0, preserved.stderr)
+            url = "https://official.example/atlas/reviews"
+            web_source_id = f"web_{hashlib.sha256(url.encode()).hexdigest()}"
+
+            answered = run_cli(
+                "answer",
+                "What is Project Atlas review cadence?",
+                "--root",
+                str(instance_root),
+                "--task",
+                "cadence-answer",
+                "--access",
+                "local-trusted",
+                "--memory-id",
+                weekly_id,
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": (
+                        "official Project Atlas review cadence"
+                    ),
+                    "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "url": url,
+                                    "title": "Official Atlas review policy",
+                                    "content": "Project Atlas is reviewed weekly.",
+                                    "published_at": "2026-07-01T09:00:00+00:00",
+                                    "retrieved_at": "2026-07-17T09:00:00+00:00",
+                                    "source_type": "official",
+                                    "fact_key": "atlas-review-cadence",
+                                    "fact_value": "weekly",
+                                }
+                            ]
+                        }
+                    ),
+                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "text": "Project Atlas is reviewed weekly.",
+                                    "source_id": web_source_id,
+                                    "locator": url,
+                                }
+                            ],
+                            "insufficient_evidence": False,
+                        }
+                    ),
+                },
+            )
+
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            result = json.loads(answered.stdout)
+            self.assertEqual(result["status"], "answered")
+            self.assertEqual(result["claims"][0]["source_ids"], [web_source_id])
+            self.assertEqual(
+                result["claims"][0]["evidence_origins"],
+                ["public-evidence"],
+            )
+
+    def test_text_answer_names_public_source_and_evidence_times(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            configure_fake_generation(instance_root)
+            url = "https://official.example/nova/release"
+            web_source_id = f"web_{hashlib.sha256(url.encode()).hexdigest()}"
+            answered = run_cli(
+                "answer",
+                "What is the current Nova release date?",
+                "--root",
+                str(instance_root),
+                "--task",
+                "nova-release",
+                "--format",
+                "text",
+                environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": "current Nova release date",
+                    "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "url": url,
+                                    "title": "Official Nova release",
+                                    "content": "Nova releases on August 1.",
+                                    "published_at": "2026-07-16T09:00:00+00:00",
+                                    "retrieved_at": "2026-07-17T09:00:00+00:00",
+                                    "source_type": "official",
+                                    "fact_key": "nova-release-date",
+                                    "fact_value": "2026-08-01",
+                                }
+                            ]
+                        }
+                    ),
+                    "MYOUTBRAIN_FAKE_RESPONSE": json.dumps(
+                        {
+                            "claims": [
+                                {
+                                    "text": "Nova releases on August 1.",
+                                    "source_id": web_source_id,
+                                    "locator": url,
+                                }
+                            ],
+                            "insufficient_evidence": False,
+                        }
+                    ),
+                },
+            )
+
+            self.assertEqual(answered.returncode, 0, answered.stderr)
+            self.assertIn("Official Nova release", answered.stdout)
+            self.assertIn(url, answered.stdout)
+            self.assertIn("published 2026-07-16T09:00:00+00:00", answered.stdout)
+            self.assertIn("retrieved 2026-07-17T09:00:00+00:00", answered.stdout)
 
     def test_answer_update_inherits_the_strongest_cited_sensitivity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -496,6 +771,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "published_at": "2026-07-17T08:00:00+00:00",
                             "retrieved_at": "2026-07-17T09:00:00+00:00",
                             "source_type": "blog",
+                            "fact_key": "launch-date",
+                            "fact_value": "tomorrow",
                         }
                     ]
                 }
