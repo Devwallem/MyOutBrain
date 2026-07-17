@@ -205,6 +205,16 @@ def build_parser() -> argparse.ArgumentParser:
     forget_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    delete_memory_parser = subcommands.add_parser(
+        "delete-memory",
+        help="Preview or explicitly confirm permanent deletion of one memory",
+    )
+    delete_memory_parser.add_argument("memory_id")
+    delete_memory_parser.add_argument("--confirm")
+    delete_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    delete_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     migrate_parser = subcommands.add_parser(
         "migrate-v1",
         help="Migrate validated V1 permanent knowledge into canonical memory",
@@ -802,6 +812,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     f"Canonical memory {state_change.memory_id}: "
                     f"{state_change.action}."
                 )
+            return 0
+        if parsed_arguments.command == "delete-memory":
+            deletion = MemoryGovernanceService(
+                parsed_arguments.root
+            ).delete(
+                parsed_arguments.memory_id,
+                confirmation=parsed_arguments.confirm,
+            )
+            if parsed_arguments.format == "json":
+                print(
+                    json.dumps(
+                        deletion.to_data(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"Permanent deletion preview for {deletion.memory_id}:")
+                print(f"Sources: {', '.join(deletion.source_ids) or 'none'}")
+                print(
+                    "Shared sources retained: "
+                    + (", ".join(deletion.shared_source_ids) or "none")
+                )
+                print(f"Confirm with --confirm {deletion.confirmation_token}")
             return 0
         if parsed_arguments.command == "migrate-v1":
             return _render_migration_summary(

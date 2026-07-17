@@ -489,6 +489,50 @@ class CanonicalMemoryStateChange:
 
 
 @dataclass(frozen=True)
+class MemoryDeletionImpact:
+    memory_id: str
+    source_ids: tuple[str, ...]
+    shared_source_ids: tuple[str, ...]
+    derived_digest_ids: tuple[str, ...]
+    related_memory_ids: tuple[str, ...]
+    conflict_memory_ids: tuple[str, ...]
+    pending_proposal_ids: tuple[str, ...]
+
+    @property
+    def confirmation_token(self) -> str:
+        scope = json.dumps(
+            {
+                "memory_id": self.memory_id,
+                "source_ids": self.source_ids,
+                "shared_source_ids": self.shared_source_ids,
+                "derived_digest_ids": self.derived_digest_ids,
+                "related_memory_ids": self.related_memory_ids,
+                "conflict_memory_ids": self.conflict_memory_ids,
+                "pending_proposal_ids": self.pending_proposal_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"delete_{hashlib.sha256(scope).hexdigest()}"
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "disposition": "preview",
+            "scope": "one-canonical-memory",
+            "memory_id": self.memory_id,
+            "canonical_memory_count": 1,
+            "source_ids": list(self.source_ids),
+            "shared_source_ids": list(self.shared_source_ids),
+            "derived_digest_ids": list(self.derived_digest_ids),
+            "related_memory_ids": list(self.related_memory_ids),
+            "conflict_memory_ids": list(self.conflict_memory_ids),
+            "pending_proposal_ids": list(self.pending_proposal_ids),
+            "confirmation_token": self.confirmation_token,
+            "requires_confirmation": True,
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
     state: Literal["active", "inactive"]
@@ -1166,6 +1210,137 @@ class LocalMemoryCore:
             action=action,
             occurred_at=occurred_at,
             reason=normalized_reason,
+        )
+
+    def preview_permanent_deletion(self, memory_id: str) -> MemoryDeletionImpact:
+        normalized_memory_id = _required_text("canonical memory id", memory_id)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    if connection.execute(
+                        "SELECT 1 FROM canonical_memories WHERE memory_id = ?",
+                        (normalized_memory_id,),
+                    ).fetchone() is None:
+                        raise UserInputError(
+                            "canonical memory does not exist: "
+                            f"{normalized_memory_id}"
+                        )
+                    source_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT source_id FROM canonical_memory_sources
+                            WHERE memory_id = ? ORDER BY source_id
+                            """,
+                            (normalized_memory_id,),
+                        ).fetchall()
+                    )
+                    shared_source_ids = tuple(
+                        source_id
+                        for source_id in source_ids
+                        if connection.execute(
+                            """
+                            SELECT 1 FROM canonical_memory_sources
+                            WHERE source_id = ? AND memory_id <> ? LIMIT 1
+                            """,
+                            (source_id, normalized_memory_id),
+                        ).fetchone()
+                        is not None
+                    )
+                    derived_digest_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT DISTINCT digest.digest_id
+                            FROM buffered_digests AS digest
+                            JOIN experiences AS experience
+                              ON experience.experience_id = digest.experience_id
+                            JOIN canonical_memory_sources AS source
+                              ON source.source_id = experience.source_id
+                            WHERE source.memory_id = ?
+                            ORDER BY digest.digest_id
+                            """,
+                            (normalized_memory_id,),
+                        ).fetchall()
+                    )
+                    related_memory_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT CASE WHEN memory_id = ? THEN related_memory_id
+                                        ELSE memory_id END
+                            FROM canonical_memory_relations
+                            WHERE memory_id = ? OR related_memory_id = ?
+                            ORDER BY 1
+                            """,
+                            (
+                                normalized_memory_id,
+                                normalized_memory_id,
+                                normalized_memory_id,
+                            ),
+                        ).fetchall()
+                    )
+                    conflict_memory_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT CASE WHEN first_memory_id = ? THEN second_memory_id
+                                        ELSE first_memory_id END
+                            FROM canonical_memory_conflicts
+                            WHERE first_memory_id = ? OR second_memory_id = ?
+                            ORDER BY 1
+                            """,
+                            (
+                                normalized_memory_id,
+                                normalized_memory_id,
+                                normalized_memory_id,
+                            ),
+                        ).fetchall()
+                    )
+                    pending_proposal_ids = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT DISTINCT proposal.proposal_id
+                            FROM integration_proposals AS proposal
+                            LEFT JOIN integration_proposal_related AS related
+                              ON related.proposal_id = proposal.proposal_id
+                            LEFT JOIN integration_proposal_sources AS source
+                              ON source.proposal_id = proposal.proposal_id
+                            WHERE proposal.status = 'pending'
+                              AND (proposal.target_memory_id = ?
+                                   OR related.memory_id = ?
+                                   OR source.source_id IN (
+                                       SELECT source_id
+                                       FROM canonical_memory_sources
+                                       WHERE memory_id = ?
+                                   ))
+                            ORDER BY proposal.proposal_id
+                            """,
+                            (
+                                normalized_memory_id,
+                                normalized_memory_id,
+                                normalized_memory_id,
+                            ),
+                        ).fetchall()
+                    )
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot preview permanent deletion") from error
+        return MemoryDeletionImpact(
+            memory_id=normalized_memory_id,
+            source_ids=source_ids,
+            shared_source_ids=shared_source_ids,
+            derived_digest_ids=derived_digest_ids,
+            related_memory_ids=related_memory_ids,
+            conflict_memory_ids=conflict_memory_ids,
+            pending_proposal_ids=pending_proposal_ids,
         )
 
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:

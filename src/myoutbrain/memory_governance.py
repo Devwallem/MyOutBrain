@@ -3,7 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from myoutbrain.core_types import UserInputError
-from myoutbrain.local_core import CanonicalMemoryStateChange, LocalMemoryCore
+from myoutbrain.local_core import (
+    CanonicalMemoryStateChange,
+    LocalMemoryCore,
+    MemoryDeletionImpact,
+)
 
 
 class MemoryGovernanceService:
@@ -44,4 +48,21 @@ class MemoryGovernanceService:
             )
         raise UserInputError(
             "memory lifecycle instruction must clearly say forget/deactivate or restore"
+        )
+
+    def delete(
+        self,
+        memory_id: str,
+        *,
+        confirmation: str | None,
+    ) -> MemoryDeletionImpact:
+        impact = self._core.preview_permanent_deletion(memory_id)
+        if confirmation is None:
+            return impact
+        if confirmation != impact.confirmation_token:
+            raise UserInputError(
+                "permanent deletion confirmation does not match the current impact"
+            )
+        raise UserInputError(
+            "permanent deletion execution is not available until cascade validation"
         )
