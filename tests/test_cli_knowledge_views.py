@@ -12,6 +12,45 @@ from tests.test_cli_promote import create_derived_insight
 
 
 class ObsidianKnowledgeViewTests(unittest.TestCase):
+    def test_rebuild_finishes_durable_cleanup_left_by_an_interruption(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            instance_root = Path(temporary_directory) / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            stale_path = instance_root / "vault" / "Knowledge Views" / "Stale.md"
+            stale_path.write_text("obsolete projection", encoding="utf-8")
+            manifest_path = (
+                instance_root / "runtime" / "knowledge-views" / "manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["cleanup_paths"] = [
+                "vault/Knowledge Views/Stale.md"
+            ]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            recovered = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertFalse(stale_path.exists())
+            recovered_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(recovered_manifest["cleanup_paths"], [])
+
     def test_manifest_path_cannot_escape_the_disposable_view_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

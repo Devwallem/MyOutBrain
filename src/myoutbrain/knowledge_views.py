@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
 
 from myoutbrain.local_core import CanonicalMemoryAudit, LocalMemoryCore
@@ -100,18 +101,25 @@ class KnowledgeViewService:
                 )
             index_content = _render_index(audits, relative_paths).encode("utf-8")
             changes.append((self._root / VIEW_INDEX, index_content))
-            manifest = json.dumps(
-                {"schema_version": 1, "views": manifest_views},
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8") + b"\n"
-            changes.append((self._root / VIEW_MANIFEST, manifest))
             previous_paths = _previous_view_paths(self._root)
-            atomic_commit(self._root, changes)
             current_paths = {path for path in relative_paths.values()}
-            for relative_path in previous_paths - current_paths:
+            cleanup_paths = tuple(sorted(previous_paths - current_paths))
+            manifest = _manifest_bytes(manifest_views, cleanup_paths)
+            changes.append((self._root / VIEW_MANIFEST, manifest))
+            atomic_commit(self._root, changes)
+            if (
+                cleanup_paths
+                and os.environ.get("MYOUTBRAIN_FAULT_INJECTION")
+                == "knowledge-view-after-manifest"
+            ):
+                os._exit(86)
+            for relative_path in cleanup_paths:
                 _resolved_view_path(self._root, relative_path).unlink(missing_ok=True)
+            if cleanup_paths:
+                atomic_commit(
+                    self._root,
+                    [(self._root / VIEW_MANIFEST, _manifest_bytes(manifest_views, ()))],
+                )
         warning = None
         if open_index:
             warning = create_obsidian_adapter().open_note(
@@ -297,20 +305,15 @@ def _previous_view_paths(root: Path) -> set[Path]:
     manifest_path = root / VIEW_MANIFEST
     if not manifest_path.is_file():
         return set()
-    try:
-        document = json.loads(manifest_path.read_text(encoding="utf-8"))
-        views = document["views"]
-        if not isinstance(views, list):
-            return set()
-        return {
-            Path(path)
-            for item in views
-            if isinstance(item, dict)
-            and isinstance(path := item.get("path"), str)
-            and Path(path).is_relative_to(VIEW_ROOT)
-        }
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
-        return set()
+    document = _load_manifest(root)
+    views = document.get("views")
+    if not isinstance(views, list):
+        raise IntegrityError("knowledge view manifest has invalid views")
+    view_paths = {_manifest_view(item)[1] for item in views}
+    cleanup_paths = _manifest_cleanup_paths(document)
+    for relative_path in view_paths | cleanup_paths:
+        _resolved_view_path(root, relative_path)
+    return view_paths | cleanup_paths
 
 
 def _load_manifest(root: Path) -> dict[str, object]:
@@ -343,6 +346,35 @@ def _manifest_view(item: object) -> tuple[str, Path, str]:
     ):
         raise IntegrityError("knowledge view manifest entry is invalid")
     return memory_id, relative_path, content_hash
+
+
+def _manifest_cleanup_paths(document: dict[str, object]) -> set[Path]:
+    values = document.get("cleanup_paths", [])
+    if not isinstance(values, list):
+        raise IntegrityError("knowledge view manifest cleanup paths are invalid")
+    paths: set[Path] = set()
+    for value in values:
+        relative_path = Path(value) if isinstance(value, str) else Path(".")
+        if not isinstance(value, str) or not relative_path.is_relative_to(VIEW_ROOT):
+            raise IntegrityError("knowledge view manifest cleanup path is invalid")
+        paths.add(relative_path)
+    return paths
+
+
+def _manifest_bytes(
+    views: list[dict[str, str]],
+    cleanup_paths: tuple[Path, ...],
+) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "views": views,
+            "cleanup_paths": [path.as_posix() for path in cleanup_paths],
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
 
 
 def _dirty_view_paths(root: Path) -> tuple[Path, ...]:
