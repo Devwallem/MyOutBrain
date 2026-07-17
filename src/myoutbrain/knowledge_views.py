@@ -176,7 +176,7 @@ class KnowledgeViewService:
                     ),
                 )
             )
-            proposals = core.propose_manual_consolidation(task)
+            proposals = MemoryGateway(self._root).propose_consolidation(task)
             edits.append(
                 KnowledgeViewEdit(
                     memory_id=memory_id,

@@ -25,6 +25,7 @@ from myoutbrain.generation import (
     ProviderFailure,
 )
 from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
+from myoutbrain.memory_gateway import MemoryGateway
 from myoutbrain.notifications import (
     LocalNotification,
     LocalNotifier,
@@ -403,7 +404,7 @@ class ConsolidationScheduler:
                     attempt_count=attempt_count,
                 )
             else:
-                proposals = LocalMemoryCore(self._root).propose_manual_consolidation(
+                proposals = MemoryGateway(self._root).propose_consolidation(
                     schedule.task
                 )
         except (
@@ -860,7 +861,7 @@ class ConsolidationScheduler:
                     raise ProviderFailure(
                         "scheduled cloud analysis must return exactly one candidate"
                     )
-                proposals = core.propose_manual_consolidation(
+                proposals = MemoryGateway(self._root).propose_consolidation(
                     schedule.task,
                     digest_ids=evidence_ids,
                     proposed_understanding=reflection.candidates[0].text,

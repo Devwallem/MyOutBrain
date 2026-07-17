@@ -24,6 +24,8 @@ from myoutbrain.embeddings import (
 )
 from myoutbrain.local_core import (
     BufferedMemoryReceipt,
+    IntegrationProposal,
+    IntegrationReviewResult,
     LocalMemoryCore,
     RecallableMemory,
 )
@@ -83,21 +85,6 @@ class ExperienceSubmission:
 
 class MemoryReader(Protocol):
     def recallable_memories(self) -> tuple[RecallableMemory, ...]: ...
-
-
-class MemoryWriter(Protocol):
-    def capture_experience(
-        self,
-        conversation_path: Path,
-        *,
-        occurred_at: str,
-        entrance: str,
-        task: str,
-        memory_digest: str,
-        sensitivity: Sensitivity,
-        visible_context: str,
-        context_gaps: tuple[str, ...],
-    ) -> BufferedMemoryReceipt: ...
 
 
 @dataclass(frozen=True)
@@ -176,18 +163,16 @@ class MemoryGateway:
         *,
         embedding_provider: EmbeddingProvider | None = None,
         memory_reader: MemoryReader | None = None,
-        memory_writer: MemoryWriter | None = None,
     ) -> None:
         self._root = root
         self._embedding_provider = (
             embedding_provider or LocalMultilingualEmbeddingProvider()
         )
-        memory_core = LocalMemoryCore(root)
-        self._memory_reader = memory_reader or memory_core
-        self._memory_writer = memory_writer or memory_core
+        self._memory_core = LocalMemoryCore(root)
+        self._memory_reader = memory_reader or self._memory_core
 
     def submit(self, submission: ExperienceSubmission) -> BufferedMemoryReceipt:
-        return self._memory_writer.capture_experience(
+        return self._memory_core.capture_experience(
             submission.experience_path,
             occurred_at=submission.occurred_at,
             entrance=submission.entrance,
@@ -196,6 +181,31 @@ class MemoryGateway:
             sensitivity=submission.sensitivity,
             visible_context=submission.visible_context,
             context_gaps=submission.context_gaps,
+        )
+
+    def propose_consolidation(
+        self,
+        task: str,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+        digest_ids: tuple[str, ...] | None = None,
+        proposed_understanding: str | None = None,
+    ) -> tuple[IntegrationProposal, ...]:
+        return self._memory_core.propose_manual_consolidation(
+            task,
+            embedding_provider=embedding_provider,
+            digest_ids=digest_ids,
+            proposed_understanding=proposed_understanding,
+        )
+
+    def review_proposal(
+        self,
+        proposal_id: str,
+        instruction: str,
+    ) -> IntegrationReviewResult:
+        return self._memory_core.review_integration_proposal(
+            proposal_id,
+            instruction,
         )
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:

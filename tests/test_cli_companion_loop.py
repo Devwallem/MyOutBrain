@@ -116,7 +116,6 @@ class CompanionLoopCliTests(unittest.TestCase):
             self.assertEqual(submitted.returncode, 0, submitted.stderr)
             submitted_data = json.loads(submitted.stdout)
             submitted_memory_id = submitted_data["digest_id"]
-            submitted_source_id = submitted_data["source_id"]
             immediate = run_cli(
                 "codex-context",
                 "What launch information does Project Lumen still need?",
@@ -130,6 +129,10 @@ class CompanionLoopCliTests(unittest.TestCase):
                 "json",
             )
             self.assertEqual(immediate.returncode, 0, immediate.stderr)
+            self.assertEqual(
+                json.loads(immediate.stdout)["evidence_package"]["answerability"],
+                "insufficient",
+            )
             self.assertEqual(
                 json.loads(immediate.stdout)["evidence_package"]["items"][0][
                     "memory_id"
@@ -221,8 +224,9 @@ class CompanionLoopCliTests(unittest.TestCase):
             target_proposal = next(
                 proposal
                 for proposal in proposals
-                if submitted_memory_id in proposal["evidence_memory_ids"]
+                if answer["memory_update_id"] in proposal["evidence_memory_ids"]
             )
+            answer_source_id = target_proposal["source_scope"][0]
             before_review = run_cli(
                 "recall",
                 "Project Lumen Nova launch",
@@ -269,9 +273,10 @@ class CompanionLoopCliTests(unittest.TestCase):
             self.assertEqual(after_engine_change.items[0].memory_id, canonical_id)
             self.assertTrue(after_engine_change.items[0].confirmed)
             self.assertIn(
-                submitted_source_id, after_engine_change.items[0].source_ids
+                answer_source_id, after_engine_change.items[0].source_ids
             )
-            self.assertIn("Project Lumen", after_engine_change.items[0].content)
+            self.assertIn("August 1, 2026", after_engine_change.items[0].content)
+            self.assertIn(web_source_id, after_engine_change.items[0].content)
 
             built = run_cli(
                 "build-views",
@@ -306,13 +311,115 @@ class CompanionLoopCliTests(unittest.TestCase):
                 )
             )
             self.assertEqual(rebuilt.items[0].memory_id, canonical_id)
-            self.assertIn(submitted_source_id, rebuilt.items[0].source_ids)
+            self.assertIn(answer_source_id, rebuilt.items[0].source_ids)
+            self.assertIn("August 1, 2026", rebuilt.items[0].content)
             self.assertTrue(
                 (instance_root / "runtime" / "indexes" / "semantic").is_dir()
             )
             self.assertTrue(
                 (instance_root / "vault" / "Knowledge Views" / "Index.md").is_file()
             )
+
+            rebuilt_context = run_cli(
+                "codex-context",
+                "When does Product Nova 2 launch for Project Lumen?",
+                "--root",
+                str(instance_root),
+                "--task-pointer",
+                "lumen-launch",
+                "--purpose",
+                "substantive",
+                "--memory-id",
+                canonical_id,
+                "--format",
+                "json",
+            )
+            self.assertEqual(rebuilt_context.returncode, 0, rebuilt_context.stderr)
+            rebuilt_context_data = json.loads(rebuilt_context.stdout)
+            self.assertEqual(
+                rebuilt_context_data["evidence_package"]["items"][0]["memory_id"],
+                canonical_id,
+            )
+            self.assertIn(
+                "August 1, 2026",
+                rebuilt_context_data["evidence_package"]["items"][0]["content"],
+            )
+            rebuilt_answer = run_cli(
+                "answer",
+                "When does Product Nova 2 launch for Project Lumen?",
+                "--root",
+                str(instance_root),
+                "--task",
+                "lumen-launch",
+                "--access",
+                "local-trusted",
+                "--time-sensitive",
+                "--public-query",
+                public_query,
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": public_response,
+                    "MYOUTBRAIN_FAKE_RESPONSE": generated_response,
+                },
+            )
+            self.assertEqual(rebuilt_answer.returncode, 0, rebuilt_answer.stderr)
+            rebuilt_answer_data = json.loads(rebuilt_answer.stdout)
+            self.assertEqual(rebuilt_answer_data["status"], "answered")
+            rebuilt_update_id = rebuilt_answer_data["memory_update_id"]
+            rebuilt_proposals_result = run_cli(
+                "consolidate",
+                "--task",
+                "lumen-launch",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(
+                rebuilt_proposals_result.returncode,
+                0,
+                rebuilt_proposals_result.stderr,
+            )
+            rebuilt_proposal = next(
+                proposal
+                for proposal in json.loads(rebuilt_proposals_result.stdout)[
+                    "proposals"
+                ]
+                if rebuilt_update_id in proposal["evidence_memory_ids"]
+            )
+            rebuilt_review = run_cli(
+                "review-memory",
+                rebuilt_proposal["proposal_id"],
+                "accept",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(rebuilt_review.returncode, 0, rebuilt_review.stderr)
+            rebuilt_canonical_id = json.loads(rebuilt_review.stdout)[
+                "canonical_memory_id"
+            ]
+            final_recall = run_cli(
+                "recall",
+                "Product Nova 2 launch date",
+                "--root",
+                str(instance_root),
+                "--task",
+                "lumen-launch",
+                "--access",
+                "task-scoped",
+                "--memory-id",
+                rebuilt_canonical_id,
+                "--format",
+                "json",
+            )
+            self.assertEqual(final_recall.returncode, 0, final_recall.stderr)
+            final_items = json.loads(final_recall.stdout)["items"]
+            self.assertEqual(final_items[0]["memory_id"], rebuilt_canonical_id)
+            self.assertTrue(final_items[0]["confirmed"])
+            self.assertIn("August 1, 2026", final_items[0]["content"])
 
     def test_unsuccessful_research_stays_unknown_and_unapproved_is_not_canonical(
         self,

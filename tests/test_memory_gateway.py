@@ -59,6 +59,45 @@ class MemoryGatewayTests(unittest.TestCase):
             self.assertEqual(recalled.items[0].memory_id, receipt.digest_id)
             self.assertEqual(recalled.items[0].entrance, "codex")
             self.assertEqual(recalled.items[0].task, "release-notes")
+
+    def test_gateway_coordinates_proposal_and_canonical_review_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            visible_experience = temporary_root / "visible-task.txt"
+            visible_experience.write_text(
+                "Project Rowan requires signed provenance records.",
+                encoding="utf-8",
+            )
+            gateway = MemoryGateway(instance_root)
+            receipt = gateway.submit(
+                ExperienceSubmission(
+                    experience_path=visible_experience,
+                    occurred_at="2026-07-18T09:30:00+08:00",
+                    entrance="codex",
+                    task_pointer="rowan-release",
+                    digest="Rowan releases require signed provenance records.",
+                    sensitivity="local-only",
+                    visible_context="current Rowan release task",
+                    context_gaps=("earlier Rowan history is unavailable",),
+                )
+            )
+
+            proposals = gateway.propose_consolidation("rowan-release")
+            proposal = next(
+                item
+                for item in proposals
+                if receipt.digest_id in item.evidence_memory_ids
+            )
+            review = gateway.review_proposal(proposal.proposal_id, "accept")
+
+            self.assertEqual(review.decision, "accepted")
+            self.assertIsNotNone(review.canonical_memory_id)
+
     def test_new_buffered_memory_is_immediately_recalled_with_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

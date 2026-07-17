@@ -63,6 +63,37 @@ EXIT_PROVIDER = 6
 EXIT_INTEGRITY = 7
 
 
+def _add_recall_options(
+    parser: argparse.ArgumentParser,
+    *,
+    default_format: str,
+) -> None:
+    parser.add_argument(
+        "--access",
+        choices=tuple(level.value for level in MemoryAccess),
+        default=MemoryAccess.TASK_SCOPED.value,
+    )
+    parser.add_argument(
+        "--purpose",
+        choices=tuple(purpose.value for purpose in QueryPurpose),
+        default=QueryPurpose.SUBSTANTIVE.value,
+    )
+    parser.add_argument("--memory-id", action="append", default=[])
+    parser.add_argument("--source-id", action="append", default=[])
+    parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument(
+        "--query-sensitivity",
+        choices=("local-only", "cloud-allowed"),
+        default="local-only",
+        help="Explicitly classify whether the query itself may leave this machine",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json", "text"),
+        default=default_format,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="myoutbrain")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -126,27 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     codex_context_parser.add_argument("question")
     codex_context_parser.add_argument("--root", type=Path, default=Path.cwd())
     codex_context_parser.add_argument("--task-pointer", required=True)
-    codex_context_parser.add_argument(
-        "--purpose",
-        choices=tuple(purpose.value for purpose in QueryPurpose),
-        default=QueryPurpose.SUBSTANTIVE.value,
-    )
-    codex_context_parser.add_argument(
-        "--access",
-        choices=tuple(level.value for level in MemoryAccess),
-        default=MemoryAccess.TASK_SCOPED.value,
-    )
-    codex_context_parser.add_argument("--memory-id", action="append", default=[])
-    codex_context_parser.add_argument("--source-id", action="append", default=[])
-    codex_context_parser.add_argument("--limit", type=int, default=5)
-    codex_context_parser.add_argument(
-        "--query-sensitivity",
-        choices=("local-only", "cloud-allowed"),
-        default="local-only",
-    )
-    codex_context_parser.add_argument(
-        "--format", choices=("json", "text"), default="json"
-    )
+    _add_recall_options(codex_context_parser, default_format="json")
     recall_parser = subcommands.add_parser(
         "recall",
         help="Request a task-scoped memory evidence package",
@@ -154,26 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument("query")
     recall_parser.add_argument("--root", type=Path, default=Path.cwd())
     recall_parser.add_argument("--task", required=True)
-    recall_parser.add_argument(
-        "--access",
-        choices=tuple(level.value for level in MemoryAccess),
-        default=MemoryAccess.TASK_SCOPED.value,
-    )
-    recall_parser.add_argument(
-        "--purpose",
-        choices=tuple(purpose.value for purpose in QueryPurpose),
-        default=QueryPurpose.SUBSTANTIVE.value,
-    )
-    recall_parser.add_argument("--memory-id", action="append", default=[])
-    recall_parser.add_argument("--source-id", action="append", default=[])
-    recall_parser.add_argument("--limit", type=int, default=5)
-    recall_parser.add_argument(
-        "--query-sensitivity",
-        choices=("local-only", "cloud-allowed"),
-        default="local-only",
-        help="Explicitly classify whether the query itself may leave this machine",
-    )
-    recall_parser.add_argument("--format", choices=("json", "text"), default="text")
+    _add_recall_options(recall_parser, default_format="text")
     answer_parser = subcommands.add_parser(
         "answer",
         help="Answer from common knowledge with sanitized public-research fallback",
@@ -635,7 +627,7 @@ def _answer(
 ) -> int:
     forced_proposals: tuple[IntegrationProposal, ...] = ()
     if force_consolidation:
-        forced_proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
+        forced_proposals = MemoryGateway(root).propose_consolidation(task)
     result = CompanionAnswerService(root).answer(
         AnswerRequest(
             question=question,
@@ -799,7 +791,7 @@ def _consolidate(
         raise UserInputError(
             "--conversation-state is only valid with forced consolidation"
         )
-    proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
+    proposals = MemoryGateway(root).propose_consolidation(task)
     run_id: str | None = None
     notification_status: str | None = None
     if force and conversation_state == "inactive":
@@ -885,7 +877,7 @@ def _review_memory(
             raise UserInputError(
                 "review-memory requires both a proposal id and natural instruction"
             )
-        result = LocalMemoryCore(root).review_integration_proposal(
+        result = MemoryGateway(root).review_proposal(
             proposal_id,
             instruction,
         )
