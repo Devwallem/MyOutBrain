@@ -1646,7 +1646,15 @@ class LocalMemoryCore:
         )
         for table, column, values in (
             ("integration_proposal_buffered", "digest_id", removed_digest_ids),
-            ("integration_proposal_sources", "source_id", impact.source_ids),
+            (
+                "integration_proposal_sources",
+                "source_id",
+                tuple(
+                    source_id
+                    for source_id in impact.source_ids
+                    if source_id not in impact.shared_source_ids
+                ),
+            ),
         ):
             if not values:
                 continue

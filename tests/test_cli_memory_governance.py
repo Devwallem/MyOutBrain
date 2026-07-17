@@ -393,6 +393,14 @@ class MemoryGovernanceTests(unittest.TestCase):
                 "--format",
                 "json",
             )
+            history = run_cli(
+                "review-memory",
+                "--history",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
 
             self.assertEqual(deleted.returncode, 0, deleted.stderr)
             result = json.loads(deleted.stdout)
@@ -406,6 +414,14 @@ class MemoryGovernanceTests(unittest.TestCase):
             self.assertEqual(
                 [item["memory_id"] for item in json.loads(recalled.stdout)["items"]],
                 [second_memory_id],
+            )
+            self.assertEqual(history.returncode, 0, history.stderr)
+            self.assertIn(
+                second_memory_id,
+                {
+                    review["canonical_memory_id"]
+                    for review in json.loads(history.stdout)["reviews"]
+                },
             )
 
     def test_storage_report_separates_durable_and_rebuildable_tiers(self) -> None:
