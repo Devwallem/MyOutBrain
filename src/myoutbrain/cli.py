@@ -212,6 +212,36 @@ def build_parser() -> argparse.ArgumentParser:
     scheduled_status_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    schedule_consolidation_parser = subcommands.add_parser(
+        "schedule-consolidation",
+        help="Configure an explicit recurring consolidation schedule",
+    )
+    schedule_consolidation_parser.add_argument("schedule_id")
+    schedule_consolidation_parser.add_argument("--task", required=True)
+    schedule_consolidation_parser.add_argument("--run-at", required=True)
+    schedule_consolidation_parser.add_argument(
+        "--every-hours", type=int, required=True
+    )
+    schedule_consolidation_parser.add_argument(
+        "--mode", choices=("local", "cloud"), required=True
+    )
+    schedule_consolidation_parser.add_argument("--root", type=Path, default=Path.cwd())
+    schedule_consolidation_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    run_scheduled_parser = subcommands.add_parser(
+        "run-scheduled-consolidation",
+        help="Run one explicitly configured schedule when due",
+    )
+    run_scheduled_parser.add_argument("schedule_id")
+    run_scheduled_parser.add_argument("--now", required=True)
+    run_scheduled_parser.add_argument(
+        "--conversation-state", choices=("active", "inactive"), required=True
+    )
+    run_scheduled_parser.add_argument("--root", type=Path, default=Path.cwd())
+    run_scheduled_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     memory_review_parser = subcommands.add_parser(
         "review-memory",
         help="List or naturally review memory integration proposals",
@@ -642,6 +672,14 @@ def _render_scheduled_authorization(
     return 0
 
 
+def _render_simple_data(data: dict[str, object], output_format: str) -> int:
+    if output_format == "json":
+        print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    else:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _review_memory(
     root: Path,
     proposal_id: str | None,
@@ -916,6 +954,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ).authorization()
             return _render_scheduled_authorization(
                 authorization.to_data(), parsed_arguments.format
+            )
+        if parsed_arguments.command == "schedule-consolidation":
+            schedule = ConsolidationScheduler(parsed_arguments.root).schedule(
+                parsed_arguments.schedule_id,
+                task=parsed_arguments.task,
+                run_at=parsed_arguments.run_at,
+                every_hours=parsed_arguments.every_hours,
+                mode=parsed_arguments.mode,
+            )
+            return _render_simple_data(schedule.to_data(), parsed_arguments.format)
+        if parsed_arguments.command == "run-scheduled-consolidation":
+            scheduled_run = ConsolidationScheduler(parsed_arguments.root).run_due(
+                parsed_arguments.schedule_id,
+                now=parsed_arguments.now,
+                conversation_state=parsed_arguments.conversation_state,
+            )
+            return _render_simple_data(
+                scheduled_run.to_data(), parsed_arguments.format
             )
         if parsed_arguments.command == "review-memory":
             return _review_memory(

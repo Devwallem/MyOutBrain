@@ -165,6 +165,92 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(invalid.returncode, 2)
             self.assertIn("local-only", invalid.stderr)
 
+    def test_explicit_local_schedule_runs_when_due_and_only_creates_proposals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="scheduled-local",
+                digest="Scheduled local review prepares a bounded proposal.",
+                task="nightly-review",
+            )
+            configured = run_cli(
+                "schedule-consolidation",
+                "nightly",
+                "--task",
+                "nightly-review",
+                "--run-at",
+                "2026-07-20T02:00:00+08:00",
+                "--every-hours",
+                "24",
+                "--mode",
+                "local",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            early = run_cli(
+                "run-scheduled-consolidation",
+                "nightly",
+                "--now",
+                "2026-07-20T01:59:59+08:00",
+                "--conversation-state",
+                "active",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            due = run_cli(
+                "run-scheduled-consolidation",
+                "nightly",
+                "--now",
+                "2026-07-20T02:00:00+08:00",
+                "--conversation-state",
+                "active",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            reviews = run_cli(
+                "review-memory",
+                "--history",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            self.assertEqual(json.loads(configured.stdout)["schedule_id"], "nightly")
+            self.assertEqual(early.returncode, 2)
+            self.assertIn("not due", early.stderr)
+            self.assertEqual(due.returncode, 0, due.stderr)
+            run = json.loads(due.stdout)
+            self.assertEqual(run["trigger"], "scheduled")
+            self.assertEqual(run["mode"], "local")
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual(run["delivery"], "active-conversation")
+            self.assertEqual(run["canonical_changes"], 0)
+            self.assertEqual(run["next_run_at"], "2026-07-21T02:00:00+08:00")
+            self.assertEqual(len(run["proposals"]), 1)
+            self.assertEqual(
+                run["proposals"][0]["evidence_memory_ids"],
+                [receipt["digest_id"]],
+            )
+            self.assertEqual(reviews.returncode, 0, reviews.stderr)
+            self.assertEqual(json.loads(reviews.stdout)["reviews"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
