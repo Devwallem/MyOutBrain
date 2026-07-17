@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from typing import cast
@@ -49,7 +51,67 @@ def remember_digest(
     return cast(dict[str, object], json.loads(result.stdout))
 
 
+def downgrade_memory_store_to_v2(instance_root: Path) -> None:
+    database_path = instance_root / "store" / "memory.sqlite3"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            DROP TABLE integration_reviews;
+            DROP TABLE integration_proposal_sources;
+            DROP TABLE integration_proposal_related;
+            DROP TABLE integration_proposal_buffered;
+            DROP TABLE integration_proposals;
+            DROP TABLE canonical_memory_relations;
+            CREATE TABLE buffered_digests_v2 (
+                digest_id TEXT PRIMARY KEY,
+                experience_id TEXT NOT NULL UNIQUE REFERENCES experiences(experience_id),
+                content TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state = 'buffered'),
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO buffered_digests_v2
+                (digest_id, experience_id, content, fingerprint, state, created_at)
+            SELECT digest_id, experience_id, content, fingerprint, state, created_at
+            FROM buffered_digests;
+            DROP TABLE buffered_digests;
+            ALTER TABLE buffered_digests_v2 RENAME TO buffered_digests;
+            PRAGMA user_version = 2;
+            """
+        )
+
+
 class ManualMemoryConsolidationTests(unittest.TestCase):
+    def test_default_review_text_displays_evidence_and_related_canonical_memory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="reviewable",
+                digest="Weekly reflection makes accumulated lessons reusable.",
+            )
+
+            rendered = run_cli(
+                "consolidate",
+                "--task",
+                "weekly-review",
+                "--root",
+                str(instance_root),
+            )
+
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.assertIn(f"Evidence: {receipt['digest_id']}", rendered.stdout)
+            self.assertIn("Related canonical memories: none", rendered.stdout)
+
     def test_manual_consolidation_groups_related_buffered_memory_without_writing_canonical(
         self,
     ) -> None:
@@ -251,7 +313,7 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
             review = run_cli(
                 "review-memory",
                 proposal["proposal_id"],
-                "accept",
+                "I accept this proposal.",
                 "--root",
                 str(instance_root),
                 "--format",
@@ -277,6 +339,86 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
             self.assertEqual(
                 LocalMemoryCore(instance_root).pending_integration_proposals(),
                 (),
+            )
+
+    def test_exact_duplicate_acceptance_reuses_stable_canonical_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            first = remember_digest(
+                temporary_root,
+                instance_root,
+                name="first-copy",
+                digest="Weekly reflection makes accumulated lessons reusable.",
+                task="first-pass",
+            )
+            initial_proposal = json.loads(
+                run_cli(
+                    "consolidate",
+                    "--task",
+                    "first-pass",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )["proposals"][0]
+            initial_review = run_cli(
+                "review-memory",
+                initial_proposal["proposal_id"],
+                "accept",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            canonical_id = json.loads(initial_review.stdout)["canonical_memory_id"]
+            second = remember_digest(
+                temporary_root,
+                instance_root,
+                name="second-copy",
+                digest="Weekly reflection makes accumulated lessons reusable.",
+                task="second-pass",
+            )
+            duplicate_proposal = json.loads(
+                run_cli(
+                    "consolidate",
+                    "--task",
+                    "second-pass",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )["proposals"][0]
+
+            duplicate_review = run_cli(
+                "review-memory",
+                duplicate_proposal["proposal_id"],
+                "I approve the proposal.",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(duplicate_review.returncode, 0, duplicate_review.stderr)
+            self.assertEqual(
+                json.loads(duplicate_review.stdout)["canonical_memory_id"],
+                canonical_id,
+            )
+            canonical = LocalMemoryCore(instance_root).recallable_memories()
+            self.assertEqual(len(canonical), 1)
+            self.assertEqual(canonical[0].memory_id, canonical_id)
+            self.assertEqual(
+                set(canonical[0].source_ids),
+                {first["source_id"], second["source_id"]},
             )
 
     def test_natural_edit_and_rejection_preserve_review_history_without_unapproved_semantics(
@@ -451,7 +593,7 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(proposal["source_scope"]),
-                {original["source_id"], followup["source_id"]},
+                {followup["source_id"]},
             )
             canonical_before_review = tuple(
                 memory
@@ -460,6 +602,88 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
             )
             self.assertEqual(len(canonical_before_review), 1)
             self.assertEqual(canonical_before_review[0].memory_id, canonical_id)
+
+            accepted_related = run_cli(
+                "review-memory",
+                proposal["proposal_id"],
+                "accept",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(
+                accepted_related.returncode,
+                0,
+                accepted_related.stderr,
+            )
+            accepted_data = json.loads(accepted_related.stdout)
+            self.assertNotEqual(accepted_data["canonical_memory_id"], canonical_id)
+            self.assertEqual(
+                accepted_data["related_canonical_memory_ids"],
+                [canonical_id],
+            )
+            canonical_after_review = {
+                memory.memory_id: memory
+                for memory in LocalMemoryCore(instance_root).recallable_memories()
+            }
+            self.assertEqual(
+                canonical_after_review[canonical_id].source_ids,
+                (original["source_id"],),
+            )
+            self.assertEqual(
+                canonical_after_review[
+                    accepted_data["canonical_memory_id"]
+                ].source_ids,
+                (followup["source_id"],),
+            )
+
+    def test_v2_memory_store_upgrades_without_losing_public_memory_behavior(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="legacy-buffer",
+                digest="Weekly reflection makes accumulated lessons reusable.",
+                task="legacy-review",
+            )
+            downgrade_memory_store_to_v2(instance_root)
+
+            upgraded = run_cli("init", "--root", str(instance_root))
+            proposal_result = run_cli(
+                "consolidate",
+                "--task",
+                "legacy-review",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+            self.assertEqual(proposal_result.returncode, 0, proposal_result.stderr)
+            proposal = json.loads(proposal_result.stdout)["proposals"][0]
+            self.assertEqual(proposal["evidence_memory_ids"], [receipt["digest_id"]])
+            review = run_cli(
+                "review-memory",
+                proposal["proposal_id"],
+                "accept",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(review.returncode, 0, review.stderr)
+            memories = LocalMemoryCore(instance_root).recallable_memories()
+            self.assertEqual(len(memories), 1)
+            self.assertEqual(memories[0].memory_state, MemoryState.CANONICAL)
 
     def test_interrupted_acceptance_restores_the_complete_pending_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

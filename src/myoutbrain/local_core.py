@@ -88,6 +88,15 @@ CREATE TABLE canonical_memory_sources (
     PRIMARY KEY (memory_id, source_id)
 );
 
+CREATE TABLE canonical_memory_relations (
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    related_memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    relationship TEXT NOT NULL CHECK (relationship = 'related'),
+    created_at TEXT NOT NULL,
+    CHECK (memory_id <> related_memory_id),
+    PRIMARY KEY (memory_id, related_memory_id)
+);
+
 CREATE TABLE integration_proposals (
     proposal_id TEXT PRIMARY KEY,
     topic TEXT NOT NULL,
@@ -266,6 +275,7 @@ class IntegrationReviewResult:
     canonical_memory_id: str | None
     canonical_content: str | None
     reason: str | None
+    related_canonical_memory_ids: tuple[str, ...]
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -274,6 +284,9 @@ class IntegrationReviewResult:
             "canonical_memory_id": self.canonical_memory_id,
             "canonical_content": self.canonical_content,
             "reason": self.reason,
+            "related_canonical_memory_ids": list(
+                self.related_canonical_memory_ids
+            ),
         }
 
 
@@ -676,11 +689,16 @@ class LocalMemoryCore:
                 if review.decision == "accepted"
                 else review.content
             )
-            canonical_memory_id = (
-                f"mem_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
-                if review.decision != "rejected"
-                else None
+            exact_duplicate_id = self._exact_duplicate_canonical_id(
+                database_path,
+                proposal=proposal,
+                canonical_content=canonical_content,
             )
+            canonical_memory_id = None
+            if review.decision != "rejected":
+                canonical_memory_id = exact_duplicate_id or (
+                    f"mem_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
+                )
             reviewed_at = datetime.now(timezone.utc).isoformat()
             staged_database = self._database_with_integration_review(
                 database_path,
@@ -714,6 +732,7 @@ class LocalMemoryCore:
             canonical_memory_id=canonical_memory_id,
             canonical_content=canonical_content,
             reason=review.reason,
+            related_canonical_memory_ids=proposal.related_canonical_memory_ids,
         )
 
     def integration_review_history(self) -> tuple[IntegrationReviewResult, ...]:
@@ -729,10 +748,15 @@ class LocalMemoryCore:
                 with closing(sqlite3.connect(database_path)) as connection:
                     rows = connection.execute(
                         """
-                        SELECT proposal_id, decision, canonical_memory_id,
-                               reviewed_content, reason
-                        FROM integration_reviews
-                        ORDER BY created_at, review_id
+                        SELECT review.proposal_id, review.decision,
+                               review.canonical_memory_id, review.reviewed_content,
+                               review.reason,
+                               GROUP_CONCAT(DISTINCT related.memory_id)
+                        FROM integration_reviews AS review
+                        LEFT JOIN integration_proposal_related AS related
+                          ON related.proposal_id = review.proposal_id
+                        GROUP BY review.review_id
+                        ORDER BY review.created_at, review.review_id
                         """
                     ).fetchall()
             except sqlite3.Error as error:
@@ -744,6 +768,7 @@ class LocalMemoryCore:
                 canonical_memory_id=row[2],
                 canonical_content=row[3],
                 reason=row[4],
+                related_canonical_memory_ids=_split_group(row[5]),
             )
             for row in rows
         )
@@ -761,6 +786,39 @@ class LocalMemoryCore:
                 database_path,
                 status="pending",
             )
+
+    @staticmethod
+    def _exact_duplicate_canonical_id(
+        database_path: Path,
+        *,
+        proposal: IntegrationProposal,
+        canonical_content: str | None,
+    ) -> str | None:
+        if canonical_content is None or not proposal.related_canonical_memory_ids:
+            return None
+        placeholders = ", ".join("?" for _ in proposal.related_canonical_memory_ids)
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT memory_id, content
+                    FROM canonical_memories
+                    WHERE state = 'active' AND memory_id IN ({placeholders})
+                    ORDER BY memory_id
+                    """,
+                    proposal.related_canonical_memory_ids,
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot classify an integration proposal") from error
+        normalized_content = _normalized_memory_body(canonical_content)
+        for memory_id, content in rows:
+            if (
+                isinstance(memory_id, str)
+                and isinstance(content, str)
+                and _normalized_memory_body(content) == normalized_content
+            ):
+                return memory_id
+        return None
 
     @staticmethod
     def _query_integration_proposals(
@@ -1047,24 +1105,55 @@ class LocalMemoryCore:
                     "rejected" if review.decision == "rejected" else "accepted"
                 )
                 if canonical_memory_id is not None and canonical_content is not None:
-                    connection.execute(
+                    existing = connection.execute(
                         """
-                        INSERT INTO canonical_memories
-                            (memory_id, content, current_version, sensitivity,
-                             state, created_at, updated_at)
-                        VALUES (?, ?, 1, ?, 'active', ?, ?)
+                        SELECT 1 FROM canonical_memories
+                        WHERE memory_id = ? AND state = 'active'
                         """,
-                        (
-                            canonical_memory_id,
-                            canonical_content,
-                            proposal.sensitivity,
-                            reviewed_at,
-                            reviewed_at,
-                        ),
-                    )
+                        (canonical_memory_id,),
+                    ).fetchone()
+                    if existing is None:
+                        connection.execute(
+                            """
+                            INSERT INTO canonical_memories
+                                (memory_id, content, current_version, sensitivity,
+                                 state, created_at, updated_at)
+                            VALUES (?, ?, 1, ?, 'active', ?, ?)
+                            """,
+                            (
+                                canonical_memory_id,
+                                canonical_content,
+                                proposal.sensitivity,
+                                reviewed_at,
+                                reviewed_at,
+                            ),
+                        )
+                        connection.executemany(
+                            """
+                            INSERT INTO canonical_memory_relations
+                                (memory_id, related_memory_id, relationship, created_at)
+                            VALUES (?, ?, 'related', ?)
+                            """,
+                            (
+                                (canonical_memory_id, related_memory_id, reviewed_at)
+                                for related_memory_id
+                                in proposal.related_canonical_memory_ids
+                                if related_memory_id != canonical_memory_id
+                            ),
+                        )
+                    elif proposal.sensitivity == "local-only":
+                        connection.execute(
+                            """
+                            UPDATE canonical_memories
+                            SET sensitivity = 'local-only', updated_at = ?
+                            WHERE memory_id = ?
+                            """,
+                            (reviewed_at, canonical_memory_id),
+                        )
                     connection.executemany(
                         """
-                        INSERT INTO canonical_memory_sources (memory_id, source_id)
+                        INSERT OR IGNORE INTO canonical_memory_sources
+                            (memory_id, source_id)
                         VALUES (?, ?)
                         """,
                         (
@@ -1179,6 +1268,15 @@ class LocalMemoryCore:
                             CHECK (status IN ('pending', 'accepted', 'rejected')),
                         created_at TEXT NOT NULL,
                         reviewed_at TEXT
+                    );
+                    CREATE TABLE canonical_memory_relations (
+                        memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+                        related_memory_id TEXT NOT NULL
+                            REFERENCES canonical_memories(memory_id),
+                        relationship TEXT NOT NULL CHECK (relationship = 'related'),
+                        created_at TEXT NOT NULL,
+                        CHECK (memory_id <> related_memory_id),
+                        PRIMARY KEY (memory_id, related_memory_id)
                     );
                     CREATE TABLE integration_proposal_buffered (
                         proposal_id TEXT NOT NULL
@@ -1317,36 +1415,66 @@ def _without_evidence_marker(content: str) -> str:
     return re.sub(r"\s*\[evidence:\s+src_[0-9a-f]+\]\s*$", "", content).strip()
 
 
+def _normalized_memory_body(content: str) -> str:
+    return " ".join(_without_evidence_marker(content).casefold().split())
+
+
 def _parse_review_instruction(instruction: str) -> _ReviewInstruction:
     normalized = _required_text("review instruction", instruction)
     folded = normalized.casefold()
-    if folded in ("accept", "接受"):
+    if re.fullmatch(
+        r"(?:i\s+)?(?:accept|approve)(?:\s+(?:this|the|it))?"
+        r"(?:\s+proposal)?[.!]?",
+        folded,
+    ) or re.fullmatch(r"(?:我)?(?:接受|同意|批准)(?:这个|该)?提案?[。！]?", folded):
         return _ReviewInstruction(decision="accepted", content=None, reason=None)
-    for prefix in ("edit:", "accept with changes:", "修改为:", "修改为："):
-        if folded.startswith(prefix.casefold()):
-            content = _required_text(
-                "edited canonical understanding",
-                normalized[len(prefix) :],
+    edit_match = re.fullmatch(
+        r"(?:edit|accept\s+with\s+changes|"
+        r"(?:i\s+)?(?:accept|approve)(?:\s+(?:this|the|it))?"
+        r"(?:\s+proposal)?\s+with\s+(?:this\s+)?(?:wording|changes?))"
+        r"\s*[:：]\s*(.+)",
+        normalized,
+        flags=re.IGNORECASE,
+    ) or re.fullmatch(
+        r"(?:我)?(?:(?:接受|同意|批准)(?:这个|该)?提案?并)?(?:修改为|改为)"
+        r"\s*[:：]?\s*(.+)",
+        normalized,
+    )
+    if edit_match is not None:
+        content = _required_text(
+            "edited canonical understanding",
+            edit_match.group(1),
+        )
+        if len(content) > 500:
+            raise UserInputError(
+                "edited canonical understanding must not exceed 500 characters"
             )
-            if len(content) > 500:
-                raise UserInputError(
-                    "edited canonical understanding must not exceed 500 characters"
-                )
-            return _ReviewInstruction(
-                decision="edited",
-                content=content,
-                reason=None,
-            )
-    if folded in ("reject", "拒绝"):
+        return _ReviewInstruction(
+            decision="edited",
+            content=content,
+            reason=None,
+        )
+    if re.fullmatch(
+        r"(?:i\s+)?reject(?:\s+(?:this|the|it))?(?:\s+proposal)?[.!]?",
+        folded,
+    ) or re.fullmatch(r"(?:我)?拒绝(?:这个|该)?提案?[。！]?", folded):
         return _ReviewInstruction(decision="rejected", content=None, reason=None)
-    for prefix in ("reject because:", "拒绝:", "拒绝："):
-        if folded.startswith(prefix.casefold()):
-            reason = _required_text("rejection reason", normalized[len(prefix) :])
-            return _ReviewInstruction(
-                decision="rejected",
-                content=None,
-                reason=reason,
-            )
+    rejection_match = re.fullmatch(
+        r"(?:i\s+)?reject(?:\s+(?:this|the|it))?(?:\s+proposal)?"
+        r"\s+because\s*[:：]?\s*(.+)",
+        normalized,
+        flags=re.IGNORECASE,
+    ) or re.fullmatch(
+        r"(?:我)?拒绝(?:这个|该)?提案?\s*(?:因为|原因是)?\s*[:：]\s*(.+)",
+        normalized,
+    )
+    if rejection_match is not None:
+        reason = _required_text("rejection reason", rejection_match.group(1))
+        return _ReviewInstruction(
+            decision="rejected",
+            content=None,
+            reason=reason,
+        )
     raise UserInputError(
         "review instruction must naturally accept, edit, or reject the proposal"
     )
@@ -1403,6 +1531,26 @@ def _validated_canonical_rows(
     return tuple(validated)
 
 
+def _proposal_impact(
+    related_memory_ids: tuple[str, ...],
+    exact_memory_ids: tuple[str, ...],
+) -> str:
+    if exact_memory_ids:
+        return (
+            "Adds the buffered sources to existing canonical memory "
+            f"{exact_memory_ids[0]} without changing its content."
+        )
+    if related_memory_ids:
+        return (
+            "Creates a separate canonical understanding related to "
+            f"{', '.join(related_memory_ids)} without revising existing content."
+        )
+    return (
+        "Creates one canonical understanding from the approved buffered evidence; "
+        "no semantic change occurs before review."
+    )
+
+
 def _integration_proposal_drafts(
     task: str,
     candidates: tuple[_ConsolidationRow, ...],
@@ -1431,17 +1579,14 @@ def _integration_proposal_drafts(
                 for row in group
             )
         )
-        source_ids = tuple(
-            sorted(
-                {row[2] for row in group}
-                | {
-                    source_id
-                    for candidate in related
-                    for source_id in candidate[3]
-                }
-            )
-        )
+        source_ids = tuple(sorted({row[2] for row in group}))
         proposed_understanding = " ".join(bodies)
+        exact_related = tuple(
+            candidate
+            for candidate in related
+            if _normalized_memory_body(candidate[1])
+            == _normalized_memory_body(proposed_understanding)
+        )
         sensitivity: Sensitivity = (
             "local-only"
             if any(row[3] == "local-only" for row in group)
@@ -1461,9 +1606,9 @@ def _integration_proposal_drafts(
                 proposal_id=f"prp_{hashlib.sha256(identity).hexdigest()}",
                 topic=topic,
                 proposed_understanding=proposed_understanding,
-                possible_impact=(
-                    "Creates one canonical understanding from the approved buffered "
-                    "evidence; no semantic change occurs before review."
+                possible_impact=_proposal_impact(
+                    tuple(candidate[0] for candidate in related),
+                    tuple(candidate[0] for candidate in exact_related),
                 ),
                 sensitivity=sensitivity,
                 digest_ids=digest_ids,

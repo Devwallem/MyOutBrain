@@ -281,12 +281,27 @@ def _render_integration_proposals(
         print(f"Topic: {proposal['topic']}")
         print(f"Proposed understanding: {proposal['proposed_understanding']}")
         print(f"Possible impact: {proposal['possible_impact']}")
+        evidence = proposal["evidence_memory_ids"]
+        if not isinstance(evidence, list) or not all(
+            isinstance(memory_id, str) for memory_id in evidence
+        ):
+            raise IntegrityError("integration proposal has invalid evidence")
+        print("Evidence: " + (", ".join(evidence) if evidence else "none"))
         source_scope = proposal["source_scope"]
         if not isinstance(source_scope, list) or not all(
             isinstance(source, str) for source in source_scope
         ):
             raise IntegrityError("integration proposal has invalid source scope")
         print("Sources: " + ", ".join(source_scope))
+        related = proposal["related_canonical_memory_ids"]
+        if not isinstance(related, list) or not all(
+            isinstance(memory_id, str) for memory_id in related
+        ):
+            raise IntegrityError("integration proposal has invalid related memory")
+        print(
+            "Related canonical memories: "
+            + (", ".join(related) if related else "none")
+        )
     return 0
 
 
