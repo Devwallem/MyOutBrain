@@ -8,8 +8,8 @@ from pathlib import Path
 import hashlib
 import json
 import math
+import os
 import re
-import shutil
 import sqlite3
 import tempfile
 from typing import Literal
@@ -34,6 +34,7 @@ from myoutbrain.persistence import (
     atomic_commit,
     event_journal_change,
     hold_writer_lock_for_acceptance_test,
+    permanent_deletion_cleanup_change,
     recover_transactions,
     writer_lock,
 )
@@ -507,6 +508,8 @@ class MemoryDeletionImpact:
     related_memory_ids: tuple[str, ...]
     conflict_memory_ids: tuple[str, ...]
     pending_proposal_ids: tuple[str, ...]
+    proposal_ids_to_delete: tuple[str, ...]
+    review_ids_to_delete: tuple[str, ...]
 
     @property
     def confirmation_token(self) -> str:
@@ -519,6 +522,8 @@ class MemoryDeletionImpact:
                 "related_memory_ids": self.related_memory_ids,
                 "conflict_memory_ids": self.conflict_memory_ids,
                 "pending_proposal_ids": self.pending_proposal_ids,
+                "proposal_ids_to_delete": self.proposal_ids_to_delete,
+                "review_ids_to_delete": self.review_ids_to_delete,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -537,6 +542,8 @@ class MemoryDeletionImpact:
             "related_memory_ids": list(self.related_memory_ids),
             "conflict_memory_ids": list(self.conflict_memory_ids),
             "pending_proposal_ids": list(self.pending_proposal_ids),
+            "proposal_ids_to_delete": list(self.proposal_ids_to_delete),
+            "review_ids_to_delete": list(self.review_ids_to_delete),
             "confirmation_token": self.confirmation_token,
             "requires_confirmation": True,
         }
@@ -551,6 +558,7 @@ class MemoryDeletionResult:
     removed_proposal_ids: tuple[str, ...]
     deleted_at: str
     backup_exclusion_after: str
+    existing_backup_clearance: str
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -563,6 +571,7 @@ class MemoryDeletionResult:
             "removed_proposal_ids": list(self.removed_proposal_ids),
             "deleted_at": self.deleted_at,
             "backup_exclusion_after": self.backup_exclusion_after,
+            "existing_backup_clearance": self.existing_backup_clearance,
         }
 
 
@@ -1366,15 +1375,27 @@ class LocalMemoryCore:
                         connection,
                         removed_source_ids,
                     )
-                    removed_proposal_ids = self._proposal_ids_for_deletion(
+                    removed_experience_ids = _select_ids_for_values(
                         connection,
-                        impact,
-                        removed_digest_ids,
+                        table="experiences",
+                        result_column="experience_id",
+                        filter_column="source_id",
+                        values=removed_source_ids,
                     )
+                    removed_proposal_ids = impact.proposal_ids_to_delete
             except sqlite3.Error as error:
                 raise IntegrityError("cannot plan permanent deletion") from error
 
             deleted_at = datetime.now(timezone.utc).isoformat()
+            deletion_event = {
+                "id": f"evt_{uuid.uuid4().hex}",
+                "type": "memory.permanently-deleted",
+                "occurred_at": deleted_at,
+                "subject_fingerprint": _deletion_fingerprint(
+                    normalized_memory_id
+                ),
+                "removed_source_count": len(removed_source_ids),
+            }
             staged_database = self._database_with_permanent_deletion(
                 database_path,
                 impact=impact,
@@ -1383,40 +1404,39 @@ class LocalMemoryCore:
                 removed_proposal_ids=removed_proposal_ids,
                 deleted_at=deleted_at,
             )
-            event_id = f"evt_{uuid.uuid4().hex}"
+            view_paths = _knowledge_view_paths_for_memory(
+                self._root,
+                normalized_memory_id,
+            )
             atomic_commit(
                 self._root,
                 [
                     (database_path, staged_database),
-                    event_journal_change(
+                    _redacted_event_journal_change(
                         self._root,
-                        {
-                            "id": event_id,
-                            "type": "memory.permanently-deleted",
-                            "occurred_at": deleted_at,
-                            "subject_fingerprint": _deletion_fingerprint(
-                                normalized_memory_id
-                            ),
-                            "removed_source_count": len(removed_source_ids),
-                        },
+                        sensitive_ids=(
+                            normalized_memory_id,
+                            *removed_source_ids,
+                            *removed_experience_ids,
+                            *removed_digest_ids,
+                            *removed_proposal_ids,
+                            *impact.review_ids_to_delete,
+                        ),
+                        deletion_event=deletion_event,
+                    ),
+                    permanent_deletion_cleanup_change(
+                        self._root,
+                        object_references=object_references,
+                        view_paths=view_paths,
                     ),
                 ],
             )
-            for object_reference in object_references:
-                object_path = _resolved_object_reference(
-                    self._root,
-                    object_reference,
-                )
-                object_path.unlink(missing_ok=True)
-                _remove_empty_parents(
-                    object_path.parent,
-                    stop=self._root / "store" / "objects",
-                )
-            for rebuildable in (
-                self._root / "runtime" / "indexes" / "semantic",
-                self._root / "runtime" / "indexes" / "fulltext",
+            if (
+                os.environ.get("MYOUTBRAIN_FAULT_INJECTION")
+                == "permanent-deletion-before-cleanup"
             ):
-                shutil.rmtree(rebuildable, ignore_errors=True)
+                os._exit(86)
+            recover_transactions(self._root)
         return MemoryDeletionResult(
             memory_id=normalized_memory_id,
             removed_source_ids=removed_source_ids,
@@ -1425,6 +1445,9 @@ class LocalMemoryCore:
             removed_proposal_ids=removed_proposal_ids,
             deleted_at=deleted_at,
             backup_exclusion_after=deleted_at,
+            existing_backup_clearance=(
+                "external-backups-must-be-rotated-or-deleted-by-owner"
+            ),
         )
 
     def storage_report(self) -> MemoryStorageReport:
@@ -1588,6 +1611,52 @@ class LocalMemoryCore:
                 (memory_id, memory_id, memory_id),
             ).fetchall()
         )
+        unshared_source_ids = tuple(
+            source_id
+            for source_id in source_ids
+            if source_id not in shared_source_ids
+        )
+        removed_digest_ids = LocalMemoryCore._digest_ids_for_sources(
+            connection,
+            unshared_source_ids,
+        )
+        proposal_ids_to_delete = set(pending_proposal_ids)
+        proposal_ids_to_delete.update(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT proposal_id FROM integration_proposals
+                WHERE target_memory_id = ?
+                UNION
+                SELECT proposal_id FROM integration_reviews
+                WHERE canonical_memory_id = ?
+                """,
+                (memory_id, memory_id),
+            ).fetchall()
+        )
+        for table, column, values in (
+            ("integration_proposal_buffered", "digest_id", removed_digest_ids),
+            ("integration_proposal_sources", "source_id", unshared_source_ids),
+        ):
+            if not values:
+                continue
+            placeholders = ", ".join("?" for _ in values)
+            proposal_ids_to_delete.update(
+                row[0]
+                for row in connection.execute(
+                    f"SELECT proposal_id FROM {table} "
+                    f"WHERE {column} IN ({placeholders})",
+                    values,
+                ).fetchall()
+            )
+        ordered_proposal_ids = tuple(sorted(proposal_ids_to_delete))
+        review_ids_to_delete = _select_ids_for_values(
+            connection,
+            table="integration_reviews",
+            result_column="review_id",
+            filter_column="proposal_id",
+            values=ordered_proposal_ids,
+        )
         return MemoryDeletionImpact(
             memory_id=memory_id,
             source_ids=source_ids,
@@ -1596,6 +1665,8 @@ class LocalMemoryCore:
             related_memory_ids=related_memory_ids,
             conflict_memory_ids=conflict_memory_ids,
             pending_proposal_ids=pending_proposal_ids,
+            proposal_ids_to_delete=ordered_proposal_ids,
+            review_ids_to_delete=review_ids_to_delete,
         )
 
     @staticmethod
@@ -1620,54 +1691,6 @@ class LocalMemoryCore:
                 source_ids,
             ).fetchall()
         )
-
-    @staticmethod
-    def _proposal_ids_for_deletion(
-        connection: sqlite3.Connection,
-        impact: MemoryDeletionImpact,
-        removed_digest_ids: tuple[str, ...],
-    ) -> tuple[str, ...]:
-        proposal_ids = set(impact.pending_proposal_ids)
-        proposal_ids.update(
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT proposal_id FROM integration_proposals
-                WHERE target_memory_id = ?
-                UNION
-                SELECT proposal_id FROM integration_proposal_related
-                WHERE memory_id = ?
-                UNION
-                SELECT proposal_id FROM integration_reviews
-                WHERE canonical_memory_id = ?
-                """,
-                (impact.memory_id, impact.memory_id, impact.memory_id),
-            ).fetchall()
-        )
-        for table, column, values in (
-            ("integration_proposal_buffered", "digest_id", removed_digest_ids),
-            (
-                "integration_proposal_sources",
-                "source_id",
-                tuple(
-                    source_id
-                    for source_id in impact.source_ids
-                    if source_id not in impact.shared_source_ids
-                ),
-            ),
-        ):
-            if not values:
-                continue
-            placeholders = ", ".join("?" for _ in values)
-            proposal_ids.update(
-                row[0]
-                for row in connection.execute(
-                    f"SELECT proposal_id FROM {table} "
-                    f"WHERE {column} IN ({placeholders})",
-                    values,
-                ).fetchall()
-            )
-        return tuple(sorted(proposal_ids))
 
     @staticmethod
     def _database_with_permanent_deletion(
@@ -1716,6 +1739,10 @@ class LocalMemoryCore:
                     table="integration_proposals",
                     column="proposal_id",
                     values=removed_proposal_ids,
+                )
+                connection.execute(
+                    "DELETE FROM integration_proposal_related WHERE memory_id = ?",
+                    (impact.memory_id,),
                 )
                 connection.execute(
                     """
@@ -3420,15 +3447,69 @@ def _resolved_object_reference(root: Path, object_reference: str) -> Path:
     return candidate
 
 
-def _remove_empty_parents(path: Path, *, stop: Path) -> None:
-    resolved_stop = stop.resolve()
-    current = path.resolve()
-    while current != resolved_stop and resolved_stop in current.parents:
-        try:
-            current.rmdir()
-        except OSError:
-            return
-        current = current.parent
+def _knowledge_view_paths_for_memory(root: Path, memory_id: str) -> tuple[str, ...]:
+    manifest_path = root / "runtime" / "knowledge-views" / "manifest.json"
+    if not manifest_path.is_file():
+        return ()
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        views = document["views"]
+        if not isinstance(views, list):
+            raise TypeError
+        paths: list[str] = []
+        for item in views:
+            if not isinstance(item, dict):
+                raise TypeError
+            item_memory_id = item.get("memory_id")
+            item_path = item.get("path")
+            if not isinstance(item_memory_id, str) or not isinstance(item_path, str):
+                raise TypeError
+            if item_memory_id == memory_id:
+                paths.append(item_path)
+        return tuple(paths)
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise IntegrityError(
+            f"cannot read knowledge view cleanup scope: {manifest_path}"
+        ) from error
+
+
+def _redacted_event_journal_change(
+    root: Path,
+    *,
+    sensitive_ids: tuple[str, ...],
+    deletion_event: dict[str, object],
+) -> tuple[Path, bytes]:
+    journal_path = root / "store" / "journal" / "events.jsonl"
+    retained: list[dict[str, object]] = []
+    try:
+        if journal_path.is_file():
+            for line in journal_path.read_text(encoding="utf-8").splitlines():
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise TypeError
+                event = {str(key): value for key, value in raw.items()}
+                if not _contains_sensitive_id(event, frozenset(sensitive_ids)):
+                    retained.append(event)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError(f"cannot redact event journal: {journal_path}") from error
+    retained.append(deletion_event)
+    return (
+        journal_path,
+        b"".join(
+            json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+            for event in retained
+        ),
+    )
+
+
+def _contains_sensitive_id(value: object, sensitive_ids: frozenset[str]) -> bool:
+    if isinstance(value, str):
+        return value in sensitive_ids
+    if isinstance(value, dict):
+        return any(_contains_sensitive_id(item, sensitive_ids) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_sensitive_id(item, sensitive_ids) for item in value)
+    return False
 
 
 def _validate_content_object(path: Path, body: bytes, digest: str) -> None:

@@ -14,6 +14,9 @@ import uuid
 from myoutbrain.core_types import IntegrityError, WriterLocked
 
 
+PERMANENT_DELETION_CLEANUP = Path("store") / "permanent-deletion-cleanup.json"
+
+
 def atomic_write(path: Path, content: bytes) -> None:
     temporary_path: Path | None = None
     try:
@@ -85,15 +88,120 @@ def _recover_transaction(root: Path, transaction_path: Path) -> None:
 
 def recover_transactions(root: Path) -> None:
     transactions_root = root / "store" / "transactions"
-    if not transactions_root.is_dir():
+    if transactions_root.is_dir():
+        for transaction_path in sorted(transactions_root.iterdir()):
+            if not transaction_path.is_dir():
+                raise IntegrityError(f"unexpected transaction entry: {transaction_path}")
+            if not (transaction_path / "manifest.json").is_file():
+                shutil.rmtree(transaction_path)
+                continue
+            _recover_transaction(root, transaction_path)
+    _recover_permanent_deletion_cleanup(root)
+
+
+def permanent_deletion_cleanup_change(
+    root: Path,
+    *,
+    object_references: tuple[str, ...],
+    view_paths: tuple[str, ...],
+) -> tuple[Path, bytes]:
+    for object_reference in object_references:
+        _deletion_cleanup_target(
+            root / "store" / "objects",
+            object_reference,
+            label="source object",
+        )
+    for view_path in view_paths:
+        _deletion_cleanup_target(
+            root / "vault" / "Knowledge Views",
+            view_path,
+            label="knowledge view",
+            root_relative=True,
+        )
+    return (
+        root / PERMANENT_DELETION_CLEANUP,
+        json_document(
+            {
+                "schema_version": 1,
+                "object_references": list(object_references),
+                "view_paths": list(view_paths),
+                "clear_rebuildable_indexes": True,
+            }
+        ),
+    )
+
+
+def _recover_permanent_deletion_cleanup(root: Path) -> None:
+    manifest_path = root / PERMANENT_DELETION_CLEANUP
+    if not manifest_path.is_file():
         return
-    for transaction_path in sorted(transactions_root.iterdir()):
-        if not transaction_path.is_dir():
-            raise IntegrityError(f"unexpected transaction entry: {transaction_path}")
-        if not (transaction_path / "manifest.json").is_file():
-            shutil.rmtree(transaction_path)
-            continue
-        _recover_transaction(root, transaction_path)
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            raise TypeError
+        object_references = document.get("object_references")
+        view_paths = document.get("view_paths")
+        if (
+            not isinstance(object_references, list)
+            or not all(isinstance(value, str) for value in object_references)
+            or not isinstance(view_paths, list)
+            or not all(isinstance(value, str) for value in view_paths)
+            or document.get("clear_rebuildable_indexes") is not True
+        ):
+            raise TypeError
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError(
+            f"invalid permanent deletion cleanup manifest: {manifest_path}"
+        ) from error
+    for object_reference in object_references:
+        target = _deletion_cleanup_target(
+            root / "store" / "objects",
+            object_reference,
+            label="source object",
+        )
+        target.unlink(missing_ok=True)
+        _remove_empty_directories(target.parent, root / "store" / "objects")
+    for view_path in view_paths:
+        target = _deletion_cleanup_target(
+            root / "vault" / "Knowledge Views",
+            view_path,
+            label="knowledge view",
+            root_relative=True,
+        )
+        target.unlink(missing_ok=True)
+    for index_root in (
+        root / "runtime" / "indexes" / "semantic",
+        root / "runtime" / "indexes" / "fulltext",
+    ):
+        if index_root.exists():
+            shutil.rmtree(index_root)
+    manifest_path.unlink()
+
+
+def _deletion_cleanup_target(
+    allowed_root: Path,
+    value: str,
+    *,
+    label: str,
+    root_relative: bool = False,
+) -> Path:
+    resolved_root = allowed_root.resolve()
+    candidate_root = allowed_root.parents[1] if root_relative else allowed_root
+    candidate = (candidate_root / value).resolve()
+    if candidate == resolved_root or resolved_root not in candidate.parents:
+        raise IntegrityError(f"{label} cleanup path escapes its allowed root")
+    return candidate
+
+
+def _remove_empty_directories(path: Path, stop: Path) -> None:
+    resolved_stop = stop.resolve()
+    current = path.resolve()
+    while current != resolved_stop and resolved_stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def atomic_commit(

@@ -117,10 +117,8 @@ class MemoryGovernanceTests(unittest.TestCase):
                 digest="Project Birch review cadence is weekly.",
                 task="deletion-preview",
             )
-            memory_id = accept_new(
-                instance_root,
-                propose(instance_root, "deletion-preview")["proposal_id"],
-            )
+            proposal = propose(instance_root, "deletion-preview")
+            memory_id = accept_new(instance_root, proposal["proposal_id"])
 
             previewed = run_cli(
                 "delete-memory",
@@ -138,6 +136,11 @@ class MemoryGovernanceTests(unittest.TestCase):
             self.assertEqual(preview["source_ids"], [evidence["source_id"]])
             self.assertEqual(preview["canonical_memory_count"], 1)
             self.assertEqual(preview["scope"], "one-canonical-memory")
+            self.assertEqual(
+                preview["proposal_ids_to_delete"],
+                [proposal["proposal_id"]],
+            )
+            self.assertEqual(len(preview["review_ids_to_delete"]), 1)
             self.assertRegex(
                 preview["confirmation_token"],
                 r"^delete_[0-9a-f]{64}$",
@@ -212,10 +215,8 @@ class MemoryGovernanceTests(unittest.TestCase):
             )
             self.assertEqual(remembered.returncode, 0, remembered.stderr)
             receipt = json.loads(remembered.stdout)
-            memory_id = accept_new(
-                instance_root,
-                propose(instance_root, "delete-elm")["proposal_id"],
-            )
+            proposal = propose(instance_root, "delete-elm")
+            memory_id = accept_new(instance_root, proposal["proposal_id"])
             built = run_cli(
                 "build-views",
                 "--root",
@@ -305,6 +306,23 @@ class MemoryGovernanceTests(unittest.TestCase):
                 if path.is_file()
             ]
             self.assertEqual(object_files, [])
+            journal = (
+                instance_root / "store" / "journal" / "events.jsonl"
+            ).read_text(encoding="utf-8")
+            for removed_identity in (
+                memory_id,
+                receipt["source_id"],
+                receipt["experience_id"],
+                receipt["digest_id"],
+                proposal["proposal_id"],
+            ):
+                self.assertNotIn(removed_identity, journal)
+            self.assertNotIn(secret_text, journal)
+            self.assertIn("memory.permanently-deleted", journal)
+            self.assertIn(
+                "external-backups-must-be-rotated-or-deleted-by-owner",
+                deletion["existing_backup_clearance"],
+            )
 
     def test_permanent_deletion_retains_a_source_shared_by_another_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -332,9 +350,10 @@ class MemoryGovernanceTests(unittest.TestCase):
                 digest="The sourdough starter is fed at dawn.",
                 task="shared-second",
             )
+            second_proposal = propose(instance_root, "shared-second")
             second_memory_id = accept_new(
                 instance_root,
-                propose(instance_root, "shared-second")["proposal_id"],
+                second_proposal["proposal_id"],
             )
             database_path = instance_root / "store" / "memory.sqlite3"
             with closing(sqlite3.connect(database_path)) as connection:
@@ -352,6 +371,14 @@ class MemoryGovernanceTests(unittest.TestCase):
                     VALUES (?, 1, ?)
                     """,
                     (second_memory_id, first["source_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO integration_proposal_related
+                        (proposal_id, memory_id)
+                    VALUES (?, ?)
+                    """,
+                    (second_proposal["proposal_id"], first_memory_id),
                 )
                 object_reference = connection.execute(
                     "SELECT object_reference FROM source_objects WHERE source_id = ?",
@@ -423,6 +450,106 @@ class MemoryGovernanceTests(unittest.TestCase):
                     for review in json.loads(history.stdout)["reviews"]
                 },
             )
+
+    def test_interrupted_permanent_deletion_resumes_file_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="resumable-delete",
+                digest="Resumable deletion phrase is amber compass.",
+                task="resumable-delete",
+            )
+            memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "resumable-delete")["proposal_id"],
+            )
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            view_path = instance_root / json.loads(built.stdout)["view_paths"][0]
+            index_path = (
+                instance_root
+                / "runtime"
+                / "indexes"
+                / "fulltext"
+                / "stale.json"
+            )
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            index_path.write_text("stale", encoding="utf-8")
+            object_path = next(
+                path
+                for path in (instance_root / "store" / "objects").rglob("*")
+                if path.is_file()
+            )
+            previewed = run_cli(
+                "delete-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            token = json.loads(previewed.stdout)["confirmation_token"]
+
+            interrupted = run_cli(
+                "delete-memory",
+                memory_id,
+                "--confirm",
+                token,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_FAULT_INJECTION": (
+                        "permanent-deletion-before-cleanup"
+                    )
+                },
+            )
+
+            cleanup_manifest = (
+                instance_root / "store" / "permanent-deletion-cleanup.json"
+            )
+            self.assertEqual(interrupted.returncode, 86)
+            self.assertTrue(cleanup_manifest.is_file())
+            self.assertTrue(object_path.is_file())
+            self.assertTrue(view_path.is_file())
+            self.assertTrue(index_path.is_file())
+
+            recovered = run_cli(
+                "recall",
+                "amber compass",
+                "--root",
+                str(instance_root),
+                "--task",
+                "recover-delete",
+                "--access",
+                "local-trusted",
+                "--memory-id",
+                memory_id,
+                "--source-id",
+                str(receipt["source_id"]),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertEqual(json.loads(recovered.stdout)["items"], [])
+            self.assertFalse(cleanup_manifest.exists())
+            self.assertFalse(object_path.exists())
+            self.assertFalse(view_path.exists())
+            self.assertFalse(index_path.exists())
 
     def test_storage_report_separates_durable_and_rebuildable_tiers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

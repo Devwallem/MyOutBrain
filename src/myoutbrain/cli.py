@@ -850,6 +850,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     f"Permanently deleted {deletion.memory_id}; removed "
                     f"{len(deletion.removed_source_ids)} unshared source(s)."
                 )
+                print(
+                    "Future backups exclude the deletion from "
+                    f"{deletion.backup_exclusion_after}."
+                )
+                print(
+                    "Existing backups: rotate or delete them explicitly; "
+                    "MyOutBrain does not manage their clearance."
+                )
             return 0
         if parsed_arguments.command == "storage-report":
             storage_report = LocalMemoryCore(parsed_arguments.root).storage_report()
