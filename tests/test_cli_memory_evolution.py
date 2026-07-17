@@ -204,6 +204,14 @@ class CanonicalMemoryEvolutionTests(unittest.TestCase):
                 "--root",
                 str(instance_root),
             )
+            review_history = run_cli(
+                "review-memory",
+                "--history",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
 
             self.assertEqual(revised.returncode, 0, revised.stderr)
             decision = json.loads(revised.stdout)
@@ -230,6 +238,11 @@ class CanonicalMemoryEvolutionTests(unittest.TestCase):
             self.assertEqual(old_version["source_ids"], [original["source_id"]])
             self.assertEqual(current_version["status"], "current")
             self.assertEqual(current_version["action"], "revised")
+            self.assertEqual(review_history.returncode, 0, review_history.stderr)
+            self.assertEqual(
+                json.loads(review_history.stdout)["reviews"][-1]["action"],
+                "revised",
+            )
             self.assertEqual(why_text.returncode, 0, why_text.stderr)
             self.assertIn("Confirmation: confirmed", why_text.stdout)
             self.assertIn("Current version: 2", why_text.stdout)
