@@ -26,7 +26,7 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 1
+MEMORY_SCHEMA_VERSION = 2
 MEMORY_DATABASE = "store/memory.sqlite3"
 
 
@@ -65,8 +65,16 @@ CREATE TABLE canonical_memories (
     memory_id TEXT PRIMARY KEY,
     content TEXT NOT NULL,
     current_version INTEGER NOT NULL,
+    sensitivity TEXT NOT NULL CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+    state TEXT NOT NULL CHECK (state IN ('active', 'inactive')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE canonical_memory_sources (
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+    PRIMARY KEY (memory_id, source_id)
 );
 
 CREATE TABLE memory_events (
@@ -173,6 +181,10 @@ class LocalMemoryCore:
         with writer_lock(self._root):
             recover_transactions(self._root)
             if database_path.exists():
+                version = self._database_version(database_path)
+                if version == 1:
+                    migrated = self._migrate_v1_database(database_path)
+                    atomic_commit(self._root, [(database_path, migrated)])
                 self._validate_database(database_path)
                 return
             database_content = self._new_database_content(database_path.parent)
@@ -468,6 +480,58 @@ class LocalMemoryCore:
             )
         if integrity_row != ("ok",):
             raise IntegrityError(f"local memory database is corrupt: {database_path}")
+
+    @staticmethod
+    def _database_version(database_path: Path) -> int:
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                row = connection.execute("PRAGMA user_version").fetchone()
+        except sqlite3.Error as error:
+            raise IntegrityError(
+                f"cannot read local memory database version: {database_path}"
+            ) from error
+        if row is None or not isinstance(row[0], int):
+            raise IntegrityError(f"local memory database has no schema version: {database_path}")
+        return row[0]
+
+    @staticmethod
+    def _migrate_v1_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    ALTER TABLE canonical_memories
+                    ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'local-only'
+                    CHECK (sensitivity IN ('local-only', 'cloud-allowed'));
+                    ALTER TABLE canonical_memories
+                    ADD COLUMN state TEXT NOT NULL DEFAULT 'active'
+                    CHECK (state IN ('active', 'inactive'));
+                    CREATE TABLE canonical_memory_sources (
+                        memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+                        source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+                        PRIMARY KEY (memory_id, source_id)
+                    );
+                    """
+                )
+                connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 def _read_conversation(conversation_path: Path) -> bytes:

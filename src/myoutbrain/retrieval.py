@@ -52,9 +52,9 @@ class LexicalNoEmbeddingsRetriever:
         question: str,
         evidence: Sequence[RetrievalEvidence],
     ) -> RetrievalDecision:
-        question_terms = _terms(question)
+        question_terms = lexical_terms(question)
         scores = {
-            item.evidence_id: len(question_terms & _terms(item.text))
+            item.evidence_id: len(question_terms & lexical_terms(item.text))
             for item in evidence
             if item.state is EvidenceState.ACTIVE
         }
@@ -95,7 +95,7 @@ _STOP_WORDS = frozenset(
 _HAN_RUN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
 
-def _terms(text: str) -> frozenset[str]:
+def lexical_terms(text: str) -> frozenset[str]:
     normalized = text.casefold()
     han_runs = _HAN_RUN.findall(normalized)
     word_terms = {

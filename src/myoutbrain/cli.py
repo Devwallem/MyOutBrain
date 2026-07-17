@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -23,6 +24,12 @@ from myoutbrain.core_types import (
 from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.generation import ProviderFailure
 from myoutbrain.local_core import LocalMemoryCore
+from myoutbrain.memory_gateway import (
+    MemoryAccess,
+    MemoryGateway,
+    QueryPurpose,
+    RecallRequest,
+)
 
 
 EXIT_USER = 2
@@ -68,6 +75,27 @@ def build_parser() -> argparse.ArgumentParser:
     remember_parser.add_argument("--visible-context", required=True)
     remember_parser.add_argument("--context-gap", action="append", required=True)
     remember_parser.add_argument("--format", choices=("json", "text"), default="text")
+    recall_parser = subcommands.add_parser(
+        "recall",
+        help="Request a task-scoped memory evidence package",
+    )
+    recall_parser.add_argument("query")
+    recall_parser.add_argument("--root", type=Path, default=Path.cwd())
+    recall_parser.add_argument("--task", required=True)
+    recall_parser.add_argument(
+        "--access",
+        choices=tuple(level.value for level in MemoryAccess),
+        default=MemoryAccess.TASK_SCOPED.value,
+    )
+    recall_parser.add_argument(
+        "--purpose",
+        choices=tuple(purpose.value for purpose in QueryPurpose),
+        default=QueryPurpose.SUBSTANTIVE.value,
+    )
+    recall_parser.add_argument("--memory-id", action="append", default=[])
+    recall_parser.add_argument("--source-id", action="append", default=[])
+    recall_parser.add_argument("--limit", type=int, default=5)
+    recall_parser.add_argument("--format", choices=("json", "text"), default="text")
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
     ask_parser.add_argument("source_id")
     ask_parser.add_argument("question")
@@ -162,13 +190,49 @@ def _remember(
         context_gaps=tuple(context_gaps),
     )
     if output_format == "json":
-        import json
-
         print(json.dumps(receipt.to_data(), ensure_ascii=False, sort_keys=True))
     elif receipt.disposition == "duplicate":
         print(f"Already buffered memory {receipt.digest_id} from {receipt.experience_id}")
     else:
         print(f"Buffered memory {receipt.digest_id} from {receipt.experience_id}")
+    return 0
+
+
+def _recall(
+    root: Path,
+    query: str,
+    *,
+    task: str,
+    access: str,
+    purpose: str,
+    memory_ids: Sequence[str],
+    source_ids: Sequence[str],
+    limit: int,
+    output_format: str,
+) -> int:
+    package = MemoryGateway(root).recall(
+        RecallRequest(
+            query=query,
+            task=task,
+            access=MemoryAccess(access),
+            purpose=QueryPurpose(purpose),
+            memory_ids=tuple(memory_ids),
+            source_ids=tuple(source_ids),
+            limit=limit,
+        )
+    )
+    if output_format == "json":
+        print(json.dumps(package.to_data(), ensure_ascii=False, sort_keys=True))
+        return 0
+    if not package.retrieval_performed:
+        print("Memory retrieval skipped: this query does not require evidence.")
+        return 0
+    print(f"Answerability: {package.answerability.value}")
+    for item in package.items:
+        print(
+            f"{item.memory_id} ({item.memory_state.value}, {item.match.value}): "
+            f"{item.content}"
+        )
     return 0
 
 
@@ -290,6 +354,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 context_gaps=parsed_arguments.context_gap,
                 output_format=parsed_arguments.format,
             )
+        if parsed_arguments.command == "recall":
+            return _recall(
+                parsed_arguments.root,
+                parsed_arguments.query,
+                task=parsed_arguments.task,
+                access=parsed_arguments.access,
+                purpose=parsed_arguments.purpose,
+                memory_ids=parsed_arguments.memory_id,
+                source_ids=parsed_arguments.source_id,
+                limit=parsed_arguments.limit,
+                output_format=parsed_arguments.format,
+            )
         if parsed_arguments.command == "ask":
             return _ask(
                 parsed_arguments.root,
@@ -368,6 +444,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         operation = {
             "capture": "Capture",
             "remember": "Memory capture",
+            "recall": "Memory recall",
             "evaluate-recall": "Evaluation",
         }.get(parsed_arguments.command, "Initialization")
         print(f"{operation} failed: {error}", file=sys.stderr)
