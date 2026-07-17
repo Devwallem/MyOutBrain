@@ -135,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     answer_parser.add_argument("--source-id", action="append", default=[])
     answer_parser.add_argument("--limit", type=int, default=5)
     answer_parser.add_argument("--high-risk", action="store_true")
+    answer_parser.add_argument(
+        "--force-consolidation",
+        action="store_true",
+        help="Prepare task-related buffered memory proposals before this answer",
+    )
     answer_parser.add_argument("--time-sensitive", action="store_true")
     answer_parser.add_argument(
         "--risk-level",
@@ -254,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pending_reviews_parser.add_argument("--root", type=Path, default=Path.cwd())
     pending_reviews_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    retry_notifications_parser = subcommands.add_parser(
+        "retry-consolidation-notifications",
+        help="Retry durable local notifications that were not delivered",
+    )
+    retry_notifications_parser.add_argument("--root", type=Path, default=Path.cwd())
+    retry_notifications_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     memory_review_parser = subcommands.add_parser(
@@ -496,6 +509,7 @@ def _answer(
     source_ids: Sequence[str],
     limit: int,
     high_risk: bool,
+    force_consolidation: bool,
     time_sensitive: bool,
     risk_level: RiskLevel,
     freshness: FreshnessRequirement,
@@ -504,6 +518,9 @@ def _answer(
     query_sensitivity: Sensitivity,
     output_format: str,
 ) -> int:
+    forced_proposals: tuple[IntegrationProposal, ...] = ()
+    if force_consolidation:
+        forced_proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
     result = CompanionAnswerService(root).answer(
         AnswerRequest(
             question=question,
@@ -520,8 +537,23 @@ def _answer(
         )
     )
     if output_format == "json":
-        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+        data = result.to_data()
+        if force_consolidation:
+            data["forced_consolidation"] = {
+                "trigger": "forced",
+                "scope": "task-related",
+                "canonical_changes": 0,
+                "proposal_ids": [
+                    proposal.proposal_id for proposal in forced_proposals
+                ],
+            }
+        print(json.dumps(data, ensure_ascii=False, sort_keys=True))
         return 0
+    if force_consolidation:
+        print(
+            "Forced consolidation prepared proposals before answering: "
+            + (", ".join(proposal.proposal_id for proposal in forced_proposals) or "none")
+        )
     if result.status == "unknown":
         print("The answer remains unknown.")
         for fact in result.verified_facts:
@@ -583,6 +615,8 @@ def _render_integration_proposals(
     output_format: str,
     trigger: str = "manual",
     delivery: str | None = None,
+    run_id: str | None = None,
+    notification_status: str | None = None,
 ) -> int:
     proposal_data = [proposal.to_data() for proposal in proposals]
     if output_format == "json":
@@ -594,6 +628,8 @@ def _render_integration_proposals(
                     "scope": "task-related",
                     "delivery": delivery,
                     "canonical_changes": 0,
+                    "run_id": run_id,
+                    "notification_status": notification_status,
                 }
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -649,6 +685,12 @@ def _consolidate(
             "--conversation-state is only valid with forced consolidation"
         )
     proposals = LocalMemoryCore(root).propose_manual_consolidation(task)
+    run_id: str | None = None
+    notification_status: str | None = None
+    if force and conversation_state == "inactive":
+        run_id, notification_status = ConsolidationScheduler(
+            root
+        ).queue_forced_review(proposals)
     return _render_integration_proposals(
         proposals,
         output_format=output_format,
@@ -660,6 +702,8 @@ def _consolidate(
             if conversation_state == "inactive"
             else None
         ),
+        run_id=run_id,
+        notification_status=notification_status,
     )
 
 
@@ -925,6 +969,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 source_ids=parsed_arguments.source_id,
                 limit=parsed_arguments.limit,
                 high_risk=parsed_arguments.high_risk,
+                force_consolidation=parsed_arguments.force_consolidation,
                 time_sensitive=parsed_arguments.time_sensitive,
                 risk_level=parsed_arguments.risk_level,
                 freshness=parsed_arguments.freshness,
@@ -1000,6 +1045,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _render_simple_data(
                 {"pending_reviews": list(pending_reviews)},
                 parsed_arguments.format,
+            )
+        if parsed_arguments.command == "retry-consolidation-notifications":
+            retried = ConsolidationScheduler(
+                parsed_arguments.root
+            ).retry_pending_notifications()
+            return _render_simple_data(
+                {"notifications": list(retried)}, parsed_arguments.format
             )
         if parsed_arguments.command == "review-memory":
             return _review_memory(

@@ -11,6 +11,12 @@ from urllib import request as url_request
 class ProviderFailure(Exception):
     """Raised when a generation provider cannot return a valid answer."""
 
+    def __init__(
+        self, message: str, *, usage: ProviderUsage | None = None
+    ) -> None:
+        super().__init__(message)
+        self.usage = usage
+
 
 @dataclass(frozen=True)
 class Citation:
@@ -98,6 +104,30 @@ class GeneratedCandidate:
 class GeneratedReflection:
     candidates: tuple[GeneratedCandidate, ...]
     insufficient_evidence: bool
+    usage: ProviderUsage | None = None
+
+
+@dataclass(frozen=True)
+class ProviderUsage:
+    input_tokens: int
+    output_tokens: int
+
+
+def _reported_usage(value: object) -> ProviderUsage | None:
+    if not isinstance(value, dict):
+        return None
+    input_tokens = value.get("input_tokens")
+    output_tokens = value.get("output_tokens")
+    if (
+        not isinstance(input_tokens, int)
+        or isinstance(input_tokens, bool)
+        or input_tokens < 0
+        or not isinstance(output_tokens, int)
+        or isinstance(output_tokens, bool)
+        or output_tokens < 0
+    ):
+        return None
+    return ProviderUsage(input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 class GenerationProvider(Protocol):
@@ -107,6 +137,8 @@ class GenerationProvider(Protocol):
     def generate(self, request: GenerationRequest) -> GeneratedAnswer: ...
 
     def reflect(self, request: GenerationRequest) -> GeneratedReflection: ...
+
+    def reflection_input_token_upper_bound(self, request: GenerationRequest) -> int: ...
 
 
 class FakeGenerationProvider:
@@ -135,7 +167,17 @@ class FakeGenerationProvider:
         try:
             return _parse_generated_reflection(response)
         except (KeyError, TypeError) as error:
-            raise ProviderFailure("fake provider returned an invalid result") from error
+            usage = (
+                _reported_usage(response.get("usage"))
+                if isinstance(response, dict)
+                else None
+            )
+            raise ProviderFailure(
+                "fake provider returned an invalid result", usage=usage
+            ) from error
+
+    def reflection_input_token_upper_bound(self, request: GenerationRequest) -> int:
+        return len(json.dumps(request.to_data(), ensure_ascii=False).encode("utf-8"))
 
     def _load_response(
         self,
@@ -206,7 +248,148 @@ class OpenAIGenerationProvider:
             raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
 
     def reflect(self, request: GenerationRequest) -> GeneratedReflection:
-        citation_schema = {
+        format_name, instructions, schema = _reflection_contract()
+        response = self._request_structured(
+            request,
+            format_name=format_name,
+            instructions=instructions,
+            schema=schema,
+        )
+        try:
+            return _parse_generated_reflection(response)
+        except (KeyError, TypeError) as error:
+            usage = (
+                _reported_usage(response.get("_provider_usage"))
+                if isinstance(response, dict)
+                else None
+            )
+            raise ProviderFailure(
+                "OpenAI Responses API returned an invalid result", usage=usage
+            ) from error
+
+    def reflection_input_token_upper_bound(self, request: GenerationRequest) -> int:
+        format_name, instructions, schema = _reflection_contract()
+        body = self._structured_request_body(
+            request,
+            format_name=format_name,
+            instructions=instructions,
+            schema=schema,
+        )
+        # UTF-8 bytes conservatively upper-bound the number of model input tokens.
+        return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+    def _structured_request_body(
+        self,
+        request: GenerationRequest,
+        *,
+        format_name: str,
+        instructions: str,
+        schema: dict[str, object],
+    ) -> dict[str, object]:
+        body: dict[str, object] = {
+            "model": self.model,
+            "store": False,
+            "instructions": instructions,
+            "input": json.dumps(request.to_data(), ensure_ascii=False),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": format_name,
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+        }
+        if request.max_output_tokens is not None:
+            body["max_output_tokens"] = request.max_output_tokens
+        return body
+
+    def _request_structured(
+        self,
+        request: GenerationRequest,
+        *,
+        format_name: str,
+        instructions: str,
+        schema: dict[str, object],
+    ) -> object:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key is None or not api_key.strip():
+            raise ProviderFailure("OPENAI_API_KEY is not configured")
+        base_url = os.environ.get("MYOUTBRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1")
+        endpoint = f"{base_url.rstrip('/')}/responses"
+        body = self._structured_request_body(
+            request,
+            format_name=format_name,
+            instructions=instructions,
+            schema=schema,
+        )
+        api_request = url_request.Request(
+            endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with url_request.urlopen(api_request, timeout=30) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except url_error.HTTPError as error:
+            raise ProviderFailure("OpenAI Responses API rejected the request") from error
+        except (url_error.URLError, TimeoutError) as error:
+            raise ProviderFailure("OpenAI Responses API timeout or connection failure") from error
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ProviderFailure("OpenAI Responses API returned invalid JSON") from error
+
+        reported_usage: ProviderUsage | None = None
+        try:
+            if not isinstance(response_data, dict):
+                raise TypeError("response is not an object")
+            usage = response_data.get("usage")
+            reported_usage = _reported_usage(usage)
+            output = response_data["output"]
+            if not isinstance(output, list):
+                raise TypeError("output is not a list")
+            for output_item in output:
+                if not isinstance(output_item, dict):
+                    continue
+                content = output_item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for content_item in content:
+                    if not isinstance(content_item, dict):
+                        continue
+                    if content_item.get("type") == "refusal":
+                        raise ProviderFailure(
+                            "OpenAI Responses API refused the request",
+                            usage=reported_usage,
+                        )
+                    if content_item.get("type") != "output_text":
+                        continue
+                    output_text = content_item.get("text")
+                    if not isinstance(output_text, str):
+                        raise TypeError("output text is invalid")
+                    parsed = json.loads(output_text)
+                    if not isinstance(parsed, dict):
+                        raise TypeError("output text is not an object")
+                    if usage is not None:
+                        parsed["_provider_usage"] = usage
+                    return parsed
+        except ProviderFailure:
+            raise
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ProviderFailure(
+                "OpenAI Responses API returned an invalid result",
+                usage=reported_usage,
+            ) from error
+        raise ProviderFailure(
+            "OpenAI Responses API returned no result", usage=reported_usage
+        )
+
+
+def _reflection_contract() -> tuple[str, str, dict[str, object]]:
+    citation_schema = {
             "type": "object",
             "properties": {
                 "source_id": {"type": "string"},
@@ -215,7 +398,7 @@ class OpenAIGenerationProvider:
             "required": ["source_id", "locator"],
             "additionalProperties": False,
         }
-        schema = {
+    schema: dict[str, object] = {
             "type": "object",
             "properties": {
                 "candidates": {
@@ -248,97 +431,15 @@ class OpenAIGenerationProvider:
             "required": ["candidates", "insufficient_evidence"],
             "additionalProperties": False,
         }
-        response = self._request_structured(
-            request,
-            format_name="grounded_reflection",
-            instructions=(
-                "Propose candidate insights only from the supplied evidence package. Include "
-                "supporting evidence, contrary evidence when present, and a derivation summary. "
-                "If the evidence cannot support a candidate, set insufficient_evidence to true."
-            ),
-            schema=schema,
-        )
-        try:
-            return _parse_generated_reflection(response)
-        except (KeyError, TypeError) as error:
-            raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
-
-    def _request_structured(
-        self,
-        request: GenerationRequest,
-        *,
-        format_name: str,
-        instructions: str,
-        schema: dict[str, object],
-    ) -> object:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key is None or not api_key.strip():
-            raise ProviderFailure("OPENAI_API_KEY is not configured")
-        base_url = os.environ.get("MYOUTBRAIN_OPENAI_BASE_URL", "https://api.openai.com/v1")
-        endpoint = f"{base_url.rstrip('/')}/responses"
-        body = {
-            "model": self.model,
-            "store": False,
-            "instructions": instructions,
-            "input": json.dumps(request.to_data(), ensure_ascii=False),
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": format_name,
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-        }
-        if request.max_output_tokens is not None:
-            body["max_output_tokens"] = request.max_output_tokens
-        api_request = url_request.Request(
-            endpoint,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with url_request.urlopen(api_request, timeout=30) as response:
-                response_data = json.loads(response.read().decode("utf-8"))
-        except url_error.HTTPError as error:
-            raise ProviderFailure("OpenAI Responses API rejected the request") from error
-        except (url_error.URLError, TimeoutError) as error:
-            raise ProviderFailure("OpenAI Responses API timeout or connection failure") from error
-        except (UnicodeError, json.JSONDecodeError) as error:
-            raise ProviderFailure("OpenAI Responses API returned invalid JSON") from error
-
-        try:
-            if not isinstance(response_data, dict):
-                raise TypeError("response is not an object")
-            output = response_data["output"]
-            if not isinstance(output, list):
-                raise TypeError("output is not a list")
-            for output_item in output:
-                if not isinstance(output_item, dict):
-                    continue
-                content = output_item.get("content")
-                if not isinstance(content, list):
-                    continue
-                for content_item in content:
-                    if not isinstance(content_item, dict):
-                        continue
-                    if content_item.get("type") == "refusal":
-                        raise ProviderFailure("OpenAI Responses API refused the request")
-                    if content_item.get("type") != "output_text":
-                        continue
-                    output_text = content_item.get("text")
-                    if not isinstance(output_text, str):
-                        raise TypeError("output text is invalid")
-                    return json.loads(output_text)
-        except ProviderFailure:
-            raise
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ProviderFailure("OpenAI Responses API returned an invalid result") from error
-        raise ProviderFailure("OpenAI Responses API returned no result")
+    return (
+        "grounded_reflection",
+        (
+            "Propose candidate insights only from the supplied evidence package. Include "
+            "supporting evidence, contrary evidence when present, and a derivation summary. "
+            "If the evidence cannot support a candidate, set insufficient_evidence to true."
+        ),
+        schema,
+    )
 
 
 def _parse_generated_answer(response: object) -> GeneratedAnswer:
@@ -429,9 +530,30 @@ def _parse_generated_reflection(response: object) -> GeneratedReflection:
         )
     if not insufficient_evidence and not candidates:
         raise TypeError("supported reflection must contain at least one candidate")
+    usage_data = response.get("usage", response.get("_provider_usage"))
+    usage: ProviderUsage | None = None
+    if usage_data is not None:
+        if not isinstance(usage_data, dict):
+            raise TypeError("provider usage must be an object")
+        input_tokens = usage_data.get("input_tokens")
+        output_tokens = usage_data.get("output_tokens")
+        if (
+            not isinstance(input_tokens, int)
+            or isinstance(input_tokens, bool)
+            or input_tokens < 0
+            or not isinstance(output_tokens, int)
+            or isinstance(output_tokens, bool)
+            or output_tokens < 0
+        ):
+            raise TypeError("provider usage token counts are invalid")
+        usage = ProviderUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
     return GeneratedReflection(
         candidates=tuple(candidates),
         insufficient_evidence=insufficient_evidence,
+        usage=usage,
     )
 
 

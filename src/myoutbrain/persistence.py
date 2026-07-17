@@ -256,8 +256,8 @@ def atomic_commit(
 
 
 @contextmanager
-def writer_lock(root: Path) -> Iterator[None]:
-    lock_path = root / ".myoutbrain.lock"
+def operation_lock(root: Path, name: str) -> Iterator[None]:
+    lock_path = root / name
     lock_descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR)
     try:
         if os.fstat(lock_descriptor).st_size == 0:
@@ -278,6 +278,12 @@ def writer_lock(root: Path) -> Iterator[None]:
         except OSError:
             pass
         os.close(lock_descriptor)
+
+
+@contextmanager
+def writer_lock(root: Path) -> Iterator[None]:
+    with operation_lock(root, ".myoutbrain.lock"):
+        yield
 
 
 def hold_writer_lock_for_acceptance_test() -> None:

@@ -1008,6 +1008,17 @@ class LocalMemoryCore:
             except sqlite3.Error as error:
                 raise IntegrityError("cannot select memory for consolidation") from error
             if not rows:
+                if normalized_digest_ids is not None:
+                    requested = frozenset(normalized_digest_ids)
+                    return tuple(
+                        proposal
+                        for proposal in self._query_integration_proposals(
+                            database_path,
+                            status="pending",
+                            topic=normalized_task,
+                        )
+                        if frozenset(proposal.evidence_memory_ids) == requested
+                    )
                 return self._query_integration_proposals(
                     database_path,
                     status="pending",
@@ -1980,6 +1991,35 @@ class LocalMemoryCore:
             return self._query_integration_proposals(
                 database_path,
                 status="pending",
+            )
+
+    def pending_proposals_for_digests(
+        self, task: str, digest_ids: tuple[str, ...]
+    ) -> tuple[IntegrationProposal, ...]:
+        normalized_task = _required_text("consolidation task", task)
+        normalized_ids = tuple(
+            _required_text("memory digest", digest_id)
+            for digest_id in digest_ids
+        )
+        if not normalized_ids:
+            return ()
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            requested = frozenset(normalized_ids)
+            return tuple(
+                proposal
+                for proposal in self._query_integration_proposals(
+                    database_path,
+                    status="pending",
+                    topic=normalized_task,
+                )
+                if frozenset(proposal.evidence_memory_ids) == requested
             )
 
     @staticmethod

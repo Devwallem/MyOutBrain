@@ -19,12 +19,18 @@ class NotificationFailure(Exception):
 
 @dataclass(frozen=True)
 class LocalNotification:
+    notification_id: str
     title: str
     body: str
     action: str
 
     def to_data(self) -> dict[str, str]:
-        return {"title": self.title, "body": self.body, "action": self.action}
+        return {
+            "notification_id": self.notification_id,
+            "title": self.title,
+            "body": self.body,
+            "action": self.action,
+        }
 
 
 class LocalNotifier(Protocol):
@@ -58,6 +64,8 @@ class WindowsLocalNotifier:
             "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument;"
             f"$xml.LoadXml({json.dumps(xml)});"
             "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);"
+            f"$toast.Tag={json.dumps(notification.notification_id[:64])};"
+            "$toast.Group='MyOutBrain';"
             "[Windows.UI.Notifications.ToastNotificationManager]::"
             "CreateToastNotifier('MyOutBrain').Show($toast)"
         )

@@ -106,6 +106,7 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                 "standard",
                 "--freshness",
                 "stable",
+                "--force-consolidation",
                 "--format",
                 "json",
                 environment={
@@ -121,6 +122,13 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(result["status"], "answered")
             self.assertEqual(result["answerability"], "sufficient")
             self.assertFalse(result["public_search_performed"])
+            self.assertEqual(
+                result["forced_consolidation"]["canonical_changes"], 0
+            )
+            self.assertEqual(
+                result["forced_consolidation"]["scope"], "task-related"
+            )
+            self.assertEqual(len(result["forced_consolidation"]["proposal_ids"]), 1)
             self.assertIsNone(result["public_query"])
             self.assertEqual(
                 result["claims"],

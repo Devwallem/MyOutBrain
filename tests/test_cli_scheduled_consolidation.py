@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+from myoutbrain.consolidation import ConsolidationScheduler
+from myoutbrain.core_types import WriterLocked
+from myoutbrain.generation import (
+    Citation,
+    GeneratedCandidate,
+    GeneratedReflection,
+    GenerationRequest,
+    ProviderUsage,
+)
+from myoutbrain.local_core import LocalMemoryCore
 from tests.cli_support import run_cli
 from tests.test_cli_consolidate import remember_digest
 
@@ -259,6 +271,7 @@ class ScheduledConsolidationTests(unittest.TestCase):
                 "Remote analysis proposes the shareable launch correction."
             )
             response = {
+                "usage": {"input_tokens": 120, "output_tokens": 40},
                 "candidates": [
                     {
                         "text": candidate_text,
@@ -315,6 +328,20 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(recorded["purpose"], "scheduled-consolidation")
             self.assertLessEqual(recorded["max_output_tokens"], 2000)
             self.assertEqual(recorded["max_cost_usd"], 0.01)
+            state = json.loads(
+                (instance_root / "store" / "scheduled-consolidation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            external_call = next(iter(state["external_calls"].values()))
+            self.assertEqual(external_call["purpose"], "scheduled-consolidation")
+            self.assertEqual(
+                external_call["evidence_memory_ids"], [shareable["digest_id"]]
+            )
+            self.assertEqual(external_call["input_tokens"], 120)
+            self.assertEqual(external_call["output_tokens"], 40)
+            self.assertEqual(external_call["actual_cost_usd"], 0.0002)
+            self.assertEqual(external_call["result"], "proposed")
 
     def test_explicit_local_schedule_runs_when_due_and_only_creates_proposals(
         self,
@@ -510,8 +537,37 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertTrue(request_path.is_file())
             request_path.unlink()
 
+            rejected_response = {
+                "usage": {"input_tokens": 110, "output_tokens": 35},
+                "candidates": [
+                    {
+                        "text": "This response cites outside the authorized batch.",
+                        "supporting_evidence": [
+                            {
+                                "source_id": "mem_outside_batch",
+                                "locator": "memory-buffer",
+                            }
+                        ],
+                        "contrary_evidence": [],
+                        "derivation": "Invalid evidence provenance.",
+                    }
+                ],
+                "insufficient_evidence": False,
+            }
+            rejected = run_cli(
+                *run_arguments,
+                environment={
+                    "MYOUTBRAIN_FAKE_REFLECTION_RESPONSE": json.dumps(
+                        rejected_response
+                    )
+                },
+            )
+            self.assertEqual(rejected.returncode, 6)
+            self.assertIn("outside its batch", rejected.stderr)
+
             candidate_text = "Retry succeeded without committing canonical memory."
             response = {
+                "usage": {"input_tokens": 100, "output_tokens": 30},
                 "candidates": [
                     {
                         "text": candidate_text,
@@ -538,7 +594,7 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(retried.returncode, 0, retried.stderr)
             completed = json.loads(retried.stdout)
             self.assertEqual(completed["status"], "completed")
-            self.assertEqual(completed["attempt_count"], 3)
+            self.assertEqual(completed["attempt_count"], 4)
             self.assertEqual(completed["next_run_at"], "2026-07-21T04:00:00+08:00")
             self.assertEqual(completed["canonical_changes"], 0)
             self.assertEqual(
@@ -552,6 +608,26 @@ class ScheduledConsolidationTests(unittest.TestCase):
                 journal.count("consolidation.schedule-retryable"),
                 2,
             )
+            state = json.loads(
+                (instance_root / "store" / "scheduled-consolidation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            failed_calls = [
+                call
+                for call in state["external_calls"].values()
+                if call["result"] == "failed"
+            ]
+            self.assertEqual(len(failed_calls), 2)
+            timeout_call = next(
+                call for call in failed_calls if "timeout" in call["error"]
+            )
+            self.assertIsNone(timeout_call["actual_cost_usd"])
+            rejected_call = next(
+                call for call in failed_calls if call["input_tokens"] == 110
+            )
+            self.assertEqual(rejected_call["output_tokens"], 35)
+            self.assertEqual(rejected_call["actual_cost_usd"], 0.00018)
 
     def test_offline_completion_queues_review_and_sends_local_notification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -630,6 +706,431 @@ class ScheduledConsolidationTests(unittest.TestCase):
             self.assertEqual(len(queue), 1)
             self.assertEqual(queue[0]["run_id"], run["run_id"])
             self.assertEqual(queue[0]["notification_status"], "delivered")
+            self.assertEqual(
+                queue[0]["notification_id"], notification["notification_id"]
+            )
+
+    def test_forced_offline_review_uses_durable_retryable_notification_outbox(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            remember_digest(
+                temporary_root,
+                instance_root,
+                name="forced-offline",
+                digest="An important offline answer needs this latest correction.",
+                task="important-answer",
+            )
+            forced = run_cli(
+                "consolidate",
+                "--force",
+                "--task",
+                "important-answer",
+                "--conversation-state",
+                "inactive",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+                environment={"MYOUTBRAIN_NOTIFICATION_ADAPTER": "unavailable"},
+            )
+            self.assertEqual(forced.returncode, 0, forced.stderr)
+            forced_result = json.loads(forced.stdout)
+            self.assertEqual(forced_result["notification_status"], "failed")
+            self.assertRegex(forced_result["run_id"], r"^forced_[0-9a-f]{64}$")
+
+            notification_path = temporary_root / "retried-notification.json"
+            retried = run_cli(
+                "retry-consolidation-notifications",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+                environment={
+                    "MYOUTBRAIN_NOTIFICATION_ADAPTER": "recording",
+                    "MYOUTBRAIN_NOTIFICATION_FILE": str(notification_path),
+                },
+            )
+            pending = run_cli(
+                "pending-consolidation-reviews",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            self.assertEqual(
+                json.loads(retried.stdout)["notifications"][0][
+                    "notification_status"
+                ],
+                "delivered",
+            )
+            queue = json.loads(pending.stdout)["pending_reviews"]
+            self.assertEqual(queue[0]["trigger"], "forced")
+            self.assertEqual(queue[0]["notification_status"], "delivered")
+            notification = json.loads(notification_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                notification["notification_id"], queue[0]["notification_id"]
+            )
+
+    def test_crashed_running_attempt_is_resumed_under_the_process_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            remember_digest(
+                temporary_root,
+                instance_root,
+                name="crash-recovery",
+                digest="A crashed scheduled attempt must remain safely retryable.",
+                task="crash-recovery",
+            )
+            due_at = "2026-07-20T06:00:00+08:00"
+            self.assertEqual(
+                run_cli(
+                    "schedule-consolidation",
+                    "crash-recovery",
+                    "--task",
+                    "crash-recovery",
+                    "--run-at",
+                    due_at,
+                    "--every-hours",
+                    "24",
+                    "--mode",
+                    "local",
+                    "--root",
+                    str(instance_root),
+                ).returncode,
+                0,
+            )
+            state_path = instance_root / "store" / "scheduled-consolidation.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            run_id = "run_" + hashlib.sha256(
+                f"crash-recovery:1:{due_at}".encode("utf-8")
+            ).hexdigest()
+            state["runs"][run_id] = {
+                "run_id": run_id,
+                "schedule_id": "crash-recovery",
+                "due_at": due_at,
+                "mode": "local",
+                "status": "running",
+                "attempt_count": 1,
+                "started_at": "2026-07-20T05:59:00+08:00",
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            recovered = run_cli(
+                "run-scheduled-consolidation",
+                "crash-recovery",
+                "--now",
+                due_at,
+                "--conversation-state",
+                "active",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertEqual(json.loads(recovered.stdout)["attempt_count"], 2)
+
+    def test_crash_after_cloud_proposal_persistence_recovers_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="cloud-checkpoint",
+                digest="A persisted proposal must survive scheduler process loss.",
+                task="cloud-checkpoint",
+                sensitivity="cloud-allowed",
+            )
+            scheduler = ConsolidationScheduler(instance_root)
+            scheduler.authorize_cloud(
+                provider="openai",
+                model="gpt-5-mini",
+                allowed_sensitivity="cloud-allowed",
+                batch_size=1,
+                token_limit=3000,
+                cost_limit_usd=0.01,
+                input_cost_per_million_usd=1.0,
+                output_cost_per_million_usd=2.0,
+            )
+            due_at = "2026-07-20T06:30:00+08:00"
+            scheduler.schedule(
+                "cloud-checkpoint",
+                task="cloud-checkpoint",
+                run_at=due_at,
+                every_hours=24,
+                mode="cloud",
+            )
+            persisted = LocalMemoryCore(instance_root).propose_manual_consolidation(
+                "cloud-checkpoint",
+                digest_ids=(str(receipt["digest_id"]),),
+                proposed_understanding="The cloud response had already become a proposal.",
+            )
+            run_id = "run_" + hashlib.sha256(
+                f"cloud-checkpoint:1:{due_at}".encode("utf-8")
+            ).hexdigest()
+            state_path = instance_root / "store" / "scheduled-consolidation.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["runs"][run_id] = {
+                "run_id": run_id,
+                "schedule_id": "cloud-checkpoint",
+                "due_at": due_at,
+                "mode": "cloud",
+                "status": "running",
+                "attempt_count": 1,
+                "started_at": "2026-07-20T06:29:00+08:00",
+            }
+            call_id = f"{run_id}:attempt-1"
+            state["external_calls"][call_id] = {
+                "call_id": call_id,
+                "status": "dispatched",
+                "purpose": "scheduled-consolidation",
+                "provider": "openai",
+                "model": "gpt-5-mini",
+                "authorization_generation": 1,
+                "evidence_memory_ids": [receipt["digest_id"]],
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            scheduler.revoke_cloud()
+
+            recovered = scheduler.run_due(
+                "cloud-checkpoint",
+                now=due_at,
+                conversation_state="active",
+            )
+
+            self.assertEqual(recovered.attempt_count, 2)
+            self.assertEqual(
+                [proposal.proposal_id for proposal in recovered.proposals],
+                [persisted[0].proposal_id],
+            )
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                final_state["external_calls"][call_id]["result"],
+                "interrupted-unknown",
+            )
+
+    def test_inflight_schedule_edit_and_revocation_do_not_get_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="race-safe",
+                digest="An in-flight cloud run must preserve newer user configuration.",
+                task="race-safe",
+                sensitivity="cloud-allowed",
+            )
+            scheduler = ConsolidationScheduler(instance_root)
+            scheduler.authorize_cloud(
+                provider="race-provider",
+                model="race-model",
+                allowed_sensitivity="cloud-allowed",
+                batch_size=1,
+                token_limit=3000,
+                cost_limit_usd=0.01,
+                input_cost_per_million_usd=1.0,
+                output_cost_per_million_usd=2.0,
+            )
+            scheduler.schedule(
+                "race-safe",
+                task="race-safe",
+                run_at="2026-07-20T07:00:00+08:00",
+                every_hours=24,
+                mode="cloud",
+            )
+            digest_id = str(receipt["digest_id"])
+
+            class ReconfiguringProvider:
+                name = "race-provider"
+                model = "race-model"
+
+                def generate(self, request: GenerationRequest) -> object:
+                    raise AssertionError("not used")
+
+                def reflection_input_token_upper_bound(
+                    self, request: GenerationRequest
+                ) -> int:
+                    return len(json.dumps(request.to_data()).encode("utf-8"))
+
+                def reflect(self, request: GenerationRequest) -> GeneratedReflection:
+                    scheduler.schedule(
+                        "race-safe",
+                        task="newer-task",
+                        run_at="2026-07-20T07:00:00+08:00",
+                        every_hours=12,
+                        mode="cloud",
+                    )
+                    scheduler.revoke_cloud()
+                    LocalMemoryCore(instance_root).propose_manual_consolidation(
+                        "race-safe"
+                    )
+                    return GeneratedReflection(
+                        candidates=(
+                            GeneratedCandidate(
+                                text="A bounded proposal from the dispatched batch.",
+                                supporting_evidence=(
+                                    Citation(
+                                        source_id=digest_id,
+                                        locator="memory-buffer",
+                                    ),
+                                ),
+                                contrary_evidence=(),
+                                derivation="The supplied digest supports the proposal.",
+                            ),
+                        ),
+                        insufficient_evidence=False,
+                        usage=ProviderUsage(input_tokens=120, output_tokens=40),
+                    )
+
+            with mock.patch(
+                "myoutbrain.library.configured_generation_provider",
+                return_value=ReconfiguringProvider(),
+            ):
+                completed = scheduler.run_due(
+                    "race-safe",
+                    now="2026-07-20T07:00:00+08:00",
+                    conversation_state="active",
+                )
+
+            state = json.loads(
+                (instance_root / "store" / "scheduled-consolidation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(completed.next_run_at, "2026-07-20T07:00:00+08:00")
+            self.assertEqual(state["schedules"]["race-safe"]["task"], "newer-task")
+            self.assertEqual(state["schedules"]["race-safe"]["every_hours"], 12)
+            self.assertEqual(state["authorization"]["status"], "revoked")
+            replacement_run_id = "run_" + hashlib.sha256(
+                "race-safe:2:2026-07-20T07:00:00+08:00".encode("utf-8")
+            ).hexdigest()
+            self.assertNotEqual(completed.run_id, replacement_run_id)
+            call = next(iter(state["external_calls"].values()))
+            self.assertLess(
+                call["authorization_generation"],
+                state["authorization"]["generation"],
+            )
+            self.assertEqual(call["result"], "proposed")
+
+    def test_post_response_writer_contention_keeps_usage_and_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            receipt = remember_digest(
+                temporary_root,
+                instance_root,
+                name="post-response-lock",
+                digest="Usage survives local contention after a paid response.",
+                task="post-response-lock",
+                sensitivity="cloud-allowed",
+            )
+            digest_id = str(receipt["digest_id"])
+            scheduler = ConsolidationScheduler(instance_root)
+            scheduler.authorize_cloud(
+                provider="usage-provider",
+                model="usage-model",
+                allowed_sensitivity="cloud-allowed",
+                batch_size=1,
+                token_limit=3000,
+                cost_limit_usd=0.01,
+                input_cost_per_million_usd=1.0,
+                output_cost_per_million_usd=2.0,
+            )
+            scheduler.schedule(
+                "post-response-lock",
+                task="post-response-lock",
+                run_at="2026-07-20T08:00:00+08:00",
+                every_hours=24,
+                mode="cloud",
+            )
+
+            class UsageProvider:
+                name = "usage-provider"
+                model = "usage-model"
+
+                def generate(self, request: GenerationRequest) -> object:
+                    raise AssertionError("not used")
+
+                def reflection_input_token_upper_bound(
+                    self, request: GenerationRequest
+                ) -> int:
+                    return len(json.dumps(request.to_data()).encode("utf-8"))
+
+                def reflect(self, request: GenerationRequest) -> GeneratedReflection:
+                    return GeneratedReflection(
+                        candidates=(
+                            GeneratedCandidate(
+                                text="A paid response awaiting local proposal persistence.",
+                                supporting_evidence=(
+                                    Citation(digest_id, "memory-buffer"),
+                                ),
+                                contrary_evidence=(),
+                                derivation="The bounded evidence supports this proposal.",
+                            ),
+                        ),
+                        insufficient_evidence=False,
+                        usage=ProviderUsage(input_tokens=110, output_tokens=35),
+                    )
+
+            with (
+                mock.patch(
+                    "myoutbrain.library.configured_generation_provider",
+                    return_value=UsageProvider(),
+                ),
+                mock.patch.object(
+                    LocalMemoryCore,
+                    "propose_manual_consolidation",
+                    side_effect=WriterLocked,
+                ),
+            ):
+                with self.assertRaises(WriterLocked):
+                    scheduler.run_due(
+                        "post-response-lock",
+                        now="2026-07-20T08:00:00+08:00",
+                        conversation_state="active",
+                    )
+
+            state = json.loads(
+                (instance_root / "store" / "scheduled-consolidation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            call = next(iter(state["external_calls"].values()))
+            self.assertEqual(call["result"], "failed")
+            self.assertEqual(call["input_tokens"], 110)
+            self.assertEqual(call["output_tokens"], 35)
+            self.assertEqual(call["actual_cost_usd"], 0.00018)
+            run = next(iter(state["runs"].values()))
+            self.assertEqual(run["status"], "retryable")
 
 
 if __name__ == "__main__":
