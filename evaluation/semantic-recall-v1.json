@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "dataset_version": "semantic-recall-v1",
+  "comparison": {
+    "baseline": "lexical-no-embeddings",
+    "candidate": "local-semantic-candidates",
+    "expected_baseline_correct_hits": 1,
+    "expected_candidate_correct_hits": 3
+  },
+  "evidence": [
+    {
+      "id": "buffered_context_gap",
+      "kind": "buffered-memory",
+      "state": "active",
+      "text": "Explicitly record missing context instead of pretending unavailable conversation history is remembered."
+    },
+    {
+      "id": "canonical_reflection",
+      "kind": "personal-cognition",
+      "state": "active",
+      "text": "Weekly reflection turns accumulated experience into reusable knowledge."
+    },
+    {
+      "id": "source_signed_manifest",
+      "kind": "source",
+      "state": "active",
+      "text": "Project Comet deployment requires signed manifests."
+    },
+    {
+      "id": "source_distractor",
+      "kind": "source",
+      "state": "active",
+      "text": "Project Atlas meetings use a generic checklist."
+    }
+  ],
+  "cases": [
+    {
+      "id": "synonym_buffered_context",
+      "category": "answerable",
+      "question": "How do we avoid claiming knowledge of unseen earlier messages?",
+      "answerable": true,
+      "expected_evidence_ids": ["buffered_context_gap"]
+    },
+    {
+      "id": "synonym_canonical_reflection",
+      "category": "answerable",
+      "question": "How can past lessons become useful again?",
+      "answerable": true,
+      "expected_evidence_ids": ["canonical_reflection"]
+    },
+    {
+      "id": "lexical_signed_manifest",
+      "category": "answerable",
+      "question": "Which Project Comet deployment requires signed manifests?",
+      "answerable": true,
+      "expected_evidence_ids": ["source_signed_manifest"]
+    }
+  ]
+}

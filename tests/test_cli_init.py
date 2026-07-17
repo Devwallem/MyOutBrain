@@ -25,6 +25,7 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
                 "store/journal",
                 "runtime/derived",
                 "runtime/indexes/fulltext",
+                "runtime/indexes/semantic",
                 "runtime/workspace/inbox",
                 "runtime/workspace/candidates",
                 "runtime/cache",
@@ -36,6 +37,11 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
                     f"Expected initialized directory: {relative_path}",
                 )
             self.assertTrue((library_root / "myoutbrain.toml").is_file())
+            configuration = (library_root / "myoutbrain.toml").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('[embedding]\nprovider = "myoutbrain-local"', configuration)
+            self.assertIn("allow_cloud = false", configuration)
             self.assertTrue((library_root / "store" / "memory.sqlite3").is_file())
             self.assertFalse((library_root / ".git").exists())
 

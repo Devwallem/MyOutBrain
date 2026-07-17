@@ -13,8 +13,15 @@ from myoutbrain.core_types import (
     MemoryState as MemoryState,
     UserInputError,
 )
+from myoutbrain.embeddings import (
+    EmbeddingFailure,
+    EmbeddingLocation,
+    EmbeddingProvider,
+    LocalMultilingualEmbeddingProvider,
+)
 from myoutbrain.local_core import LocalMemoryCore, RecallableMemory
 from myoutbrain.retrieval import lexical_terms
+from myoutbrain.semantic_index import SemanticRecallIndex
 
 
 class MemoryAccess(StrEnum):
@@ -39,6 +46,7 @@ class RecallMatch(StrEnum):
     STABLE_IDENTITY = "stable-identity"
     SOURCE_RELATION = "source-relation"
     FULL_TEXT = "full-text"
+    SEMANTIC_CANDIDATE = "semantic-candidate"
 
 
 @dataclass(frozen=True)
@@ -114,8 +122,16 @@ class MemoryEvidencePackage:
 class MemoryGateway:
     """Return task-scoped memory without exposing persistence details."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> None:
         self._root = root
+        self._embedding_provider = (
+            embedding_provider or LocalMultilingualEmbeddingProvider()
+        )
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()
@@ -168,6 +184,17 @@ class MemoryGateway:
             requested_memory_ids=requested_memory_ids,
             requested_source_ids=requested_source_ids,
         )
+        semantic_scores = self._semantic_scores(query, canonical + buffered)
+        canonical_matches = _with_semantic_matches(
+            canonical,
+            canonical_matches,
+            semantic_scores,
+        )
+        buffered_matches = _with_semantic_matches(
+            buffered,
+            buffered_matches,
+            semantic_scores,
+        )
         matched = canonical_matches + buffered_matches
         ordered = tuple(
             sorted(
@@ -194,11 +221,69 @@ class MemoryGateway:
             items=selected,
         )
 
+    def _semantic_scores(
+        self,
+        query: str,
+        memories: tuple[RecallableMemory, ...],
+    ) -> dict[str, float]:
+        provider = self._embedding_provider
+        eligible = memories
+        if provider.location is EmbeddingLocation.CLOUD:
+            if not _cloud_embedding_authorized(self._root, provider):
+                return {}
+            eligible = tuple(
+                memory
+                for memory in memories
+                if memory.sensitivity == "cloud-allowed"
+            )
+        try:
+            return SemanticRecallIndex(self._root).scores(query, eligible, provider)
+        except (EmbeddingFailure, OSError, RuntimeError, ValueError):
+            return {}
+
 _MATCH_ORDER = {
     RecallMatch.STABLE_IDENTITY: 0,
     RecallMatch.SOURCE_RELATION: 1,
     RecallMatch.FULL_TEXT: 2,
+    RecallMatch.SEMANTIC_CANDIDATE: 3,
 }
+
+
+def _with_semantic_matches(
+    memories: tuple[RecallableMemory, ...],
+    existing: tuple[tuple[RecallableMemory, RecallMatch, float], ...],
+    semantic_scores: Mapping[str, float],
+) -> tuple[tuple[RecallableMemory, RecallMatch, float], ...]:
+    matched_ids = {memory.memory_id for memory, _match, _score in existing}
+    semantic = tuple(
+        (memory, RecallMatch.SEMANTIC_CANDIDATE, semantic_scores[memory.memory_id])
+        for memory in memories
+        if memory.memory_id in semantic_scores and memory.memory_id not in matched_ids
+    )
+    return existing + semantic
+
+
+def _cloud_embedding_authorized(
+    root: Path,
+    provider: EmbeddingProvider,
+) -> bool:
+    import tomllib
+
+    try:
+        with (root / "myoutbrain.toml").open("rb") as configuration_file:
+            configuration = tomllib.load(configuration_file)
+        embedding = configuration.get("embedding")
+        return (
+            isinstance(embedding, dict)
+            and embedding.get("allow_cloud") is True
+            and embedding.get("provider") == provider.space.provider
+            and embedding.get("model") == provider.space.model
+            and embedding.get("dimensions") == provider.space.dimensions
+            and embedding.get("normalization_version")
+            == provider.space.normalization_version
+        )
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
 
 
 def _eligible_for_phase(
@@ -248,9 +333,9 @@ def _match_phase(
     *,
     requested_memory_ids: frozenset[str],
     requested_source_ids: frozenset[str],
-) -> tuple[tuple[RecallableMemory, RecallMatch, int], ...]:
+) -> tuple[tuple[RecallableMemory, RecallMatch, float], ...]:
     full_text_scores = _full_text_matches(query, memories)
-    matches: list[tuple[RecallableMemory, RecallMatch, int]] = []
+    matches: list[tuple[RecallableMemory, RecallMatch, float]] = []
     for memory in memories:
         match = _match_for(
             memory,
@@ -260,7 +345,7 @@ def _match_phase(
         )
         if match is not None:
             matches.append(
-                (memory, match, full_text_scores.get(memory.memory_id, 0))
+                (memory, match, float(full_text_scores.get(memory.memory_id, 0)))
             )
     return tuple(matches)
 

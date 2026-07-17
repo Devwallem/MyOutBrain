@@ -21,6 +21,7 @@ from myoutbrain.generation import (
     ProviderFailure,
     create_generation_provider,
 )
+from myoutbrain.embeddings import DEFAULT_LOCAL_EMBEDDING_SPACE
 from myoutbrain.candidates import (
     CandidateRecord,
     CandidateWorkspace,
@@ -78,6 +79,7 @@ INITIAL_DIRECTORIES = (
     "runtime/derived",
     "runtime/indexes",
     "runtime/indexes/fulltext",
+    "runtime/indexes/semantic",
     "runtime/workspace",
     "runtime/workspace/inbox",
     "runtime/workspace/candidates",
@@ -271,6 +273,7 @@ def _render_initial_configuration() -> str:
         f"permanent = [{permanent}]\n"
         f"rebuildable = [{rebuildable}]\n"
         f"\n{_render_default_generation_configuration()}"
+        f"\n{_render_default_embedding_configuration()}"
         "\n[reflection]\n"
         f"candidate_ttl_days = {DEFAULT_CANDIDATE_TTL_DAYS}\n"
     )
@@ -284,6 +287,18 @@ def _render_default_generation_configuration() -> str:
     )
 
 
+def _render_default_embedding_configuration() -> str:
+    return (
+        "[embedding]\n"
+        f'provider = "{DEFAULT_LOCAL_EMBEDDING_SPACE.provider}"\n'
+        f'model = "{DEFAULT_LOCAL_EMBEDDING_SPACE.model}"\n'
+        f"dimensions = {DEFAULT_LOCAL_EMBEDDING_SPACE.dimensions}\n"
+        "normalization_version = "
+        f"{DEFAULT_LOCAL_EMBEDDING_SPACE.normalization_version}\n"
+        "allow_cloud = false\n"
+    )
+
+
 def _with_default_generation_configuration(configuration: str) -> str:
     if configuration.endswith("\n\n"):
         separator = ""
@@ -292,6 +307,16 @@ def _with_default_generation_configuration(configuration: str) -> str:
     else:
         separator = "\n\n"
     return f"{configuration}{separator}{_render_default_generation_configuration()}"
+
+
+def _with_default_embedding_configuration(configuration: str) -> str:
+    if configuration.endswith("\n\n"):
+        separator = ""
+    elif configuration.endswith("\n"):
+        separator = "\n"
+    else:
+        separator = "\n\n"
+    return f"{configuration}{separator}{_render_default_embedding_configuration()}"
 
 
 def _with_required_git_ignore_rules(existing_content: str) -> str:
@@ -422,16 +447,25 @@ class KnowledgeWorkflow:
             migrated_configuration: str | None = None
             if configuration.exists():
                 configuration_data = _load_validated_configuration(configuration)
-                if "generation" not in configuration_data:
+                if (
+                    "generation" not in configuration_data
+                    or "embedding" not in configuration_data
+                ):
                     try:
                         existing_configuration = configuration.read_text(encoding="utf-8")
                     except (OSError, UnicodeError) as error:
                         raise ConfigurationConflict(
                             f"cannot read configuration for migration: {configuration}"
                         ) from error
-                    migrated_configuration = _with_default_generation_configuration(
-                        existing_configuration
-                    )
+                    migrated_configuration = existing_configuration
+                    if "generation" not in configuration_data:
+                        migrated_configuration = _with_default_generation_configuration(
+                            migrated_configuration
+                        )
+                    if "embedding" not in configuration_data:
+                        migrated_configuration = _with_default_embedding_configuration(
+                            migrated_configuration
+                        )
             for relative_path in INITIAL_DIRECTORIES:
                 (root / relative_path).mkdir(parents=True, exist_ok=True)
             updated_git_ignore = _with_required_git_ignore_rules(existing_git_ignore)

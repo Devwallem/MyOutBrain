@@ -18,6 +18,7 @@ from myoutbrain.retrieval import (
     EvidenceState,
     RetrievalDecision,
     RetrievalEvidence,
+    SemanticCandidateRetriever,
 )
 from tests.cli_support import run_cli
 
@@ -170,6 +171,27 @@ class EvaluateEvidenceRecallTests(unittest.TestCase):
         self.assertIn("Should-refuse violations:", text_report.stdout)
         for category in ("answerable", "unanswerable", "conflicting", "superseded"):
             self.assertIn(f"Category: {category}", text_report.stdout)
+
+    def test_versioned_semantic_evaluation_beats_lexical_baseline_and_covers_buffer(
+        self,
+    ) -> None:
+        dataset_path = PROJECT_ROOT / "evaluation" / "semantic-recall-v1.json"
+        dataset = load_recall_dataset(dataset_path)
+
+        lexical = evaluate_recall(dataset)
+        semantic = evaluate_recall(dataset, SemanticCandidateRetriever())
+
+        self.assertIn(EvidenceKind.BUFFERED_MEMORY, {item.kind for item in dataset.evidence})
+        self.assertEqual(lexical.summary.correct_hits, 1)
+        self.assertEqual(lexical.summary.key_omissions, 2)
+        self.assertEqual(semantic.retriever, "local-semantic-candidates")
+        self.assertEqual(semantic.summary.correct_hits, 3)
+        self.assertEqual(semantic.summary.key_omissions, 0)
+        self.assertEqual(semantic.summary.incorrect_citations, 0)
+        self.assertGreater(
+            semantic.summary.correct_hits,
+            lexical.summary.correct_hits,
+        )
 
     def test_recall_failures_are_reported_and_return_a_failing_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

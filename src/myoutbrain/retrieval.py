@@ -10,6 +10,7 @@ from typing import Protocol
 class EvidenceKind(StrEnum):
     SOURCE = "source"
     PERSONAL_COGNITION = "personal-cognition"
+    BUFFERED_MEMORY = "buffered-memory"
 
 
 class EvidenceState(StrEnum):
@@ -66,6 +67,48 @@ class LexicalNoEmbeddingsRetriever:
                 evidence_id
                 for evidence_id, score in scores.items()
                 if score == best_score
+            )
+        )
+        return RetrievalDecision(evidence_ids=selected_ids, should_refuse=False)
+
+
+class SemanticCandidateRetriever:
+    """Evaluation adapter for the default local semantic candidate model."""
+
+    @property
+    def name(self) -> str:
+        return "local-semantic-candidates"
+
+    def retrieve(
+        self,
+        question: str,
+        evidence: Sequence[RetrievalEvidence],
+    ) -> RetrievalDecision:
+        from myoutbrain.embeddings import (
+            LocalMultilingualEmbeddingProvider,
+            SEMANTIC_SIMILARITY_THRESHOLD,
+            cosine_similarity,
+        )
+
+        active = tuple(item for item in evidence if item.state is EvidenceState.ACTIVE)
+        if not active:
+            return RetrievalDecision(evidence_ids=(), should_refuse=True)
+        provider = LocalMultilingualEmbeddingProvider()
+        vectors = provider.embed((question,) + tuple(item.text for item in active))
+        question_vector = vectors[0]
+        scores = {
+            item.evidence_id: cosine_similarity(question_vector, vector)
+            for item, vector in zip(active, vectors[1:])
+        }
+        best_score = max(scores.values(), default=0.0)
+        if best_score < SEMANTIC_SIMILARITY_THRESHOLD:
+            return RetrievalDecision(evidence_ids=(), should_refuse=True)
+        selected_ids = tuple(
+            sorted(
+                evidence_id
+                for evidence_id, score in scores.items()
+                if score >= SEMANTIC_SIMILARITY_THRESHOLD
+                and score >= best_score - 0.05
             )
         )
         return RetrievalDecision(evidence_ids=selected_ids, should_refuse=False)
