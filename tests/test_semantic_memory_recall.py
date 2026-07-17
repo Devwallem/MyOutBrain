@@ -1,24 +1,26 @@
 from __future__ import annotations
 
-from contextlib import closing
 from pathlib import Path
 import json
 import shutil
-import sqlite3
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from typing import cast
 
 from myoutbrain.embeddings import (
+    DeterministicEmbeddingProvider,
     EmbeddingLocation,
-    EmbeddingProvider,
     EmbeddingSpace,
     LocalMultilingualEmbeddingProvider,
 )
+from myoutbrain.local_core import RecallableMemory
 from myoutbrain.memory_gateway import (
     Answerability,
     MemoryAccess,
     MemoryGateway,
+    MemoryState,
     QueryPurpose,
     RecallMatch,
     RecallRequest,
@@ -63,25 +65,33 @@ def _remember(
     return cast(dict[str, object], json.loads(result.stdout))
 
 
-def _seed_canonical(instance_root: Path, *, memory_id: str, content: str) -> None:
-    with closing(
-        sqlite3.connect(instance_root / "store" / "memory.sqlite3")
-    ) as connection:
-        connection.execute(
-            """
-            INSERT INTO canonical_memories
-                (memory_id, content, current_version, sensitivity, state,
-                 created_at, updated_at)
-            VALUES (?, ?, 1, 'local-only', 'active', ?, ?)
-            """,
-            (
-                memory_id,
-                content,
-                "2026-07-17T16:05:00+08:00",
-                "2026-07-17T16:05:00+08:00",
-            ),
-        )
-        connection.commit()
+class StaticMemoryReader:
+    def __init__(self, memories: tuple[RecallableMemory, ...]) -> None:
+        self._memories = memories
+
+    def recallable_memories(self) -> tuple[RecallableMemory, ...]:
+        return self._memories
+
+
+class FakeArray:
+    def __init__(self, rows: list[list[float]]) -> None:
+        self._rows = rows
+
+    def tolist(self) -> object:
+        return self._rows
+
+
+class FakeSentenceEncoder:
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        normalize_embeddings: bool,
+        convert_to_numpy: bool,
+    ) -> object:
+        if not normalize_embeddings or not convert_to_numpy:
+            raise AssertionError("local adapter must request normalized numeric vectors")
+        return FakeArray([[1.0] + [0.0] * 383 for _text in texts])
 
 
 class FailingEmbeddingProvider:
@@ -141,6 +151,9 @@ def _configure_cloud_embeddings(
         f"dimensions = {provider.space.dimensions}\n"
         f"normalization_version = {provider.space.normalization_version}\n"
         "allow_cloud = true\n"
+        'cloud_send_scope = "cloud-allowed-only"\n'
+        "cloud_budget_usd = 5.0\n"
+        "cloud_max_texts_per_request = 8\n"
     )
     path.write_text(
         configuration[:start] + replacement + configuration[end + 1 :],
@@ -149,33 +162,76 @@ def _configure_cloud_embeddings(
 
 
 class SemanticMemoryRecallTests(unittest.TestCase):
-    def test_default_local_embeddings_recall_synonymous_buffered_and_canonical_memory(
+    def test_default_adapter_uses_a_cached_local_multilingual_model(self) -> None:
+        constructor_calls: list[tuple[str, bool]] = []
+
+        def sentence_transformer(
+            model: str,
+            *,
+            local_files_only: bool,
+        ) -> FakeSentenceEncoder:
+            constructor_calls.append((model, local_files_only))
+            return FakeSentenceEncoder()
+
+        provider = LocalMultilingualEmbeddingProvider()
+        fake_module = SimpleNamespace(SentenceTransformer=sentence_transformer)
+
+        with patch(
+            "myoutbrain.embeddings.importlib.import_module",
+            return_value=fake_module,
+        ):
+            vectors = provider.embed(("held-out paraphrase", "跨语言改写"))
+            provider.embed(("cached invocation",))
+
+        self.assertEqual(len(vectors), 2)
+        self.assertTrue(all(len(vector) == 384 for vector in vectors))
+        self.assertEqual(
+            constructor_calls,
+            [(provider.space.model, True)],
+        )
+
+    def test_deterministic_adapter_recalls_synonymous_buffered_and_canonical_memory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            temporary_root = Path(temporary_directory)
-            instance_root = temporary_root / "Private Companion"
-            initialization = run_cli("init", "--root", str(instance_root))
-            self.assertEqual(initialization.returncode, 0, initialization.stderr)
-            buffered = _remember(
-                temporary_root,
-                instance_root,
-                name="context-gap",
-                digest=(
-                    "Explicitly record missing context instead of pretending the "
-                    "unavailable conversation history is remembered."
-                ),
+            instance_root = Path(temporary_directory) / "Private Companion"
+            reader = StaticMemoryReader(
+                (
+                    RecallableMemory(
+                        memory_id="dig_context_gap",
+                        content=(
+                            "Explicitly record missing context instead of pretending "
+                            "the unavailable conversation history is remembered."
+                        ),
+                        memory_state=MemoryState.BUFFERED,
+                        source_ids=("src_context_gap",),
+                        occurred_at="2026-07-17T16:00:00+08:00",
+                        sensitivity="local-only",
+                        entrance="codex",
+                        task="semantic-recall",
+                    ),
+                    RecallableMemory(
+                        memory_id="mem_weekly_reflection",
+                        content=(
+                            "Weekly reflection turns accumulated experience into "
+                            "reusable knowledge."
+                        ),
+                        memory_state=MemoryState.CANONICAL,
+                        source_ids=("src_reflection",),
+                        occurred_at="2026-07-17T16:05:00+08:00",
+                        sensitivity="local-only",
+                        entrance=None,
+                        task=None,
+                    ),
+                )
             )
-            _seed_canonical(
+            gateway = MemoryGateway(
                 instance_root,
-                memory_id="mem_weekly_reflection",
-                content=(
-                    "Weekly reflection turns accumulated experience into reusable "
-                    "knowledge."
-                ),
+                embedding_provider=DeterministicEmbeddingProvider(),
+                memory_reader=reader,
             )
 
-            buffered_package = MemoryGateway(instance_root).recall(
+            buffered_package = gateway.recall(
                 RecallRequest(
                     query="How do we avoid claiming knowledge of unseen earlier messages?",
                     task="semantic-recall",
@@ -183,7 +239,7 @@ class SemanticMemoryRecallTests(unittest.TestCase):
                     purpose=QueryPurpose.SUBSTANTIVE,
                 )
             )
-            canonical_package = MemoryGateway(instance_root).recall(
+            canonical_package = gateway.recall(
                 RecallRequest(
                     query="How can lessons gathered over time become useful again?",
                     task="semantic-recall",
@@ -194,7 +250,7 @@ class SemanticMemoryRecallTests(unittest.TestCase):
 
             self.assertEqual(
                 [(item.memory_id, item.match) for item in buffered_package.items],
-                [(buffered["digest_id"], RecallMatch.SEMANTIC_CANDIDATE)],
+                [("dig_context_gap", RecallMatch.SEMANTIC_CANDIDATE)],
             )
             self.assertEqual(
                 [(item.memory_id, item.match) for item in canonical_package.items],
@@ -220,7 +276,10 @@ class SemanticMemoryRecallTests(unittest.TestCase):
                 name="review",
                 digest="Reflect on accumulated experience so lessons remain reusable.",
             )
-            gateway = MemoryGateway(instance_root)
+            gateway = MemoryGateway(
+                instance_root,
+                embedding_provider=DeterministicEmbeddingProvider(),
+            )
             request = RecallRequest(
                 query="How do past lessons become useful again?",
                 task="semantic-recall",
@@ -238,30 +297,24 @@ class SemanticMemoryRecallTests(unittest.TestCase):
                 / "current.json"
             )
             generation = json.loads(index_path.read_text(encoding="utf-8"))
-            with closing(
-                sqlite3.connect(instance_root / "store" / "memory.sqlite3")
-            ) as connection:
-                before = connection.execute(
-                    "SELECT digest_id, content FROM buffered_digests"
-                ).fetchall()
 
             shutil.rmtree(instance_root / "runtime" / "indexes" / "semantic")
             rebuilt = gateway.recall(request)
-            with closing(
-                sqlite3.connect(instance_root / "store" / "memory.sqlite3")
-            ) as connection:
-                after = connection.execute(
-                    "SELECT digest_id, content FROM buffered_digests"
-                ).fetchall()
 
             self.assertEqual(generation["schema_version"], 1)
             self.assertEqual(
                 generation["space"],
-                LocalMultilingualEmbeddingProvider().space.to_data(),
+                DeterministicEmbeddingProvider().space.to_data(),
             )
             self.assertEqual(first.items[0].memory_id, receipt["digest_id"])
             self.assertEqual(rebuilt.items[0].memory_id, receipt["digest_id"])
-            self.assertEqual(after, before)
+            self.assertEqual(rebuilt.to_data(), first.to_data())
+
+            generation["entries"] = []
+            index_path.write_text(json.dumps(generation), encoding="utf-8")
+            degraded = gateway.recall(request)
+            self.assertEqual(degraded.items, ())
+            self.assertEqual(degraded.answerability, Answerability.INSUFFICIENT)
 
     def test_embedding_failure_falls_back_to_full_text_recall(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -329,10 +382,25 @@ class SemanticMemoryRecallTests(unittest.TestCase):
             self.assertEqual(unauthorized.items, ())
 
             _configure_cloud_embeddings(instance_root, provider)
-            authorized = MemoryGateway(
+            still_private = MemoryGateway(
                 instance_root,
                 embedding_provider=provider,
             ).recall(request)
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(still_private.items, ())
+
+            authorized = MemoryGateway(
+                instance_root,
+                embedding_provider=provider,
+            ).recall(
+                RecallRequest(
+                    query=request.query,
+                    task=request.task,
+                    access=request.access,
+                    purpose=request.purpose,
+                    query_sensitivity="cloud-allowed",
+                )
+            )
 
             sent_text = " ".join(
                 text for call in provider.calls for text in call
@@ -365,6 +433,7 @@ class SemanticMemoryRecallTests(unittest.TestCase):
                 task="semantic-recall",
                 access=MemoryAccess.LOCAL_TRUSTED,
                 purpose=QueryPurpose.SUBSTANTIVE,
+                query_sensitivity="cloud-allowed",
             )
             first_provider = RecordingCloudEmbeddingProvider(model="recording-v1")
             _configure_cloud_embeddings(instance_root, first_provider)

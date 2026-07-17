@@ -18,6 +18,8 @@ from myoutbrain.persistence import atomic_write
 
 
 _SCHEMA_VERSION = 1
+
+
 class SemanticRecallIndex:
     """Own rebuildable semantic generations without exposing vector storage."""
 
@@ -59,7 +61,7 @@ class SemanticRecallIndex:
     ) -> dict[str, tuple[float, ...]]:
         path = self._generation_path(sensitivity)
         fingerprint = _memory_fingerprint(memories)
-        loaded = _load_generation(path, provider, fingerprint)
+        loaded = _load_generation(path, provider, memories, fingerprint)
         if loaded is not None:
             return loaded
         raw_vectors = provider.embed(tuple(memory.content for memory in memories))
@@ -107,6 +109,7 @@ class SemanticRecallIndex:
 def _load_generation(
     path: Path,
     provider: EmbeddingProvider,
+    memories: tuple[RecallableMemory, ...],
     fingerprint: str,
 ) -> dict[str, tuple[float, ...]] | None:
     if not path.is_file():
@@ -121,12 +124,21 @@ def _load_generation(
         ):
             return None
         entries = _sequence(document.get("entries"))
+        expected_fingerprints = {
+            memory.memory_id: _content_fingerprint(memory.content)
+            for memory in memories
+        }
         result: dict[str, tuple[float, ...]] = {}
         for raw_entry in entries:
             entry = _mapping(raw_entry)
             memory_id = entry.get("memory_id")
             vector = _sequence(entry.get("vector"))
-            if not isinstance(memory_id, str) or memory_id in result:
+            if (
+                not isinstance(memory_id, str)
+                or memory_id in result
+                or entry.get("content_fingerprint")
+                != expected_fingerprints.get(memory_id)
+            ):
                 raise TypeError
             if not all(
                 isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -138,6 +150,8 @@ def _load_generation(
                 (memory_id,),
                 (tuple(float(cast(int | float, value)) for value in vector),),
             )[0]
+        if result.keys() != expected_fingerprints.keys():
+            raise TypeError
         return result
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
         raise EmbeddingFailure(f"invalid semantic index generation: {path}") from error

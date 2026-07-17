@@ -7,10 +7,13 @@ from enum import StrEnum
 import math
 from pathlib import Path
 import sqlite3
+import tomllib
+from typing import Protocol, cast
 
 from myoutbrain.core_types import (
     IntegrityError,
     MemoryState as MemoryState,
+    Sensitivity,
     UserInputError,
 )
 from myoutbrain.embeddings import (
@@ -58,6 +61,11 @@ class RecallRequest:
     memory_ids: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
     limit: int = 5
+    query_sensitivity: Sensitivity = "local-only"
+
+
+class MemoryReader(Protocol):
+    def recallable_memories(self) -> tuple[RecallableMemory, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -127,11 +135,13 @@ class MemoryGateway:
         root: Path,
         *,
         embedding_provider: EmbeddingProvider | None = None,
+        memory_reader: MemoryReader | None = None,
     ) -> None:
         self._root = root
         self._embedding_provider = (
             embedding_provider or LocalMultilingualEmbeddingProvider()
         )
+        self._memory_reader = memory_reader or LocalMemoryCore(root)
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()
@@ -142,6 +152,8 @@ class MemoryGateway:
             raise UserInputError("recall task must not be blank")
         if request.limit < 1 or request.limit > 20:
             raise UserInputError("recall limit must be between 1 and 20")
+        if request.query_sensitivity not in ("local-only", "cloud-allowed"):
+            raise UserInputError("recall query sensitivity is invalid")
         if request.purpose is not QueryPurpose.SUBSTANTIVE:
             return MemoryEvidencePackage(
                 query=query,
@@ -153,7 +165,7 @@ class MemoryGateway:
                 items=(),
             )
 
-        memories = LocalMemoryCore(self._root).recallable_memories()
+        memories = self._memory_reader.recallable_memories()
         requested_memory_ids = frozenset(request.memory_ids)
         requested_source_ids = frozenset(request.source_ids)
         canonical = _eligible_for_phase(
@@ -184,7 +196,11 @@ class MemoryGateway:
             requested_memory_ids=requested_memory_ids,
             requested_source_ids=requested_source_ids,
         )
-        semantic_scores = self._semantic_scores(query, canonical + buffered)
+        semantic_scores = self._semantic_scores(
+            query,
+            canonical + buffered,
+            query_sensitivity=request.query_sensitivity,
+        )
         canonical_matches = _with_semantic_matches(
             canonical,
             canonical_matches,
@@ -225,20 +241,30 @@ class MemoryGateway:
         self,
         query: str,
         memories: tuple[RecallableMemory, ...],
+        *,
+        query_sensitivity: Sensitivity,
     ) -> dict[str, float]:
         provider = self._embedding_provider
-        eligible = memories
-        if provider.location is EmbeddingLocation.CLOUD:
-            if not _cloud_embedding_authorized(self._root, provider):
-                return {}
-            eligible = tuple(
-                memory
-                for memory in memories
-                if memory.sensitivity == "cloud-allowed"
-            )
         try:
+            eligible = memories
+            if provider.location is EmbeddingLocation.CLOUD:
+                cloud_text_limit = _cloud_embedding_text_limit(self._root, provider)
+                if query_sensitivity != "cloud-allowed" or cloud_text_limit is None:
+                    return {}
+                eligible = tuple(
+                    memory
+                    for memory in memories
+                    if memory.sensitivity == "cloud-allowed"
+                )[: cloud_text_limit - 1]
             return SemanticRecallIndex(self._root).scores(query, eligible, provider)
-        except (EmbeddingFailure, OSError, RuntimeError, ValueError):
+        except (
+            EmbeddingFailure,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ):
             return {}
 
 _MATCH_ORDER = {
@@ -263,27 +289,36 @@ def _with_semantic_matches(
     return existing + semantic
 
 
-def _cloud_embedding_authorized(
+def _cloud_embedding_text_limit(
     root: Path,
     provider: EmbeddingProvider,
-) -> bool:
-    import tomllib
-
+) -> int | None:
     try:
         with (root / "myoutbrain.toml").open("rb") as configuration_file:
             configuration = tomllib.load(configuration_file)
         embedding = configuration.get("embedding")
-        return (
-            isinstance(embedding, dict)
-            and embedding.get("allow_cloud") is True
+        if not isinstance(embedding, dict):
+            return None
+        authorized = (
+            embedding.get("allow_cloud") is True
             and embedding.get("provider") == provider.space.provider
             and embedding.get("model") == provider.space.model
             and embedding.get("dimensions") == provider.space.dimensions
             and embedding.get("normalization_version")
             == provider.space.normalization_version
+            and embedding.get("cloud_send_scope") == "cloud-allowed-only"
+            and isinstance(embedding.get("cloud_budget_usd"), (int, float))
+            and not isinstance(embedding.get("cloud_budget_usd"), bool)
+            and cast(float, embedding.get("cloud_budget_usd")) > 0
+            and isinstance(embedding.get("cloud_max_texts_per_request"), int)
+            and not isinstance(embedding.get("cloud_max_texts_per_request"), bool)
+            and cast(int, embedding.get("cloud_max_texts_per_request")) >= 2
         )
+        if not authorized:
+            return None
+        return cast(int, embedding.get("cloud_max_texts_per_request"))
     except (OSError, tomllib.TOMLDecodeError):
-        return False
+        return None
 
 
 def _eligible_for_phase(

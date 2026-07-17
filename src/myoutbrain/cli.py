@@ -95,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument("--memory-id", action="append", default=[])
     recall_parser.add_argument("--source-id", action="append", default=[])
     recall_parser.add_argument("--limit", type=int, default=5)
+    recall_parser.add_argument(
+        "--query-sensitivity",
+        choices=("local-only", "cloud-allowed"),
+        default="local-only",
+        help="Explicitly classify whether the query itself may leave this machine",
+    )
     recall_parser.add_argument("--format", choices=("json", "text"), default="text")
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
     ask_parser.add_argument("source_id")
@@ -208,6 +214,7 @@ def _recall(
     memory_ids: Sequence[str],
     source_ids: Sequence[str],
     limit: int,
+    query_sensitivity: Sensitivity,
     output_format: str,
 ) -> int:
     package = MemoryGateway(root).recall(
@@ -219,6 +226,7 @@ def _recall(
             memory_ids=tuple(memory_ids),
             source_ids=tuple(source_ids),
             limit=limit,
+            query_sensitivity=query_sensitivity,
         )
     )
     if output_format == "json":
@@ -364,6 +372,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 memory_ids=parsed_arguments.memory_id,
                 source_ids=parsed_arguments.source_id,
                 limit=parsed_arguments.limit,
+                query_sensitivity=parsed_arguments.query_sensitivity,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "ask":

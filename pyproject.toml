@@ -7,7 +7,7 @@ name = "myoutbrain"
 version = "0.1.0"
 description = "A local-first personal cognitive library."
 requires-python = ">=3.13"
-dependencies = []
+dependencies = ["sentence-transformers>=3"]
 
 [project.scripts]
 myoutbrain = "myoutbrain.cli:main"

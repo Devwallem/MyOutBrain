@@ -85,7 +85,7 @@ class SemanticCandidateRetriever:
         evidence: Sequence[RetrievalEvidence],
     ) -> RetrievalDecision:
         from myoutbrain.embeddings import (
-            LocalMultilingualEmbeddingProvider,
+            DeterministicEmbeddingProvider,
             SEMANTIC_SIMILARITY_THRESHOLD,
             cosine_similarity,
         )
@@ -93,7 +93,7 @@ class SemanticCandidateRetriever:
         active = tuple(item for item in evidence if item.state is EvidenceState.ACTIVE)
         if not active:
             return RetrievalDecision(evidence_ids=(), should_refuse=True)
-        provider = LocalMultilingualEmbeddingProvider()
+        provider = DeterministicEmbeddingProvider()
         vectors = provider.embed((question,) + tuple(item.text for item in active))
         question_vector = vectors[0]
         scores = {

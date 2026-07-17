@@ -296,6 +296,9 @@ def _render_default_embedding_configuration() -> str:
         "normalization_version = "
         f"{DEFAULT_LOCAL_EMBEDDING_SPACE.normalization_version}\n"
         "allow_cloud = false\n"
+        'cloud_send_scope = "none"\n'
+        "cloud_budget_usd = 0.0\n"
+        "cloud_max_texts_per_request = 0\n"
     )
 
 

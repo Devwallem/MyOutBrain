@@ -40,8 +40,14 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
             configuration = (library_root / "myoutbrain.toml").read_text(
                 encoding="utf-8"
             )
-            self.assertIn('[embedding]\nprovider = "myoutbrain-local"', configuration)
+            self.assertIn(
+                '[embedding]\nprovider = "sentence-transformers"',
+                configuration,
+            )
             self.assertIn("allow_cloud = false", configuration)
+            self.assertIn('cloud_send_scope = "none"', configuration)
+            self.assertIn("cloud_budget_usd = 0.0", configuration)
+            self.assertIn("cloud_max_texts_per_request = 0", configuration)
             self.assertTrue((library_root / "store" / "memory.sqlite3").is_file())
             self.assertFalse((library_root / ".git").exists())
 

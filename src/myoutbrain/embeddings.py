@@ -4,10 +4,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
+import importlib
 import math
 import re
 import unicodedata
-from typing import Protocol
+from typing import Callable, Protocol, cast
 
 from myoutbrain.retrieval import lexical_terms
 
@@ -48,7 +49,13 @@ class EmbeddingProvider(Protocol):
 
 
 DEFAULT_LOCAL_EMBEDDING_SPACE = EmbeddingSpace(
-    provider="myoutbrain-local",
+    provider="sentence-transformers",
+    model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    dimensions=384,
+    normalization_version=1,
+)
+DETERMINISTIC_TEST_EMBEDDING_SPACE = EmbeddingSpace(
+    provider="myoutbrain-deterministic-test",
     model="multilingual-concept-hash-v1",
     dimensions=256,
     normalization_version=1,
@@ -117,16 +124,74 @@ _CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 class LocalMultilingualEmbeddingProvider:
-    """Small offline semantic projection used when no model service is configured.
+    """Use a cached multilingual sentence-transformers model without network access."""
 
-    The adapter combines multilingual concept features with hashed lexical features.
-    It is deliberately modest: it broadens candidate recall while downstream policy
-    remains responsible for evidence quality and answerability.
-    """
+    def __init__(self) -> None:
+        self._encoder: _SentenceEncoder | None = None
 
     @property
     def space(self) -> EmbeddingSpace:
         return DEFAULT_LOCAL_EMBEDDING_SPACE
+
+    @property
+    def location(self) -> EmbeddingLocation:
+        return EmbeddingLocation.LOCAL
+
+    def embed(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        try:
+            encoder = self._load_encoder()
+            encoded = encoder.encode(
+                list(texts),
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+            )
+            rows = cast(_ArrayLike, encoded).tolist()
+            if not isinstance(rows, list):
+                raise TypeError
+            vectors: list[tuple[float, ...]] = []
+            for row in rows:
+                if not isinstance(row, list) or not all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    for value in row
+                ):
+                    raise TypeError
+                vectors.append(
+                    tuple(float(cast(int | float, value)) for value in row)
+                )
+            return validate_embeddings(self.space, texts, vectors)
+        except (
+            AttributeError,
+            ImportError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise EmbeddingFailure(
+                "local multilingual embedding model is unavailable"
+            ) from error
+
+    def _load_encoder(self) -> _SentenceEncoder:
+        if self._encoder is None:
+            module = importlib.import_module("sentence_transformers")
+            factory = cast(
+                Callable[..., _SentenceEncoder],
+                getattr(module, "SentenceTransformer"),
+            )
+            self._encoder = factory(self.space.model, local_files_only=True)
+        return self._encoder
+
+
+class DeterministicEmbeddingProvider:
+    """Offline deterministic adapter for tests and versioned evaluation.
+
+    The adapter combines multilingual concept features with hashed lexical features.
+    It is not selected by production configuration.
+    """
+
+    @property
+    def space(self) -> EmbeddingSpace:
+        return DETERMINISTIC_TEST_EMBEDDING_SPACE
 
     @property
     def location(self) -> EmbeddingLocation:
@@ -151,6 +216,20 @@ class LocalMultilingualEmbeddingProvider:
         if norm == 0.0:
             return tuple(vector)
         return tuple(value / norm for value in vector)
+
+
+class _SentenceEncoder(Protocol):
+    def encode(
+        self,
+        texts: list[str],
+        *,
+        normalize_embeddings: bool,
+        convert_to_numpy: bool,
+    ) -> object: ...
+
+
+class _ArrayLike(Protocol):
+    def tolist(self) -> object: ...
 
 
 def validate_embeddings(
