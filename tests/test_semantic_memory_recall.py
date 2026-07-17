@@ -14,6 +14,7 @@ from myoutbrain.embeddings import (
     EmbeddingLocation,
     EmbeddingSpace,
     LocalMultilingualEmbeddingProvider,
+    prepare_default_local_embedding_model,
 )
 from myoutbrain.local_core import RecallableMemory
 from myoutbrain.memory_gateway import (
@@ -91,7 +92,34 @@ class FakeSentenceEncoder:
     ) -> object:
         if not normalize_embeddings or not convert_to_numpy:
             raise AssertionError("local adapter must request normalized numeric vectors")
-        return FakeArray([[1.0] + [0.0] * 383 for _text in texts])
+        rows: list[list[float]] = []
+        for text in texts:
+            normalized = text.casefold()
+            vector = [0.0] * 384
+            if any(
+                phrase in normalized
+                for phrase in (
+                    "missing context",
+                    "unavailable conversation",
+                    "unseen earlier messages",
+                    "claiming knowledge",
+                )
+            ):
+                vector[0] = 1.0
+            elif any(
+                phrase in normalized
+                for phrase in (
+                    "accumulated experience",
+                    "reusable knowledge",
+                    "lessons gathered",
+                    "useful again",
+                )
+            ):
+                vector[1] = 1.0
+            else:
+                vector[2] = 1.0
+            rows.append(vector)
+        return FakeArray(rows)
 
 
 class FailingEmbeddingProvider:
@@ -190,7 +218,31 @@ class SemanticMemoryRecallTests(unittest.TestCase):
             [(provider.space.model, True)],
         )
 
-    def test_deterministic_adapter_recalls_synonymous_buffered_and_canonical_memory(
+    def test_initialization_prepares_the_default_model_for_offline_recall(self) -> None:
+        constructor_calls: list[tuple[str, bool]] = []
+
+        def sentence_transformer(
+            model: str,
+            *,
+            local_files_only: bool,
+        ) -> FakeSentenceEncoder:
+            constructor_calls.append((model, local_files_only))
+            return FakeSentenceEncoder()
+
+        fake_module = SimpleNamespace(SentenceTransformer=sentence_transformer)
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "myoutbrain.embeddings.importlib.import_module",
+            return_value=fake_module,
+        ):
+            prepared = prepare_default_local_embedding_model()
+
+        self.assertTrue(prepared)
+        self.assertEqual(
+            constructor_calls,
+            [(LocalMultilingualEmbeddingProvider().space.model, False)],
+        )
+
+    def test_default_local_adapter_recalls_synonymous_buffered_and_canonical_memory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -227,26 +279,35 @@ class SemanticMemoryRecallTests(unittest.TestCase):
             )
             gateway = MemoryGateway(
                 instance_root,
-                embedding_provider=DeterministicEmbeddingProvider(),
                 memory_reader=reader,
             )
+            fake_module = SimpleNamespace(
+                SentenceTransformer=lambda _model, **_kwargs: FakeSentenceEncoder()
+            )
 
-            buffered_package = gateway.recall(
-                RecallRequest(
-                    query="How do we avoid claiming knowledge of unseen earlier messages?",
-                    task="semantic-recall",
-                    access=MemoryAccess.TASK_SCOPED,
-                    purpose=QueryPurpose.SUBSTANTIVE,
+            with patch(
+                "myoutbrain.embeddings.importlib.import_module",
+                return_value=fake_module,
+            ):
+                buffered_package = gateway.recall(
+                    RecallRequest(
+                        query=(
+                            "How do we avoid claiming knowledge of unseen earlier "
+                            "messages?"
+                        ),
+                        task="semantic-recall",
+                        access=MemoryAccess.TASK_SCOPED,
+                        purpose=QueryPurpose.SUBSTANTIVE,
+                    )
                 )
-            )
-            canonical_package = gateway.recall(
-                RecallRequest(
-                    query="How can lessons gathered over time become useful again?",
-                    task="semantic-recall",
-                    access=MemoryAccess.TASK_SCOPED,
-                    purpose=QueryPurpose.SUBSTANTIVE,
+                canonical_package = gateway.recall(
+                    RecallRequest(
+                        query="How can lessons gathered over time become useful again?",
+                        task="semantic-recall",
+                        access=MemoryAccess.TASK_SCOPED,
+                        purpose=QueryPurpose.SUBSTANTIVE,
+                    )
                 )
-            )
 
             self.assertEqual(
                 [(item.memory_id, item.match) for item in buffered_package.items],

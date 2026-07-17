@@ -21,7 +21,10 @@ from myoutbrain.generation import (
     ProviderFailure,
     create_generation_provider,
 )
-from myoutbrain.embeddings import DEFAULT_LOCAL_EMBEDDING_SPACE
+from myoutbrain.embeddings import (
+    DEFAULT_LOCAL_EMBEDDING_SPACE,
+    prepare_default_local_embedding_model,
+)
 from myoutbrain.candidates import (
     CandidateRecord,
     CandidateWorkspace,
@@ -479,6 +482,7 @@ class KnowledgeWorkflow:
             elif migrated_configuration is not None:
                 _atomic_write(configuration, migrated_configuration.encode("utf-8"))
         LocalMemoryCore(root).initialize()
+        prepare_default_local_embedding_model()
 
     def capture(self, source_path: Path, sensitivity: Sensitivity) -> CaptureResult:
         configuration = self._root / "myoutbrain.toml"

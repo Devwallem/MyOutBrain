@@ -6,6 +6,7 @@ from enum import StrEnum
 import hashlib
 import importlib
 import math
+import os
 import re
 import unicodedata
 from typing import Callable, Protocol, cast
@@ -126,8 +127,9 @@ _CONCEPT_ALIASES: dict[str, tuple[str, ...]] = {
 class LocalMultilingualEmbeddingProvider:
     """Use a cached multilingual sentence-transformers model without network access."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_model_download: bool = False) -> None:
         self._encoder: _SentenceEncoder | None = None
+        self._allow_model_download = allow_model_download
 
     @property
     def space(self) -> EmbeddingSpace:
@@ -178,8 +180,31 @@ class LocalMultilingualEmbeddingProvider:
                 Callable[..., _SentenceEncoder],
                 getattr(module, "SentenceTransformer"),
             )
-            self._encoder = factory(self.space.model, local_files_only=True)
+            self._encoder = factory(
+                self.space.model,
+                local_files_only=not self._allow_model_download,
+            )
         return self._encoder
+
+
+def prepare_default_local_embedding_model() -> bool:
+    """Provision the default model during initialization, never during recall."""
+
+    if os.environ.get("MYOUTBRAIN_SKIP_MODEL_PREPARATION") == "1":
+        return False
+    try:
+        LocalMultilingualEmbeddingProvider(allow_model_download=True)._load_encoder()
+    except (
+        AttributeError,
+        EmbeddingFailure,
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return True
 
 
 class DeterministicEmbeddingProvider:

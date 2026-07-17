@@ -16,6 +16,7 @@ def cli_invocation(
 ) -> tuple[list[str], dict[str, str]]:
     command_environment = os.environ.copy()
     command_environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    command_environment["MYOUTBRAIN_SKIP_MODEL_PREPARATION"] = "1"
     if environment is not None:
         command_environment.update(environment)
     command = [sys.executable, "-m", "myoutbrain", *arguments]
