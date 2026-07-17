@@ -1371,10 +1371,7 @@ class LocalMemoryCore:
                             (normalized_memory_id, normalized_memory_id),
                         ).fetchall()
                     )
-                    removed_digest_ids = self._digest_ids_for_sources(
-                        connection,
-                        removed_source_ids,
-                    )
+                    removed_digest_ids = impact.derived_digest_ids
                     removed_experience_ids = _select_ids_for_values(
                         connection,
                         table="experiences",
@@ -1553,21 +1550,6 @@ class LocalMemoryCore:
             ).fetchone()
             is not None
         )
-        derived_digest_ids = tuple(
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT DISTINCT digest.digest_id
-                FROM buffered_digests AS digest
-                JOIN experiences AS experience
-                  ON experience.experience_id = digest.experience_id
-                JOIN canonical_memory_sources AS source
-                  ON source.source_id = experience.source_id
-                WHERE source.memory_id = ? ORDER BY digest.digest_id
-                """,
-                (memory_id,),
-            ).fetchall()
-        )
         related_memory_ids = tuple(
             row[0]
             for row in connection.execute(
@@ -1650,6 +1632,27 @@ class LocalMemoryCore:
                 ).fetchall()
             )
         ordered_proposal_ids = tuple(sorted(proposal_ids_to_delete))
+        proposal_digest_rows = connection.execute(
+            """
+            SELECT proposal_id, digest_id
+            FROM integration_proposal_buffered
+            ORDER BY proposal_id, digest_id
+            """
+        ).fetchall()
+        retained_proposal_digest_ids = {
+            digest_id
+            for proposal_id, digest_id in proposal_digest_rows
+            if proposal_id not in proposal_ids_to_delete
+        }
+        exclusive_target_digest_ids = {
+            digest_id
+            for proposal_id, digest_id in proposal_digest_rows
+            if proposal_id in proposal_ids_to_delete
+            and digest_id not in retained_proposal_digest_ids
+        }
+        derived_digest_ids = tuple(
+            sorted(set(removed_digest_ids).union(exclusive_target_digest_ids))
+        )
         review_ids_to_delete = _select_ids_for_values(
             connection,
             table="integration_reviews",

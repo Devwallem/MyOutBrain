@@ -67,12 +67,13 @@ class MemoryGovernanceService:
                 "permanent deletion confirmation does not match the current impact"
             )
         views = KnowledgeViewService(self._root)
-        if (self._root / VIEW_MANIFEST).is_file():
+        views_were_built = (self._root / VIEW_MANIFEST).is_file()
+        if views_were_built:
             views.rebuild()
         result = self._core.permanently_delete(
             memory_id,
             confirmation_token=confirmation,
         )
-        if (self._root / VIEW_MANIFEST).is_file():
+        if views_were_built:
             views.rebuild()
         return result

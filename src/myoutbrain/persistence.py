@@ -126,6 +126,7 @@ def permanent_deletion_cleanup_change(
                 "object_references": list(object_references),
                 "view_paths": list(view_paths),
                 "clear_rebuildable_indexes": True,
+                "clear_knowledge_view_metadata": True,
             }
         ),
     )
@@ -147,6 +148,7 @@ def _recover_permanent_deletion_cleanup(root: Path) -> None:
             or not isinstance(view_paths, list)
             or not all(isinstance(value, str) for value in view_paths)
             or document.get("clear_rebuildable_indexes") is not True
+            or document.get("clear_knowledge_view_metadata") is not True
         ):
             raise TypeError
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
@@ -169,6 +171,10 @@ def _recover_permanent_deletion_cleanup(root: Path) -> None:
             root_relative=True,
         )
         target.unlink(missing_ok=True)
+    (root / "vault" / "Knowledge Views" / "Index.md").unlink(missing_ok=True)
+    (root / "runtime" / "knowledge-views" / "manifest.json").unlink(
+        missing_ok=True
+    )
     for index_root in (
         root / "runtime" / "indexes" / "semantic",
         root / "runtime" / "indexes" / "fulltext",

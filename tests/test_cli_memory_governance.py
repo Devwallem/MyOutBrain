@@ -436,6 +436,7 @@ class MemoryGovernanceTests(unittest.TestCase):
                 result["retained_shared_source_ids"],
                 [first["source_id"]],
             )
+            self.assertEqual(result["removed_digest_ids"], [first["digest_id"]])
             self.assertTrue(shared_object.is_file())
             self.assertEqual(recalled.returncode, 0, recalled.stderr)
             self.assertEqual(
@@ -478,6 +479,10 @@ class MemoryGovernanceTests(unittest.TestCase):
                 "json",
             )
             view_path = instance_root / json.loads(built.stdout)["view_paths"][0]
+            view_index = instance_root / "vault" / "Knowledge Views" / "Index.md"
+            view_manifest = (
+                instance_root / "runtime" / "knowledge-views" / "manifest.json"
+            )
             index_path = (
                 instance_root
                 / "runtime"
@@ -525,6 +530,8 @@ class MemoryGovernanceTests(unittest.TestCase):
             self.assertTrue(cleanup_manifest.is_file())
             self.assertTrue(object_path.is_file())
             self.assertTrue(view_path.is_file())
+            self.assertTrue(view_index.is_file())
+            self.assertTrue(view_manifest.is_file())
             self.assertTrue(index_path.is_file())
 
             recovered = run_cli(
@@ -549,6 +556,8 @@ class MemoryGovernanceTests(unittest.TestCase):
             self.assertFalse(cleanup_manifest.exists())
             self.assertFalse(object_path.exists())
             self.assertFalse(view_path.exists())
+            self.assertFalse(view_index.exists())
+            self.assertFalse(view_manifest.exists())
             self.assertFalse(index_path.exists())
 
     def test_storage_report_separates_durable_and_rebuildable_tiers(self) -> None:
