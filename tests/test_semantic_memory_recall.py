@@ -16,7 +16,8 @@ from myoutbrain.embeddings import (
     LocalMultilingualEmbeddingProvider,
     prepare_default_local_embedding_model,
 )
-from myoutbrain.local_core import RecallableMemory
+from myoutbrain.library import KnowledgeWorkflow
+from myoutbrain.local_core import LocalMemoryCore, RecallableMemory
 from myoutbrain.memory_gateway import (
     Answerability,
     MemoryAccess,
@@ -241,6 +242,33 @@ class SemanticMemoryRecallTests(unittest.TestCase):
             constructor_calls,
             [(LocalMultilingualEmbeddingProvider().space.model, False)],
         )
+
+    def test_initialization_prepares_after_durable_state_and_tolerates_unavailability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            instance_root = Path(temporary_directory) / "Private Companion"
+            observed_durable_state: list[bool] = []
+
+            def unavailable_model() -> bool:
+                observed_durable_state.append(
+                    (instance_root / "myoutbrain.toml").is_file()
+                    and (instance_root / "store" / "memory.sqlite3").is_file()
+                )
+                return False
+
+            with patch(
+                "myoutbrain.library.prepare_default_local_embedding_model",
+                side_effect=unavailable_model,
+            ) as prepare:
+                KnowledgeWorkflow(instance_root).initialize()
+
+            prepare.assert_called_once_with()
+            self.assertEqual(observed_durable_state, [True])
+            self.assertEqual(
+                LocalMemoryCore(instance_root).recallable_memories(),
+                (),
+            )
 
     def test_default_local_adapter_recalls_synonymous_buffered_and_canonical_memory(
         self,
