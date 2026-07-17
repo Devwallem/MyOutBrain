@@ -8,12 +8,41 @@ import tempfile
 import unittest
 from unittest import mock
 
+from myoutbrain.generation import ProviderFailure
+from myoutbrain.public_search import search_public_sources
 from tests.cli_support import run_cli
 from tests.test_cli_ask import configure_fake_generation
 from tests.test_cli_memory_evolution import accept_new, propose, remember_evidence
 
 
 class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
+    def test_public_search_endpoint_does_not_follow_redirects(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MYOUTBRAIN_PUBLIC_SEARCH_ENDPOINT": (
+                    "https://search.example/v1/research"
+                ),
+                "MYOUTBRAIN_PUBLIC_SEARCH_API_KEY": "secret-token",
+            },
+            clear=False,
+        ):
+            os.environ.pop("MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE", None)
+            with mock.patch(
+                "myoutbrain.public_search.HTTPSConnection"
+            ) as connection_factory:
+                response = connection_factory.return_value.getresponse.return_value
+                response.status = 302
+
+                with self.assertRaisesRegex(ProviderFailure, "HTTP 302"):
+                    search_public_sources("safe public query", time_sensitive=False)
+
+            connection_factory.assert_called_once_with(
+                "search.example",
+                None,
+                timeout=15,
+            )
+
     def test_sufficient_internal_evidence_answers_without_public_search(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

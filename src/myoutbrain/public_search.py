@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
 import hashlib
 import json
 import os
 from typing import Literal
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from myoutbrain.generation import ProviderFailure
 
@@ -107,24 +106,43 @@ def _search_configured_endpoint(query: str) -> str | None:
     if endpoint is None:
         return None
     parsed_endpoint = urlparse(endpoint)
-    if parsed_endpoint.scheme != "https" or not parsed_endpoint.netloc:
+    if (
+        parsed_endpoint.scheme != "https"
+        or parsed_endpoint.hostname is None
+        or parsed_endpoint.username is not None
+        or parsed_endpoint.password is not None
+    ):
         raise ProviderFailure("public search endpoint must use HTTPS")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     api_key = os.environ.get("MYOUTBRAIN_PUBLIC_SEARCH_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    request = Request(
-        endpoint,
-        data=json.dumps({"query": query}, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
+    request_path = parsed_endpoint.path or "/"
+    if parsed_endpoint.query:
+        request_path = f"{request_path}?{parsed_endpoint.query}"
+    connection = HTTPSConnection(
+        parsed_endpoint.hostname,
+        parsed_endpoint.port,
+        timeout=15,
     )
     try:
-        with urlopen(request, timeout=15) as response:
-            response_body: bytes = response.read()
-            return response_body.decode("utf-8")
-    except (HTTPError, URLError, TimeoutError, UnicodeError, OSError) as error:
+        connection.request(
+            "POST",
+            request_path,
+            body=json.dumps({"query": query}, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+        )
+        response = connection.getresponse()
+        if not 200 <= response.status < 300:
+            raise ProviderFailure(
+                f"public search provider returned HTTP {response.status}"
+            )
+        response_body = response.read()
+        return response_body.decode("utf-8")
+    except (HTTPException, TimeoutError, UnicodeError, OSError) as error:
         raise ProviderFailure("public search provider request failed") from error
+    finally:
+        connection.close()
 
 
 def public_sources_conflict(sources: tuple[PublicSource, ...]) -> bool:
