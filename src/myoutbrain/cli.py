@@ -14,6 +14,7 @@ from myoutbrain.answering import (
     FreshnessRequirement,
     RiskLevel,
 )
+from myoutbrain.cognitive_audit import CognitiveAuditService
 from myoutbrain.evaluation import (
     evaluate_recall,
     load_recall_dataset,
@@ -32,7 +33,11 @@ from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.legacy_migration import MigrationSummary, V1PermanentKnowledgeMigrator
 from myoutbrain.knowledge_views import KnowledgeViewService
 from myoutbrain.generation import ProviderFailure
-from myoutbrain.local_core import IntegrationProposal, LocalMemoryCore
+from myoutbrain.local_core import (
+    CanonicalMemoryAudit,
+    IntegrationProposal,
+    LocalMemoryCore,
+)
 from myoutbrain.memory_gateway import (
     MemoryAccess,
     MemoryGateway,
@@ -180,6 +185,15 @@ def build_parser() -> argparse.ArgumentParser:
     why_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    audit_memory_parser = subcommands.add_parser(
+        "audit-memory",
+        help="Naturally query canonical understanding, sources, and evolution",
+    )
+    audit_memory_parser.add_argument("query")
+    audit_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    audit_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     migrate_parser = subcommands.add_parser(
         "migrate-v1",
         help="Migrate validated V1 permanent knowledge into canonical memory",
@@ -201,6 +215,14 @@ def build_parser() -> argparse.ArgumentParser:
     build_views_parser.add_argument("--root", type=Path, default=Path.cwd())
     build_views_parser.add_argument("--open", action="store_true")
     build_views_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    sync_views_parser = subcommands.add_parser(
+        "sync-view-edits",
+        help="Submit edited generated views as buffered evidence and proposals",
+    )
+    sync_views_parser.add_argument("--root", type=Path, default=Path.cwd())
+    sync_views_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
@@ -536,6 +558,11 @@ def _why_memory(root: Path, memory_id: str, output_format: str) -> int:
     if output_format == "json":
         print(json.dumps(audit.to_data(), ensure_ascii=False, sort_keys=True))
         return 0
+    _render_canonical_audit(audit)
+    return 0
+
+
+def _render_canonical_audit(audit: CanonicalMemoryAudit) -> None:
     print(f"Memory: {audit.memory_id}")
     print(f"State: {audit.state}")
     print(f"Confirmation: {audit.confirmation_status}")
@@ -551,6 +578,21 @@ def _why_memory(root: Path, memory_id: str, output_format: str) -> int:
         print(f"- v{version.version} {version.status}: {version.content}")
         if version.supersession_reason is not None:
             print(f"  Replaced because: {version.supersession_reason}")
+
+
+def _audit_memory(root: Path, query: str, output_format: str) -> int:
+    result = CognitiveAuditService(root).query(query)
+    if output_format == "json":
+        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+        return 0
+    print(f"Cognitive audit: {result.query}")
+    if not result.audits:
+        print("No canonical understanding matched this question.")
+        return 0
+    for index, audit in enumerate(result.audits):
+        if index:
+            print()
+        _render_canonical_audit(audit)
     return 0
 
 
@@ -723,6 +765,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.memory_id,
                 parsed_arguments.format,
             )
+        if parsed_arguments.command == "audit-memory":
+            return _audit_memory(
+                parsed_arguments.root,
+                parsed_arguments.query,
+                parsed_arguments.format,
+            )
         if parsed_arguments.command == "migrate-v1":
             return _render_migration_summary(
                 V1PermanentKnowledgeMigrator(parsed_arguments.root).migrate(),
@@ -734,18 +782,40 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "build-views":
-            result = KnowledgeViewService(parsed_arguments.root).rebuild(
+            view_build = KnowledgeViewService(parsed_arguments.root).rebuild(
                 open_index=parsed_arguments.open
             )
             if parsed_arguments.format == "json":
-                print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+                print(
+                    json.dumps(
+                        view_build.to_data(), ensure_ascii=False, sort_keys=True
+                    )
+                )
             else:
                 print(
-                    f"Generated {len(result.view_paths)} knowledge views at "
-                    f"{result.index_path}."
+                    f"Generated {len(view_build.view_paths)} knowledge views at "
+                    f"{view_build.index_path}."
                 )
-                if result.obsidian_warning is not None:
-                    print(f"Warning: {result.obsidian_warning}", file=sys.stderr)
+                if view_build.obsidian_warning is not None:
+                    print(
+                        f"Warning: {view_build.obsidian_warning}", file=sys.stderr
+                    )
+            return 0
+        if parsed_arguments.command == "sync-view-edits":
+            view_sync = KnowledgeViewService(parsed_arguments.root).sync_edits()
+            if parsed_arguments.format == "json":
+                print(
+                    json.dumps(
+                        view_sync.to_data(), ensure_ascii=False, sort_keys=True
+                    )
+                )
+            else:
+                print(f"Submitted {len(view_sync.edits)} edited knowledge views.")
+                for edit in view_sync.edits:
+                    print(
+                        f"{edit.memory_id}: buffered {edit.digest_id}; proposals "
+                        + (", ".join(edit.proposal_ids) or "none")
+                    )
             return 0
         if parsed_arguments.command == "ask":
             return _ask(

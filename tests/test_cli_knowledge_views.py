@@ -157,6 +157,192 @@ class ObsidianKnowledgeViewTests(unittest.TestCase):
             self.assertEqual(audit.returncode, 0, audit.stderr)
             self.assertEqual(json.loads(audit.stdout)["memory_id"], memory_id)
 
+    def test_human_view_edit_returns_as_buffered_evidence_and_a_proposal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            remember_evidence(
+                temporary_root,
+                instance_root,
+                name="editable-cadence",
+                digest="Project Atlas review cadence is weekly.",
+                task="editable-cadence",
+            )
+            memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "editable-cadence")["proposal_id"],
+            )
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            view_path = instance_root / json.loads(built.stdout)["view_paths"][0]
+            generated = view_path.read_text(encoding="utf-8")
+            view_path.write_text(
+                generated.replace(
+                    (
+                        "## Current understanding\n\n"
+                        "Project Atlas review cadence is weekly."
+                    ),
+                    (
+                        "## Current understanding\n\n"
+                        "Project Atlas review cadence is monthly."
+                    ),
+                ),
+                encoding="utf-8",
+            )
+
+            synced = run_cli(
+                "sync-view-edits",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            canonical = run_cli(
+                "why-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            pending = run_cli(
+                "review-memory",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(synced.returncode, 0, synced.stderr)
+            result = json.loads(synced.stdout)
+            self.assertEqual(result["edit_count"], 1)
+            self.assertEqual(result["edits"][0]["memory_id"], memory_id)
+            self.assertRegex(result["edits"][0]["digest_id"], r"^mem_[0-9a-f]{64}$")
+            self.assertEqual(canonical.returncode, 0, canonical.stderr)
+            audit = json.loads(canonical.stdout)
+            self.assertEqual(
+                audit["current_content"],
+                "Project Atlas review cadence is weekly.",
+            )
+            self.assertEqual(audit["current_version"], 1)
+            self.assertEqual(pending.returncode, 0, pending.stderr)
+            proposals = json.loads(pending.stdout)["proposals"]
+            self.assertEqual(len(proposals), 1)
+            self.assertEqual(
+                proposals[0]["proposed_understanding"],
+                "Project Atlas review cadence is monthly.",
+            )
+            self.assertIn(memory_id, proposals[0]["related_canonical_memory_ids"])
+
+            repeated = run_cli(
+                "sync-view-edits",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertEqual(json.loads(repeated.stdout)["edit_count"], 0)
+
+    def test_natural_audit_query_explains_sources_versions_and_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            initialized = run_cli("init", "--root", str(instance_root))
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            weekly = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="weekly-audit",
+                digest="Project Atlas review cadence is weekly.",
+                task="weekly-audit",
+            )
+            weekly_id = accept_new(
+                instance_root,
+                propose(instance_root, "weekly-audit")["proposal_id"],
+            )
+            daily = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="daily-audit",
+                digest="Project Atlas review cadence is daily.",
+                task="daily-audit",
+            )
+            conflict = propose(instance_root, "daily-audit")
+            preserved = run_cli(
+                "review-memory",
+                str(conflict["proposal_id"]),
+                (
+                    f"preserve conflict with {weekly_id} because: "
+                    "the observations disagree"
+                ),
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(preserved.returncode, 0, preserved.stderr)
+            daily_id = json.loads(preserved.stdout)["canonical_memory_id"]
+
+            audited = run_cli(
+                "audit-memory",
+                "How does Project Atlas review cadence work?",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(audited.returncode, 0, audited.stderr)
+            result = json.loads(audited.stdout)
+            self.assertEqual(result["query"], "How does Project Atlas review cadence work?")
+            audits = {audit["memory_id"]: audit for audit in result["audits"]}
+            self.assertEqual(set(audits), {weekly_id, daily_id})
+            weekly_audit = audits[weekly_id]
+            self.assertEqual(weekly_audit["confirmation_status"], "conflicted")
+            self.assertEqual(weekly_audit["current_source_ids"], [weekly["source_id"]])
+            self.assertEqual(weekly_audit["versions"][0]["status"], "current")
+            self.assertEqual(
+                weekly_audit["unresolved_conflicts"][0]["memory_id"],
+                daily_id,
+            )
+            self.assertEqual(
+                weekly_audit["unresolved_conflicts"][0]["source_ids"],
+                [daily["source_id"]],
+            )
+            built = run_cli(
+                "build-views",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            view_paths = [
+                instance_root / relative_path
+                for relative_path in json.loads(built.stdout)["view_paths"]
+            ]
+            view_by_memory = {
+                next(
+                    line.removeprefix("memory_id: ")
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("memory_id: ")
+                ): path
+                for path in view_paths
+            }
+            weekly_view = view_by_memory[weekly_id].read_text(encoding="utf-8")
+            self.assertIn("## Unresolved conflicts", weekly_view)
+            self.assertIn("the observations disagree", weekly_view)
+            self.assertIn(f"[[{view_by_memory[daily_id].stem}]]", weekly_view)
+
 
 if __name__ == "__main__":
     unittest.main()
