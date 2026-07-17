@@ -140,33 +140,21 @@ class MemoryGateway:
         memories = LocalMemoryCore(self._root).recallable_memories()
         requested_memory_ids = frozenset(request.memory_ids)
         requested_source_ids = frozenset(request.source_ids)
-        canonical = tuple(
-            memory
-            for memory in memories
-            if memory.memory_state is MemoryState.CANONICAL
-            and _allows(
-                memory,
-                request.access,
-                task,
-                explicitly_requested=(
-                    memory.memory_id in requested_memory_ids
-                    or bool(requested_source_ids.intersection(memory.source_ids))
-                ),
-            )
+        canonical = _eligible_for_phase(
+            memories,
+            state=MemoryState.CANONICAL,
+            access=request.access,
+            task=task,
+            requested_memory_ids=requested_memory_ids,
+            requested_source_ids=requested_source_ids,
         )
-        buffered = tuple(
-            memory
-            for memory in memories
-            if memory.memory_state is MemoryState.BUFFERED
-            and _allows(
-                memory,
-                request.access,
-                task,
-                explicitly_requested=(
-                    memory.memory_id in requested_memory_ids
-                    or bool(requested_source_ids.intersection(memory.source_ids))
-                ),
-            )
+        buffered = _eligible_for_phase(
+            memories,
+            state=MemoryState.BUFFERED,
+            access=request.access,
+            task=task,
+            requested_memory_ids=requested_memory_ids,
+            requested_source_ids=requested_source_ids,
         )
         canonical_matches = _match_phase(
             query,
@@ -211,6 +199,31 @@ _MATCH_ORDER = {
     RecallMatch.SOURCE_RELATION: 1,
     RecallMatch.FULL_TEXT: 2,
 }
+
+
+def _eligible_for_phase(
+    memories: tuple[RecallableMemory, ...],
+    *,
+    state: MemoryState,
+    access: MemoryAccess,
+    task: str,
+    requested_memory_ids: frozenset[str],
+    requested_source_ids: frozenset[str],
+) -> tuple[RecallableMemory, ...]:
+    return tuple(
+        memory
+        for memory in memories
+        if memory.memory_state is state
+        and _allows(
+            memory,
+            access,
+            task,
+            explicitly_requested=(
+                memory.memory_id in requested_memory_ids
+                or bool(requested_source_ids.intersection(memory.source_ids))
+            ),
+        )
+    )
 
 
 def _allows(
