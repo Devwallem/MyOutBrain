@@ -15,6 +15,11 @@ from myoutbrain.answering import (
     RiskLevel,
 )
 from myoutbrain.cognitive_audit import CognitiveAuditService
+from myoutbrain.codex_entrance import (
+    CodexEntrance,
+    CodexTaskRequest,
+    CodexVisibleExperience,
+)
 from myoutbrain.consolidation import ConsolidationScheduler
 from myoutbrain.evaluation import (
     evaluate_recall,
@@ -41,6 +46,7 @@ from myoutbrain.local_core import (
     MemoryDeletionImpact,
 )
 from myoutbrain.memory_gateway import (
+    ExperienceSubmission,
     MemoryAccess,
     MemoryGateway,
     QueryPurpose,
@@ -92,6 +98,55 @@ def build_parser() -> argparse.ArgumentParser:
     remember_parser.add_argument("--visible-context", required=True)
     remember_parser.add_argument("--context-gap", action="append", required=True)
     remember_parser.add_argument("--format", choices=("json", "text"), default="text")
+    codex_submit_parser = subcommands.add_parser(
+        "codex-submit",
+        help="Submit only the task context currently visible to Codex",
+    )
+    codex_submit_parser.add_argument("visible_task", type=Path)
+    codex_submit_parser.add_argument("--root", type=Path, default=Path.cwd())
+    codex_submit_parser.add_argument("--occurred-at", required=True)
+    codex_submit_parser.add_argument("--task-pointer", required=True)
+    codex_submit_parser.add_argument("--digest", required=True)
+    codex_submit_parser.add_argument(
+        "--sensitivity",
+        required=True,
+        choices=("local-only", "cloud-allowed"),
+    )
+    codex_submit_parser.add_argument("--visible-context", required=True)
+    codex_submit_parser.add_argument(
+        "--context-gap", action="append", required=True
+    )
+    codex_submit_parser.add_argument(
+        "--format", choices=("json", "text"), default="json"
+    )
+    codex_context_parser = subcommands.add_parser(
+        "codex-context",
+        help="Request the minimal task evidence package before Codex works",
+    )
+    codex_context_parser.add_argument("question")
+    codex_context_parser.add_argument("--root", type=Path, default=Path.cwd())
+    codex_context_parser.add_argument("--task-pointer", required=True)
+    codex_context_parser.add_argument(
+        "--purpose",
+        choices=tuple(purpose.value for purpose in QueryPurpose),
+        default=QueryPurpose.SUBSTANTIVE.value,
+    )
+    codex_context_parser.add_argument(
+        "--access",
+        choices=tuple(level.value for level in MemoryAccess),
+        default=MemoryAccess.TASK_SCOPED.value,
+    )
+    codex_context_parser.add_argument("--memory-id", action="append", default=[])
+    codex_context_parser.add_argument("--source-id", action="append", default=[])
+    codex_context_parser.add_argument("--limit", type=int, default=5)
+    codex_context_parser.add_argument(
+        "--query-sensitivity",
+        choices=("local-only", "cloud-allowed"),
+        default="local-only",
+    )
+    codex_context_parser.add_argument(
+        "--format", choices=("json", "text"), default="json"
+    )
     recall_parser = subcommands.add_parser(
         "recall",
         help="Request a task-scoped memory evidence package",
@@ -440,15 +495,17 @@ def _remember(
     context_gaps: Sequence[str],
     output_format: str,
 ) -> int:
-    receipt = LocalMemoryCore(root).capture_experience(
-        conversation,
-        occurred_at=occurred_at,
-        entrance=entrance,
-        task=task,
-        memory_digest=digest,
-        sensitivity=sensitivity,
-        visible_context=visible_context,
-        context_gaps=tuple(context_gaps),
+    receipt = MemoryGateway(root).submit(
+        ExperienceSubmission(
+            experience_path=conversation,
+            occurred_at=occurred_at,
+            entrance=entrance,
+            task_pointer=task,
+            digest=digest,
+            sensitivity=sensitivity,
+            visible_context=visible_context,
+            context_gaps=tuple(context_gaps),
+        )
     )
     if output_format == "json":
         print(json.dumps(receipt.to_data(), ensure_ascii=False, sort_keys=True))
@@ -497,6 +554,64 @@ def _recall(
             f"{item.content}"
         )
     return 0
+
+
+def _codex_submit(
+    root: Path,
+    visible_task: Path,
+    *,
+    occurred_at: str,
+    task_pointer: str,
+    digest: str,
+    sensitivity: Sensitivity,
+    visible_context: str,
+    context_gaps: Sequence[str],
+    output_format: str,
+) -> int:
+    try:
+        visible_text = visible_task.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise UserInputError(f"cannot read visible Codex task: {visible_task}") from error
+    receipt = CodexEntrance(root).after_task(
+        CodexVisibleExperience(
+            visible_text=visible_text,
+            occurred_at=occurred_at,
+            task_pointer=task_pointer,
+            digest=digest,
+            sensitivity=sensitivity,
+            visible_context=visible_context,
+            context_gaps=tuple(context_gaps),
+        )
+    )
+    return _render_simple_data(receipt.to_data(), output_format)
+
+
+def _codex_context(
+    root: Path,
+    question: str,
+    *,
+    task_pointer: str,
+    purpose: str,
+    access: str,
+    memory_ids: Sequence[str],
+    source_ids: Sequence[str],
+    limit: int,
+    query_sensitivity: Sensitivity,
+    output_format: str,
+) -> int:
+    context = CodexEntrance(root).before_task(
+        CodexTaskRequest(
+            question=question,
+            task_pointer=task_pointer,
+            purpose=QueryPurpose(purpose),
+            access=MemoryAccess(access),
+            memory_ids=tuple(memory_ids),
+            source_ids=tuple(source_ids),
+            limit=limit,
+            query_sensitivity=query_sensitivity,
+        )
+    )
+    return _render_simple_data(context.to_data(), output_format)
 
 
 def _answer(
@@ -944,6 +1059,31 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 sensitivity=parsed_arguments.sensitivity,
                 visible_context=parsed_arguments.visible_context,
                 context_gaps=parsed_arguments.context_gap,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "codex-submit":
+            return _codex_submit(
+                parsed_arguments.root,
+                parsed_arguments.visible_task,
+                occurred_at=parsed_arguments.occurred_at,
+                task_pointer=parsed_arguments.task_pointer,
+                digest=parsed_arguments.digest,
+                sensitivity=parsed_arguments.sensitivity,
+                visible_context=parsed_arguments.visible_context,
+                context_gaps=parsed_arguments.context_gap,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "codex-context":
+            return _codex_context(
+                parsed_arguments.root,
+                parsed_arguments.question,
+                task_pointer=parsed_arguments.task_pointer,
+                purpose=parsed_arguments.purpose,
+                access=parsed_arguments.access,
+                memory_ids=parsed_arguments.memory_id,
+                source_ids=parsed_arguments.source_id,
+                limit=parsed_arguments.limit,
+                query_sensitivity=parsed_arguments.query_sensitivity,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "recall":

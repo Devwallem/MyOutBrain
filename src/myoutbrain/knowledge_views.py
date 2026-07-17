@@ -9,6 +9,7 @@ import os
 import re
 
 from myoutbrain.local_core import CanonicalMemoryAudit, LocalMemoryCore
+from myoutbrain.memory_gateway import ExperienceSubmission, MemoryGateway
 from myoutbrain.core_types import (
     IntegrityError,
     UserInputError,
@@ -161,17 +162,19 @@ class KnowledgeViewService:
                 view_path.stat().st_mtime,
                 tz=timezone.utc,
             ).isoformat()
-            receipt = core.capture_experience(
-                view_path,
-                occurred_at=occurred_at,
-                entrance="obsidian-view",
-                task=task,
-                memory_digest=edited_understanding,
-                sensitivity="local-only",
-                visible_context=f"edited generated knowledge view for {memory_id}",
-                context_gaps=(
-                    "Only the edited generated view and its canonical identity are visible.",
-                ),
+            receipt = MemoryGateway(self._root).submit(
+                ExperienceSubmission(
+                    experience_path=view_path,
+                    occurred_at=occurred_at,
+                    entrance="obsidian-view",
+                    task_pointer=task,
+                    digest=edited_understanding,
+                    sensitivity="local-only",
+                    visible_context=f"edited generated knowledge view for {memory_id}",
+                    context_gaps=(
+                        "Only the edited generated view and its canonical identity are visible.",
+                    ),
+                )
             )
             proposals = core.propose_manual_consolidation(task)
             edits.append(

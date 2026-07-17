@@ -22,7 +22,11 @@ from myoutbrain.embeddings import (
     EmbeddingProvider,
     LocalMultilingualEmbeddingProvider,
 )
-from myoutbrain.local_core import LocalMemoryCore, RecallableMemory
+from myoutbrain.local_core import (
+    BufferedMemoryReceipt,
+    LocalMemoryCore,
+    RecallableMemory,
+)
 from myoutbrain.retrieval import lexical_terms
 from myoutbrain.semantic_index import SemanticRecallIndex
 
@@ -65,8 +69,35 @@ class RecallRequest:
     query_sensitivity: Sensitivity = "local-only"
 
 
+@dataclass(frozen=True)
+class ExperienceSubmission:
+    experience_path: Path
+    occurred_at: str
+    entrance: str
+    task_pointer: str
+    digest: str
+    sensitivity: Sensitivity
+    visible_context: str
+    context_gaps: tuple[str, ...]
+
+
 class MemoryReader(Protocol):
     def recallable_memories(self) -> tuple[RecallableMemory, ...]: ...
+
+
+class MemoryWriter(Protocol):
+    def capture_experience(
+        self,
+        conversation_path: Path,
+        *,
+        occurred_at: str,
+        entrance: str,
+        task: str,
+        memory_digest: str,
+        sensitivity: Sensitivity,
+        visible_context: str,
+        context_gaps: tuple[str, ...],
+    ) -> BufferedMemoryReceipt: ...
 
 
 @dataclass(frozen=True)
@@ -145,12 +176,27 @@ class MemoryGateway:
         *,
         embedding_provider: EmbeddingProvider | None = None,
         memory_reader: MemoryReader | None = None,
+        memory_writer: MemoryWriter | None = None,
     ) -> None:
         self._root = root
         self._embedding_provider = (
             embedding_provider or LocalMultilingualEmbeddingProvider()
         )
-        self._memory_reader = memory_reader or LocalMemoryCore(root)
+        memory_core = LocalMemoryCore(root)
+        self._memory_reader = memory_reader or memory_core
+        self._memory_writer = memory_writer or memory_core
+
+    def submit(self, submission: ExperienceSubmission) -> BufferedMemoryReceipt:
+        return self._memory_writer.capture_experience(
+            submission.experience_path,
+            occurred_at=submission.occurred_at,
+            entrance=submission.entrance,
+            task=submission.task_pointer,
+            memory_digest=submission.digest,
+            sensitivity=submission.sensitivity,
+            visible_context=submission.visible_context,
+            context_gaps=submission.context_gaps,
+        )
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()

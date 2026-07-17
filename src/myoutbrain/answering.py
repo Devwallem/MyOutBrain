@@ -21,8 +21,8 @@ from myoutbrain.generation import (
     ProviderFailure,
 )
 from myoutbrain.library import configured_generation_provider
-from myoutbrain.local_core import LocalMemoryCore
 from myoutbrain.memory_gateway import (
+    ExperienceSubmission,
     MemoryAccess,
     MemoryEvidence,
     MemoryGateway,
@@ -342,15 +342,17 @@ class CompanionAnswerService:
             ) as temporary_file:
                 temporary_path = Path(temporary_file.name)
                 temporary_file.write(body)
-            receipt = LocalMemoryCore(self._root).capture_experience(
-                temporary_path,
-                occurred_at=datetime.now(timezone.utc).isoformat(),
-                entrance="companion-answer",
-                task=request.task,
-                memory_digest=summary,
-                sensitivity=sensitivity,
-                visible_context="substantive question, answer, and cited evidence",
-                context_gaps=("conversation outside this answer is unavailable",),
+            receipt = MemoryGateway(self._root).submit(
+                ExperienceSubmission(
+                    experience_path=temporary_path,
+                    occurred_at=datetime.now(timezone.utc).isoformat(),
+                    entrance="companion-answer",
+                    task_pointer=request.task,
+                    digest=summary,
+                    sensitivity=sensitivity,
+                    visible_context="substantive question, answer, and cited evidence",
+                    context_gaps=("conversation outside this answer is unavailable",),
+                )
             )
             return receipt.digest_id
         finally:

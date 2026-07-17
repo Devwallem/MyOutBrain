@@ -7,6 +7,7 @@ import unittest
 
 from myoutbrain.memory_gateway import (
     Answerability,
+    ExperienceSubmission,
     MemoryAccess,
     MemoryGateway,
     MemoryState,
@@ -18,6 +19,46 @@ from tests.cli_support import run_cli
 
 
 class MemoryGatewayTests(unittest.TestCase):
+    def test_entrance_submits_only_visible_experience_through_shared_gateway(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            visible_experience = temporary_root / "visible-task.txt"
+            visible_experience.write_text(
+                "The visible task confirms that release notes require source links.",
+                encoding="utf-8",
+            )
+
+            receipt = MemoryGateway(instance_root).submit(
+                ExperienceSubmission(
+                    experience_path=visible_experience,
+                    occurred_at="2026-07-18T09:00:00+08:00",
+                    entrance="codex",
+                    task_pointer="release-notes",
+                    digest="Release notes must retain source links.",
+                    sensitivity="local-only",
+                    visible_context="current release-notes task only",
+                    context_gaps=("earlier task messages are unavailable",),
+                )
+            )
+            recalled = MemoryGateway(instance_root).recall(
+                RecallRequest(
+                    query="What must release notes retain?",
+                    task="release-notes",
+                    access=MemoryAccess.TASK_SCOPED,
+                    purpose=QueryPurpose.SUBSTANTIVE,
+                )
+            )
+
+            self.assertEqual(recalled.items[0].memory_id, receipt.digest_id)
+            self.assertEqual(recalled.items[0].entrance, "codex")
+            self.assertEqual(recalled.items[0].task, "release-notes")
     def test_new_buffered_memory_is_immediately_recalled_with_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
