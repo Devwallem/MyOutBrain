@@ -216,6 +216,14 @@ def build_parser() -> argparse.ArgumentParser:
     delete_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    storage_report_parser = subcommands.add_parser(
+        "storage-report",
+        help="Report durable evidence, canonical, buffer, and index storage",
+    )
+    storage_report_parser.add_argument("--root", type=Path, default=Path.cwd())
+    storage_report_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     migrate_parser = subcommands.add_parser(
         "migrate-v1",
         help="Migrate validated V1 permanent knowledge into canonical memory",
@@ -842,6 +850,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     f"Permanently deleted {deletion.memory_id}; removed "
                     f"{len(deletion.removed_source_ids)} unshared source(s)."
                 )
+            return 0
+        if parsed_arguments.command == "storage-report":
+            storage_report = LocalMemoryCore(parsed_arguments.root).storage_report()
+            data = storage_report.to_data()
+            if parsed_arguments.format == "json":
+                print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+            else:
+                for label, key in (
+                    ("Evidence", "evidence"),
+                    ("Canonical", "canonical"),
+                    ("Buffer", "buffer"),
+                    ("Rebuildable indexes", "rebuildable_indexes"),
+                ):
+                    tier = data[key]
+                    if not isinstance(tier, dict):
+                        raise IntegrityError("storage report tier is invalid")
+                    print(f"{label}: {tier['count']} item(s), {tier['bytes']} bytes")
+                print("Destructive maintenance requires explicit approval.")
             return 0
         if parsed_arguments.command == "migrate-v1":
             return _render_migration_summary(

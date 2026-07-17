@@ -567,6 +567,42 @@ class MemoryDeletionResult:
 
 
 @dataclass(frozen=True)
+class MemoryStorageReport:
+    evidence_source_ids: tuple[str, ...]
+    evidence_bytes: int
+    canonical_count: int
+    canonical_version_count: int
+    canonical_bytes: int
+    buffer_count: int
+    buffer_bytes: int
+    rebuildable_index_count: int
+    rebuildable_index_bytes: int
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "evidence": {
+                "count": len(self.evidence_source_ids),
+                "bytes": self.evidence_bytes,
+                "source_ids": list(self.evidence_source_ids),
+            },
+            "canonical": {
+                "count": self.canonical_count,
+                "version_count": self.canonical_version_count,
+                "bytes": self.canonical_bytes,
+            },
+            "buffer": {
+                "count": self.buffer_count,
+                "bytes": self.buffer_bytes,
+            },
+            "rebuildable_indexes": {
+                "count": self.rebuildable_index_count,
+                "bytes": self.rebuildable_index_bytes,
+            },
+            "destructive_maintenance": "requires-explicit-approval",
+        }
+
+
+@dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
     state: Literal["active", "inactive"]
@@ -1389,6 +1425,77 @@ class LocalMemoryCore:
             removed_proposal_ids=removed_proposal_ids,
             deleted_at=deleted_at,
             backup_exclusion_after=deleted_at,
+        )
+
+    def storage_report(self) -> MemoryStorageReport:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    source_rows = connection.execute(
+                        """
+                        SELECT source_id, object_reference FROM source_objects
+                        ORDER BY source_id
+                        """
+                    ).fetchall()
+                    canonical_rows = connection.execute(
+                        "SELECT content FROM canonical_memory_versions"
+                    ).fetchall()
+                    canonical_count_row = connection.execute(
+                        "SELECT COUNT(*) FROM canonical_memories"
+                    ).fetchone()
+                    buffer_rows = connection.execute(
+                        """
+                        SELECT content FROM buffered_digests
+                        WHERE state = 'buffered'
+                        """
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot read memory storage usage") from error
+            evidence_bytes = 0
+            for _, object_reference in source_rows:
+                object_path = _resolved_object_reference(
+                    self._root,
+                    object_reference,
+                )
+                try:
+                    evidence_bytes += object_path.stat().st_size
+                except OSError as error:
+                    raise IntegrityError(
+                        f"cannot measure source object: {object_path}"
+                    ) from error
+            index_files = tuple(
+                path
+                for path in (self._root / "runtime" / "indexes").rglob("*")
+                if path.is_file()
+            )
+            try:
+                index_bytes = sum(path.stat().st_size for path in index_files)
+            except OSError as error:
+                raise IntegrityError("cannot measure rebuildable indexes") from error
+        canonical_count = (
+            canonical_count_row[0] if canonical_count_row is not None else 0
+        )
+        if not isinstance(canonical_count, int):
+            raise IntegrityError("canonical memory count is invalid")
+        return MemoryStorageReport(
+            evidence_source_ids=tuple(row[0] for row in source_rows),
+            evidence_bytes=evidence_bytes,
+            canonical_count=canonical_count,
+            canonical_version_count=len(canonical_rows),
+            canonical_bytes=sum(
+                len(row[0].encode("utf-8")) for row in canonical_rows
+            ),
+            buffer_count=len(buffer_rows),
+            buffer_bytes=sum(len(row[0].encode("utf-8")) for row in buffer_rows),
+            rebuildable_index_count=len(index_files),
+            rebuildable_index_bytes=index_bytes,
         )
 
     @staticmethod

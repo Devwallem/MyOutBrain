@@ -323,6 +323,7 @@ class MigrateV1PermanentKnowledgeTests(unittest.TestCase):
                 connection.executescript(
                     """
                     PRAGMA foreign_keys = OFF;
+                    DROP TABLE deletion_markers;
                     DROP TABLE legacy_knowledge_metadata;
                     DROP TABLE legacy_source_metadata;
                     DROP TABLE legacy_audit_events;

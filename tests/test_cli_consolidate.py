@@ -58,6 +58,7 @@ def downgrade_memory_store_to_v2(instance_root: Path) -> None:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.executescript(
             """
+            DROP TABLE deletion_markers;
             DROP TABLE legacy_knowledge_metadata;
             DROP TABLE legacy_source_metadata;
             DROP TABLE legacy_audit_events;

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import json
+import sqlite3
 import tempfile
 import unittest
 
@@ -303,6 +305,186 @@ class MemoryGovernanceTests(unittest.TestCase):
                 if path.is_file()
             ]
             self.assertEqual(object_files, [])
+
+    def test_permanent_deletion_retains_a_source_shared_by_another_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            first = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="shared-first",
+                digest="Project Fir uses a weekly review.",
+                task="shared-first",
+            )
+            first_memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "shared-first")["proposal_id"],
+            )
+            remember_evidence(
+                temporary_root,
+                instance_root,
+                name="shared-second",
+                digest="The sourdough starter is fed at dawn.",
+                task="shared-second",
+            )
+            second_memory_id = accept_new(
+                instance_root,
+                propose(instance_root, "shared-second")["proposal_id"],
+            )
+            database_path = instance_root / "store" / "memory.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_sources (memory_id, source_id)
+                    VALUES (?, ?)
+                    """,
+                    (second_memory_id, first["source_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_version_sources
+                        (memory_id, version, source_id)
+                    VALUES (?, 1, ?)
+                    """,
+                    (second_memory_id, first["source_id"]),
+                )
+                object_reference = connection.execute(
+                    "SELECT object_reference FROM source_objects WHERE source_id = ?",
+                    (first["source_id"],),
+                ).fetchone()[0]
+                connection.commit()
+            shared_object = instance_root / "store" / "objects" / object_reference
+
+            previewed = run_cli(
+                "delete-memory",
+                first_memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            preview = json.loads(previewed.stdout)
+            deleted = run_cli(
+                "delete-memory",
+                first_memory_id,
+                "--confirm",
+                preview["confirmation_token"],
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            recalled = run_cli(
+                "recall",
+                "sourdough starter dawn",
+                "--root",
+                str(instance_root),
+                "--task",
+                "shared-retention",
+                "--access",
+                "local-trusted",
+                "--memory-id",
+                second_memory_id,
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(deleted.returncode, 0, deleted.stderr)
+            result = json.loads(deleted.stdout)
+            self.assertEqual(result["removed_source_ids"], [])
+            self.assertEqual(
+                result["retained_shared_source_ids"],
+                [first["source_id"]],
+            )
+            self.assertTrue(shared_object.is_file())
+            self.assertEqual(recalled.returncode, 0, recalled.stderr)
+            self.assertEqual(
+                [item["memory_id"] for item in json.loads(recalled.stdout)["items"]],
+                [second_memory_id],
+            )
+
+    def test_storage_report_separates_durable_and_rebuildable_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "Private Companion"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            buffered = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="storage-buffered",
+                digest="Unreviewed storage note remains buffered.",
+                task="storage-buffered",
+            )
+            canonical = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="storage-canonical",
+                digest="Approved storage note becomes canonical.",
+                task="storage-canonical",
+            )
+            accept_new(
+                instance_root,
+                propose(instance_root, "storage-canonical")["proposal_id"],
+            )
+            rebuildable_file = (
+                instance_root
+                / "runtime"
+                / "indexes"
+                / "fulltext"
+                / "acceptance-projection.json"
+            )
+            rebuildable_file.parent.mkdir(parents=True, exist_ok=True)
+            rebuildable_file.write_text('{"rebuildable": true}\n', encoding="utf-8")
+            object_paths_before = sorted(
+                path
+                for path in (instance_root / "store" / "objects").rglob("*")
+                if path.is_file()
+            )
+
+            reported = run_cli(
+                "storage-report",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(reported.returncode, 0, reported.stderr)
+            report = json.loads(reported.stdout)
+            self.assertEqual(report["evidence"]["count"], 2)
+            self.assertGreater(report["evidence"]["bytes"], 0)
+            self.assertEqual(report["canonical"]["count"], 1)
+            self.assertEqual(report["canonical"]["version_count"], 1)
+            self.assertGreater(report["canonical"]["bytes"], 0)
+            self.assertEqual(report["buffer"]["count"], 1)
+            self.assertGreater(report["buffer"]["bytes"], 0)
+            self.assertEqual(report["rebuildable_indexes"]["count"], 1)
+            self.assertEqual(
+                report["rebuildable_indexes"]["bytes"],
+                rebuildable_file.stat().st_size,
+            )
+            self.assertEqual(
+                report["destructive_maintenance"],
+                "requires-explicit-approval",
+            )
+            self.assertEqual(
+                sorted(
+                    path
+                    for path in (instance_root / "store" / "objects").rglob("*")
+                    if path.is_file()
+                ),
+                object_paths_before,
+            )
+            self.assertIn(buffered["source_id"], report["evidence"]["source_ids"])
+            self.assertIn(canonical["source_id"], report["evidence"]["source_ids"])
 
 
 if __name__ == "__main__":
