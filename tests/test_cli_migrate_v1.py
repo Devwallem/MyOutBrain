@@ -159,6 +159,22 @@ class MigrateV1PermanentKnowledgeTests(unittest.TestCase):
                 json.loads(explained.stdout)["current_source_ids"],
                 [source_id],
             )
+            archived_explanation = run_cli(
+                "why-memory",
+                insight_id,
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(
+                archived_explanation.returncode,
+                0,
+                archived_explanation.stderr,
+            )
+            archived_data = json.loads(archived_explanation.stdout)
+            self.assertEqual(archived_data["state"], "inactive")
+            self.assertEqual(archived_data["current_source_ids"], [source_id])
 
             status = run_cli(
                 "migration-status",
@@ -174,21 +190,60 @@ class MigrateV1PermanentKnowledgeTests(unittest.TestCase):
             self.assertEqual(status_data["cognition_count"], 1)
             self.assertGreater(status_data["event_count"], 0)
 
-            repeated_without_vault = run_cli(
+    def test_changed_v1_truth_after_completion_stops_without_reimporting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            library_root, insight_id, insight_path, _ = create_derived_insight(
+                Path(temporary_directory)
+            )
+            first = run_cli(
                 "migrate-v1",
                 "--root",
                 str(library_root),
                 "--format",
                 "json",
             )
-            self.assertEqual(
-                repeated_without_vault.returncode,
-                0,
-                repeated_without_vault.stderr,
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_fingerprint = json.loads(first.stdout)["source_fingerprint"]
+            insight_path.write_text(
+                insight_path.read_text(encoding="utf-8").replace(
+                    "Reflection turns experience into reusable guidance.",
+                    "Changed legacy understanding must not be silently imported.",
+                ),
+                encoding="utf-8",
             )
+
+            repeated = run_cli(
+                "migrate-v1",
+                "--root",
+                str(library_root),
+            )
+
+            self.assertEqual(repeated.returncode, 3, repeated.stderr)
+            self.assertIn("changed after migration completed", repeated.stderr)
+            status = run_cli(
+                "migration-status",
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(status.returncode, 0, status.stderr)
             self.assertEqual(
-                json.loads(repeated_without_vault.stdout)["disposition"],
-                "already-complete",
+                json.loads(status.stdout)["source_fingerprint"],
+                first_fingerprint,
+            )
+            explained = run_cli(
+                "why-memory",
+                insight_id,
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(explained.returncode, 0, explained.stderr)
+            self.assertIn(
+                "Reflection turns experience into reusable guidance.",
+                json.loads(explained.stdout)["current_content"],
             )
 
     def test_unreviewed_candidate_is_not_promoted_by_migration(self) -> None:

@@ -13,9 +13,10 @@ import tomllib
 from typing import Literal
 
 from myoutbrain.core_types import ConfigurationConflict, IntegrityError
-from myoutbrain.library import KnowledgeWorkflow, SourceRecord
+from myoutbrain.library import SourceRecord
 from myoutbrain.local_core import MEMORY_DATABASE, MEMORY_SCHEMA_VERSION, LocalMemoryCore
 from myoutbrain.persistence import atomic_commit, recover_transactions, writer_lock
+from myoutbrain.reconstruction import ReconstructionError, RuntimeReconstructor
 from myoutbrain.vault import KnowledgeNoteSnapshot, VaultIntegrityError, scan_knowledge_notes
 
 
@@ -94,20 +95,25 @@ class V1PermanentKnowledgeMigrator:
             )
 
         LocalMemoryCore(self._root).initialize()
-        existing = self.status()
-        if existing.status == "complete":
-            return _with_disposition(existing, "already-complete")
-
-        # The existing public rebuild path validates source objects, knowledge
-        # relationships, confirmation events, and journal consistency first.
-        KnowledgeWorkflow(self._root).rebuild_runtime()
-        migration_input = self._read_input()
         database_path = self._root / MEMORY_DATABASE
 
         with writer_lock(self._root):
             recover_transactions(self._root)
             existing = self._read_status(database_path)
+            try:
+                # Validate source objects, knowledge relationships,
+                # confirmation events, and journal consistency while the same
+                # writer lock protects the input snapshot and final commit.
+                RuntimeReconstructor(self._root).rebuild()
+            except ReconstructionError as error:
+                raise IntegrityError(str(error)) from error
+            migration_input = self._read_input()
             if existing.status == "complete":
+                if existing.source_fingerprint != migration_input.fingerprint:
+                    raise ConfigurationConflict(
+                        "V1 permanent knowledge changed after migration completed; "
+                        "the canonical core was not modified"
+                    )
                 return _with_disposition(existing, "already-complete")
 
             completed_at = datetime.now(timezone.utc).isoformat()

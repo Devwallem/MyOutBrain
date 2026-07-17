@@ -459,6 +459,7 @@ class UnresolvedMemoryConflict:
 @dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
+    state: Literal["active", "inactive"]
     confirmation_status: Literal["confirmed", "conflicted"]
     current_version: int
     current_content: str
@@ -469,6 +470,7 @@ class CanonicalMemoryAudit:
     def to_data(self) -> dict[str, object]:
         return {
             "memory_id": self.memory_id,
+            "state": self.state,
             "confirmation_status": self.confirmation_status,
             "current_version": self.current_version,
             "current_content": self.current_content,
@@ -1011,9 +1013,9 @@ class LocalMemoryCore:
                 with closing(sqlite3.connect(database_path)) as connection:
                     current = connection.execute(
                         """
-                        SELECT content, current_version
+                        SELECT content, current_version, state
                         FROM canonical_memories
-                        WHERE memory_id = ? AND state = 'active'
+                        WHERE memory_id = ?
                         """,
                         (normalized_memory_id,),
                     ).fetchone()
@@ -1061,11 +1063,14 @@ class LocalMemoryCore:
                     ).fetchall()
             except sqlite3.Error as error:
                 raise IntegrityError("cannot explain canonical memory") from error
-        if current is None or not isinstance(current[0], str) or not isinstance(
-            current[1], int
+        if (
+            current is None
+            or not isinstance(current[0], str)
+            or not isinstance(current[1], int)
+            or current[2] not in ("active", "inactive")
         ):
             raise UserInputError(
-                f"active canonical memory does not exist: {normalized_memory_id}"
+                f"canonical memory does not exist: {normalized_memory_id}"
             )
         versions = tuple(
             CanonicalMemoryVersion(
@@ -1099,6 +1104,7 @@ class LocalMemoryCore:
         )
         return CanonicalMemoryAudit(
             memory_id=normalized_memory_id,
+            state=current[2],
             confirmation_status="conflicted" if conflicts else "confirmed",
             current_version=current_version,
             current_content=current[0],

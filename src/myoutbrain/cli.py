@@ -414,6 +414,7 @@ def _why_memory(root: Path, memory_id: str, output_format: str) -> int:
         print(json.dumps(audit.to_data(), ensure_ascii=False, sort_keys=True))
         return 0
     print(f"Memory: {audit.memory_id}")
+    print(f"State: {audit.state}")
     print(f"Confirmation: {audit.confirmation_status}")
     print(f"Current version: {audit.current_version}")
     print(f"Current understanding: {audit.current_content}")
