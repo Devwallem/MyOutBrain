@@ -122,6 +122,15 @@ def build_parser() -> argparse.ArgumentParser:
     memory_review_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    why_memory_parser = subcommands.add_parser(
+        "why-memory",
+        help="Explain a canonical memory's current evidence and evolution",
+    )
+    why_memory_parser.add_argument("memory_id")
+    why_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    why_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     ask_parser = subcommands.add_parser("ask", help="Answer a question from one captured source")
     ask_parser.add_argument("source_id")
     ask_parser.add_argument("question")
@@ -281,6 +290,8 @@ def _render_integration_proposals(
         print(f"Topic: {proposal['topic']}")
         print(f"Proposed understanding: {proposal['proposed_understanding']}")
         print(f"Possible impact: {proposal['possible_impact']}")
+        print(f"Suggested action: {proposal['suggested_action']}")
+        print(f"Target memory: {proposal['target_memory_id'] or 'none'}")
         evidence = proposal["evidence_memory_ids"]
         if not isinstance(evidence, list) or not all(
             isinstance(memory_id, str) for memory_id in evidence
@@ -355,6 +366,28 @@ def _review_memory(
         return 0
     proposals = LocalMemoryCore(root).pending_integration_proposals()
     return _render_integration_proposals(proposals, output_format=output_format)
+
+
+def _why_memory(root: Path, memory_id: str, output_format: str) -> int:
+    audit = LocalMemoryCore(root).explain_canonical_memory(memory_id)
+    if output_format == "json":
+        print(json.dumps(audit.to_data(), ensure_ascii=False, sort_keys=True))
+        return 0
+    print(f"Memory: {audit.memory_id}")
+    print(f"Confirmation: {audit.confirmation_status}")
+    print(f"Current version: {audit.current_version}")
+    print(f"Current understanding: {audit.current_content}")
+    print("Key sources: " + ", ".join(audit.current_source_ids))
+    if audit.unresolved_conflicts:
+        print("Unresolved conflicts:")
+        for conflict in audit.unresolved_conflicts:
+            print(f"- {conflict.memory_id}: {conflict.content} ({conflict.reason})")
+    print("Evolution:")
+    for version in audit.versions:
+        print(f"- v{version.version} {version.status}: {version.content}")
+        if version.supersession_reason is not None:
+            print(f"  Replaced because: {version.supersession_reason}")
+    return 0
 
 
 def _ask(root: Path, source_id: str, question: str, allow_cloud: bool) -> int:
@@ -500,6 +533,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.proposal_id,
                 parsed_arguments.instruction,
                 parsed_arguments.history,
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "why-memory":
+            return _why_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
                 parsed_arguments.format,
             )
         if parsed_arguments.command == "ask":

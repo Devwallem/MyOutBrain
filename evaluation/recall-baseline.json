@@ -30,6 +30,18 @@
       "kind": "source",
       "state": "active",
       "text": "Some collaborators still recommend daily review cadence."
+    },
+    {
+      "id": "conflict_atlas_weekly",
+      "kind": "personal-cognition",
+      "state": "conflicting",
+      "text": "Project Atlas sources recommend a weekly review cadence."
+    },
+    {
+      "id": "conflict_atlas_daily",
+      "kind": "personal-cognition",
+      "state": "conflicting",
+      "text": "Project Atlas sources recommend a daily review cadence."
     }
   ],
   "cases": [
@@ -52,11 +64,11 @@
     {
       "id": "conflicting_review_cadence",
       "category": "conflicting",
-      "question": "Which review cadence is recommended?",
-      "answerable": true,
+      "question": "What review cadence do Project Atlas sources recommend?",
+      "answerable": false,
       "expected_evidence_ids": [
-        "cognition_weekly_review",
-        "source_review_debate"
+        "conflict_atlas_weekly",
+        "conflict_atlas_daily"
       ]
     },
     {

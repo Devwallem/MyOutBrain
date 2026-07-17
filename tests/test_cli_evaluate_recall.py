@@ -161,6 +161,15 @@ class EvaluateEvidenceRecallTests(unittest.TestCase):
         )
         self.assertEqual(report["summary"]["case_count"], 4)
         self.assertEqual(report["summary"]["failed"], 0)
+        conflicting_case = next(
+            case for case in report["cases"] if case["category"] == "conflicting"
+        )
+        self.assertFalse(conflicting_case["answerable"])
+        self.assertFalse(conflicting_case["should_refuse_violation"])
+        self.assertEqual(
+            set(conflicting_case["correct_hits"]),
+            {"conflict_atlas_weekly", "conflict_atlas_daily"},
+        )
         self.assertEqual(text_report.returncode, 0, text_report.stderr)
         self.assertIn("Evidence selection only; answer generation was not run.", text_report.stdout)
         self.assertIn("Retriever: lexical-no-embeddings", text_report.stdout)

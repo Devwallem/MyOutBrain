@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 import math
 from pathlib import Path
@@ -48,6 +48,7 @@ class Answerability(StrEnum):
 class RecallMatch(StrEnum):
     STABLE_IDENTITY = "stable-identity"
     SOURCE_RELATION = "source-relation"
+    UNRESOLVED_CONFLICT = "unresolved-conflict"
     FULL_TEXT = "full-text"
     SEMANTIC_CANDIDATE = "semantic-candidate"
 
@@ -87,6 +88,8 @@ class MemoryEvidence(RecallableMemory):
             sensitivity=memory.sensitivity,
             entrance=memory.entrance,
             task=memory.task,
+            related_memory_ids=memory.related_memory_ids,
+            conflict_memory_ids=memory.conflict_memory_ids,
             match=match,
         )
 
@@ -101,6 +104,8 @@ class MemoryEvidence(RecallableMemory):
             "sensitivity": self.sensitivity,
             "entrance": self.entrance,
             "task": self.task,
+            "related_memory_ids": list(self.related_memory_ids),
+            "conflict_memory_ids": list(self.conflict_memory_ids),
             "match": self.match.value,
         }
 
@@ -114,6 +119,7 @@ class MemoryEvidencePackage:
     common_knowledge_queried: bool
     answerability: Answerability
     items: tuple[MemoryEvidence, ...]
+    unresolved_conflicts: tuple[tuple[str, str], ...] = ()
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -124,6 +130,9 @@ class MemoryEvidencePackage:
             "common_knowledge_queried": self.common_knowledge_queried,
             "answerability": self.answerability.value,
             "items": [item.to_data() for item in self.items],
+            "unresolved_conflicts": [
+                list(pair) for pair in self.unresolved_conflicts
+            ],
         }
 
 
@@ -176,6 +185,25 @@ class MemoryGateway:
             requested_memory_ids=requested_memory_ids,
             requested_source_ids=requested_source_ids,
         )
+        visible_canonical_ids = frozenset(
+            memory.memory_id for memory in canonical
+        )
+        canonical = tuple(
+            replace(
+                memory,
+                related_memory_ids=tuple(
+                    related_id
+                    for related_id in memory.related_memory_ids
+                    if related_id in visible_canonical_ids
+                ),
+                conflict_memory_ids=tuple(
+                    conflict_id
+                    for conflict_id in memory.conflict_memory_ids
+                    if conflict_id in visible_canonical_ids
+                ),
+            )
+            for memory in canonical
+        )
         buffered = _eligible_for_phase(
             memories,
             state=MemoryState.BUFFERED,
@@ -227,6 +255,28 @@ class MemoryGateway:
             MemoryEvidence.from_memory(memory, match)
             for memory, match, _score in ordered
         )
+        selected_ids = {item.memory_id for item in selected}
+        conflict_ids = {
+            conflict_id
+            for item in selected
+            for conflict_id in item.conflict_memory_ids
+        }
+        conflict_evidence = tuple(
+            MemoryEvidence.from_memory(memory, RecallMatch.UNRESOLVED_CONFLICT)
+            for memory in canonical
+            if memory.memory_id in conflict_ids
+            and memory.memory_id not in selected_ids
+        )
+        selected = selected + conflict_evidence
+        unresolved_conflicts = tuple(
+            sorted(
+                {
+                    _ordered_conflict_pair(item.memory_id, conflict_id)
+                    for item in selected
+                    for conflict_id in item.conflict_memory_ids
+                }
+            )
+        )
         return MemoryEvidencePackage(
             query=query,
             task=task,
@@ -235,6 +285,7 @@ class MemoryGateway:
             common_knowledge_queried=True,
             answerability=Answerability.INSUFFICIENT,
             items=selected,
+            unresolved_conflicts=unresolved_conflicts,
         )
 
     def _semantic_scores(
@@ -270,9 +321,14 @@ class MemoryGateway:
 _MATCH_ORDER = {
     RecallMatch.STABLE_IDENTITY: 0,
     RecallMatch.SOURCE_RELATION: 1,
-    RecallMatch.FULL_TEXT: 2,
-    RecallMatch.SEMANTIC_CANDIDATE: 3,
+    RecallMatch.UNRESOLVED_CONFLICT: 2,
+    RecallMatch.FULL_TEXT: 3,
+    RecallMatch.SEMANTIC_CANDIDATE: 4,
 }
+
+
+def _ordered_conflict_pair(left: str, right: str) -> tuple[str, str]:
+    return (left, right) if left < right else (right, left)
 
 
 def _with_semantic_matches(

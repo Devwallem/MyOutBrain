@@ -37,7 +37,7 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 3
+MEMORY_SCHEMA_VERSION = 4
 MEMORY_DATABASE = "store/memory.sqlite3"
 
 
@@ -88,6 +88,28 @@ CREATE TABLE canonical_memory_sources (
     PRIMARY KEY (memory_id, source_id)
 );
 
+CREATE TABLE canonical_memory_versions (
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    action TEXT NOT NULL
+        CHECK (action IN ('created', 'supplemented', 'revised')),
+    change_reason TEXT,
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    supersession_reason TEXT,
+    PRIMARY KEY (memory_id, version)
+);
+
+CREATE TABLE canonical_memory_version_sources (
+    memory_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES canonical_memory_versions(memory_id, version),
+    PRIMARY KEY (memory_id, version, source_id)
+);
+
 CREATE TABLE canonical_memory_relations (
     memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
     related_memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
@@ -97,12 +119,27 @@ CREATE TABLE canonical_memory_relations (
     PRIMARY KEY (memory_id, related_memory_id)
 );
 
+CREATE TABLE canonical_memory_conflicts (
+    conflict_id TEXT PRIMARY KEY,
+    first_memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    second_memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('unresolved', 'resolved')),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    CHECK (first_memory_id < second_memory_id),
+    UNIQUE (first_memory_id, second_memory_id)
+);
+
 CREATE TABLE integration_proposals (
     proposal_id TEXT PRIMARY KEY,
     topic TEXT NOT NULL,
     proposed_understanding TEXT NOT NULL,
     possible_impact TEXT NOT NULL,
     sensitivity TEXT NOT NULL CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+    suggested_action TEXT NOT NULL
+        CHECK (suggested_action IN ('new', 'supplement', 'revise', 'conflict')),
+    target_memory_id TEXT REFERENCES canonical_memories(memory_id),
     status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
     created_at TEXT NOT NULL,
     reviewed_at TEXT
@@ -130,6 +167,8 @@ CREATE TABLE integration_reviews (
     review_id TEXT PRIMARY KEY,
     proposal_id TEXT NOT NULL UNIQUE REFERENCES integration_proposals(proposal_id),
     decision TEXT NOT NULL CHECK (decision IN ('accepted', 'edited', 'rejected')),
+    action TEXT NOT NULL
+        CHECK (action IN ('created', 'supplemented', 'revised', 'conflicted', 'rejected')),
     reviewed_content TEXT,
     reason TEXT,
     canonical_memory_id TEXT REFERENCES canonical_memories(memory_id),
@@ -147,6 +186,10 @@ CREATE TABLE memory_events (
 
 
 MemoryDisposition = Literal["buffered", "duplicate"]
+IntegrationAction = Literal["new", "supplement", "revise", "conflict"]
+AppliedIntegrationAction = Literal[
+    "created", "supplemented", "revised", "conflicted", "rejected"
+]
 
 
 @dataclass(frozen=True)
@@ -235,6 +278,7 @@ class RecallableMemory:
     entrance: str | None
     task: str | None
     related_memory_ids: tuple[str, ...] = field(default=(), kw_only=True)
+    conflict_memory_ids: tuple[str, ...] = field(default=(), kw_only=True)
 
     @property
     def confirmed(self) -> bool:
@@ -251,6 +295,8 @@ class IntegrationProposal:
     related_canonical_memory_ids: tuple[str, ...]
     possible_impact: str
     sensitivity: Sensitivity
+    suggested_action: IntegrationAction
+    target_memory_id: str | None
     status: str
 
     def to_data(self) -> dict[str, object]:
@@ -265,6 +311,8 @@ class IntegrationProposal:
             ),
             "possible_impact": self.possible_impact,
             "sensitivity": self.sensitivity,
+            "suggested_action": self.suggested_action,
+            "target_memory_id": self.target_memory_id,
             "status": self.status,
         }
 
@@ -277,6 +325,7 @@ class IntegrationReviewResult:
     canonical_content: str | None
     reason: str | None
     related_canonical_memory_ids: tuple[str, ...]
+    action: AppliedIntegrationAction
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -285,6 +334,7 @@ class IntegrationReviewResult:
             "canonical_memory_id": self.canonical_memory_id,
             "canonical_content": self.canonical_content,
             "reason": self.reason,
+            "action": self.action,
             "related_canonical_memory_ids": list(
                 self.related_canonical_memory_ids
             ),
@@ -296,6 +346,8 @@ class _ReviewInstruction:
     decision: Literal["accepted", "edited", "rejected"]
     content: str | None
     reason: str | None
+    action: IntegrationAction | None = None
+    target_memory_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +360,8 @@ class _IntegrationProposalDraft:
     digest_ids: tuple[str, ...]
     source_ids: tuple[str, ...]
     related_memory_ids: tuple[str, ...]
+    suggested_action: IntegrationAction
+    target_memory_id: str | None
     created_at: str
 
     def as_proposal(self) -> IntegrationProposal:
@@ -320,8 +374,72 @@ class _IntegrationProposalDraft:
             related_canonical_memory_ids=self.related_memory_ids,
             possible_impact=self.possible_impact,
             sensitivity=self.sensitivity,
+            suggested_action=self.suggested_action,
+            target_memory_id=self.target_memory_id,
             status="pending",
         )
+
+
+@dataclass(frozen=True)
+class CanonicalMemoryVersion:
+    version: int
+    content: str
+    action: str
+    change_reason: str | None
+    status: str
+    supersession_reason: str | None
+    source_ids: tuple[str, ...]
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "content": self.content,
+            "action": self.action,
+            "change_reason": self.change_reason,
+            "status": self.status,
+            "supersession_reason": self.supersession_reason,
+            "source_ids": list(self.source_ids),
+        }
+
+
+@dataclass(frozen=True)
+class UnresolvedMemoryConflict:
+    memory_id: str
+    content: str
+    source_ids: tuple[str, ...]
+    reason: str
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "memory_id": self.memory_id,
+            "content": self.content,
+            "source_ids": list(self.source_ids),
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalMemoryAudit:
+    memory_id: str
+    confirmation_status: Literal["confirmed", "conflicted"]
+    current_version: int
+    current_content: str
+    current_source_ids: tuple[str, ...]
+    versions: tuple[CanonicalMemoryVersion, ...]
+    unresolved_conflicts: tuple[UnresolvedMemoryConflict, ...]
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "memory_id": self.memory_id,
+            "confirmation_status": self.confirmation_status,
+            "current_version": self.current_version,
+            "current_content": self.current_content,
+            "current_source_ids": list(self.current_source_ids),
+            "versions": [version.to_data() for version in self.versions],
+            "unresolved_conflicts": [
+                conflict.to_data() for conflict in self.unresolved_conflicts
+            ],
+        }
 
 
 class LocalMemoryCore:
@@ -347,6 +465,10 @@ class LocalMemoryCore:
                     version = 2
                 if version == 2:
                     migrated = self._migrate_v2_database(database_path)
+                    atomic_commit(self._root, [(database_path, migrated)])
+                    version = 3
+                if version == 3:
+                    migrated = self._migrate_v3_database(database_path)
                     atomic_commit(self._root, [(database_path, migrated)])
                 self._validate_database(database_path)
                 return
@@ -511,18 +633,21 @@ class LocalMemoryCore:
                                    WHEN c.sensitivity = 'local-only'
                                      OR EXISTS (
                                          SELECT 1
-                                         FROM canonical_memory_sources AS private_source
+                                         FROM canonical_memory_version_sources
+                                              AS private_source
                                          JOIN experiences AS private_experience
                                            ON private_experience.source_id = private_source.source_id
                                          WHERE private_source.memory_id = c.memory_id
+                                           AND private_source.version = c.current_version
                                            AND private_experience.sensitivity = 'local-only'
                                      ) THEN 'local-only'
                                    ELSE 'cloud-allowed'
                                END AS effective_sensitivity,
                                GROUP_CONCAT(source.source_id, ',') AS source_ids
                         FROM canonical_memories AS c
-                        LEFT JOIN canonical_memory_sources AS source
+                        LEFT JOIN canonical_memory_version_sources AS source
                           ON source.memory_id = c.memory_id
+                         AND source.version = c.current_version
                         WHERE c.state = 'active'
                         GROUP BY c.memory_id, c.content, c.updated_at, c.sensitivity
                         """
@@ -532,6 +657,14 @@ class LocalMemoryCore:
                         SELECT memory_id, related_memory_id
                         FROM canonical_memory_relations
                         ORDER BY memory_id, related_memory_id
+                        """
+                    ).fetchall()
+                    conflict_rows = connection.execute(
+                        """
+                        SELECT first_memory_id, second_memory_id
+                        FROM canonical_memory_conflicts
+                        WHERE status = 'unresolved'
+                        ORDER BY first_memory_id, second_memory_id
                         """
                     ).fetchall()
         except sqlite3.Error as error:
@@ -573,6 +706,13 @@ class LocalMemoryCore:
                     related_memory_id
                     for relation_memory_id, related_memory_id in relation_rows
                     if relation_memory_id == memory_id
+                ),
+                conflict_memory_ids=tuple(
+                    second_memory_id
+                    if first_memory_id == memory_id
+                    else first_memory_id
+                    for first_memory_id, second_memory_id in conflict_rows
+                    if memory_id in (first_memory_id, second_memory_id)
                 ),
             )
             for memory_id, content, updated_at, sensitivity, source_ids in canonical_rows
@@ -697,21 +837,44 @@ class LocalMemoryCore:
                 raise UserInputError(
                     f"pending integration proposal does not exist: {normalized_proposal_id}"
                 )
-            canonical_content = (
-                proposal.proposed_understanding
+            action: IntegrationAction = review.action or (
+                proposal.suggested_action
                 if review.decision == "accepted"
-                else review.content
+                else "new"
             )
-            exact_duplicate_id = self._exact_duplicate_canonical_id(
-                database_path,
-                proposal=proposal,
-                canonical_content=canonical_content,
+            target_memory_id = review.target_memory_id or (
+                proposal.target_memory_id
+                if review.decision == "accepted"
+                else None
             )
+            if action != "new":
+                if target_memory_id is None:
+                    raise UserInputError(
+                        f"{action} review requires a target canonical memory"
+                    )
+                if target_memory_id not in proposal.related_canonical_memory_ids:
+                    raise UserInputError(
+                        "integration target must be a related canonical memory "
+                        "shown by the proposal"
+                    )
+            canonical_content = None
             canonical_memory_id = None
+            applied_action: AppliedIntegrationAction = "rejected"
             if review.decision != "rejected":
-                canonical_memory_id = exact_duplicate_id or (
-                    f"mem_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
+                canonical_content = review.content or proposal.proposed_understanding
+                canonical_memory_id = (
+                    target_memory_id
+                    if action in ("supplement", "revise")
+                    else f"mem_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}"
                 )
+                if action == "new":
+                    applied_action = "created"
+                elif action == "supplement":
+                    applied_action = "supplemented"
+                elif action == "revise":
+                    applied_action = "revised"
+                else:
+                    applied_action = "conflicted"
             reviewed_at = datetime.now(timezone.utc).isoformat()
             staged_database = self._database_with_integration_review(
                 database_path,
@@ -719,6 +882,9 @@ class LocalMemoryCore:
                 review=review,
                 canonical_memory_id=canonical_memory_id,
                 canonical_content=canonical_content,
+                action=action,
+                applied_action=applied_action,
+                target_memory_id=target_memory_id,
                 reviewed_at=reviewed_at,
             )
             event_id = f"evt_{uuid.uuid4().hex}"
@@ -728,6 +894,7 @@ class LocalMemoryCore:
                 "occurred_at": reviewed_at,
                 "proposal_id": proposal.proposal_id,
                 "decision": review.decision,
+                "action": applied_action,
                 "canonical_memory_id": canonical_memory_id,
                 "source_scope": list(proposal.source_scope),
             }
@@ -746,6 +913,7 @@ class LocalMemoryCore:
             canonical_content=canonical_content,
             reason=review.reason,
             related_canonical_memory_ids=proposal.related_canonical_memory_ids,
+            action=applied_action,
         )
 
     def integration_review_history(self) -> tuple[IntegrationReviewResult, ...]:
@@ -763,7 +931,7 @@ class LocalMemoryCore:
                         """
                         SELECT review.proposal_id, review.decision,
                                review.canonical_memory_id, review.reviewed_content,
-                               review.reason,
+                               review.reason, review.action,
                                GROUP_CONCAT(DISTINCT related.memory_id)
                         FROM integration_reviews AS review
                         LEFT JOIN integration_proposal_related AS related
@@ -781,9 +949,120 @@ class LocalMemoryCore:
                 canonical_memory_id=row[2],
                 canonical_content=row[3],
                 reason=row[4],
-                related_canonical_memory_ids=_split_group(row[5]),
+                related_canonical_memory_ids=_split_group(row[6]),
+                action=row[5],
             )
             for row in rows
+        )
+
+    def explain_canonical_memory(self, memory_id: str) -> CanonicalMemoryAudit:
+        normalized_memory_id = _required_text("canonical memory id", memory_id)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            try:
+                with closing(sqlite3.connect(database_path)) as connection:
+                    current = connection.execute(
+                        """
+                        SELECT content, current_version
+                        FROM canonical_memories
+                        WHERE memory_id = ? AND state = 'active'
+                        """,
+                        (normalized_memory_id,),
+                    ).fetchone()
+                    version_rows = connection.execute(
+                        """
+                        SELECT version.version, version.content, version.action,
+                               version.change_reason, version.superseded_at,
+                               version.supersession_reason,
+                               GROUP_CONCAT(source.source_id, ',')
+                        FROM canonical_memory_versions AS version
+                        LEFT JOIN canonical_memory_version_sources AS source
+                          ON source.memory_id = version.memory_id
+                         AND source.version = version.version
+                        WHERE version.memory_id = ?
+                        GROUP BY version.memory_id, version.version
+                        ORDER BY version.version
+                        """,
+                        (normalized_memory_id,),
+                    ).fetchall()
+                    conflict_rows = connection.execute(
+                        """
+                        SELECT other.memory_id, other.content, conflict.reason,
+                               GROUP_CONCAT(source.source_id, ',')
+                        FROM canonical_memory_conflicts AS conflict
+                        JOIN canonical_memories AS other
+                          ON other.memory_id = CASE
+                              WHEN conflict.first_memory_id = ?
+                              THEN conflict.second_memory_id
+                              ELSE conflict.first_memory_id
+                          END
+                        LEFT JOIN canonical_memory_version_sources AS source
+                          ON source.memory_id = other.memory_id
+                         AND source.version = other.current_version
+                        WHERE conflict.status = 'unresolved'
+                          AND (? = conflict.first_memory_id
+                               OR ? = conflict.second_memory_id)
+                        GROUP BY conflict.conflict_id, other.memory_id
+                        ORDER BY other.memory_id
+                        """,
+                        (
+                            normalized_memory_id,
+                            normalized_memory_id,
+                            normalized_memory_id,
+                        ),
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise IntegrityError("cannot explain canonical memory") from error
+        if current is None or not isinstance(current[0], str) or not isinstance(
+            current[1], int
+        ):
+            raise UserInputError(
+                f"active canonical memory does not exist: {normalized_memory_id}"
+            )
+        versions = tuple(
+            CanonicalMemoryVersion(
+                version=row[0],
+                content=row[1],
+                action=row[2],
+                change_reason=row[3],
+                status="superseded" if row[4] is not None else "current",
+                supersession_reason=row[5],
+                source_ids=_split_group(row[6]),
+            )
+            for row in version_rows
+        )
+        conflicts = tuple(
+            UnresolvedMemoryConflict(
+                memory_id=row[0],
+                content=row[1],
+                reason=row[2],
+                source_ids=_split_group(row[3]),
+            )
+            for row in conflict_rows
+        )
+        current_version = current[1]
+        current_sources = next(
+            (
+                version.source_ids
+                for version in versions
+                if version.version == current_version
+            ),
+            (),
+        )
+        return CanonicalMemoryAudit(
+            memory_id=normalized_memory_id,
+            confirmation_status="conflicted" if conflicts else "confirmed",
+            current_version=current_version,
+            current_content=current[0],
+            current_source_ids=current_sources,
+            versions=versions,
+            unresolved_conflicts=conflicts,
         )
 
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
@@ -799,39 +1078,6 @@ class LocalMemoryCore:
                 database_path,
                 status="pending",
             )
-
-    @staticmethod
-    def _exact_duplicate_canonical_id(
-        database_path: Path,
-        *,
-        proposal: IntegrationProposal,
-        canonical_content: str | None,
-    ) -> str | None:
-        if canonical_content is None or not proposal.related_canonical_memory_ids:
-            return None
-        placeholders = ", ".join("?" for _ in proposal.related_canonical_memory_ids)
-        try:
-            with closing(sqlite3.connect(database_path)) as connection:
-                rows = connection.execute(
-                    f"""
-                    SELECT memory_id, content
-                    FROM canonical_memories
-                    WHERE state = 'active' AND memory_id IN ({placeholders})
-                    ORDER BY memory_id
-                    """,
-                    proposal.related_canonical_memory_ids,
-                ).fetchall()
-        except sqlite3.Error as error:
-            raise IntegrityError("cannot classify an integration proposal") from error
-        normalized_content = _normalized_memory_body(canonical_content)
-        for memory_id, content in rows:
-            if (
-                isinstance(memory_id, str)
-                and isinstance(content, str)
-                and _normalized_memory_body(content) == normalized_content
-            ):
-                return memory_id
-        return None
 
     @staticmethod
     def _query_integration_proposals(
@@ -853,7 +1099,8 @@ class LocalMemoryCore:
                            p.possible_impact, p.sensitivity, p.status,
                            GROUP_CONCAT(DISTINCT buffered.digest_id),
                            GROUP_CONCAT(DISTINCT source.source_id),
-                           GROUP_CONCAT(DISTINCT related.memory_id)
+                           GROUP_CONCAT(DISTINCT related.memory_id),
+                           p.suggested_action, p.target_memory_id
                     FROM integration_proposals AS p
                     LEFT JOIN integration_proposal_buffered AS buffered
                       ON buffered.proposal_id = p.proposal_id
@@ -880,6 +1127,8 @@ class LocalMemoryCore:
                 evidence_memory_ids=_split_group(row[6]),
                 source_scope=_split_group(row[7]),
                 related_canonical_memory_ids=_split_group(row[8]),
+                suggested_action=row[9],
+                target_memory_id=row[10],
             )
             for row in rows
         )
@@ -1038,8 +1287,9 @@ class LocalMemoryCore:
                         """
                         INSERT INTO integration_proposals
                             (proposal_id, topic, proposed_understanding,
-                             possible_impact, sensitivity, status, created_at)
-                        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                             possible_impact, sensitivity, suggested_action,
+                             target_memory_id, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                         """,
                         (
                             draft.proposal_id,
@@ -1047,6 +1297,8 @@ class LocalMemoryCore:
                             draft.proposed_understanding,
                             draft.possible_impact,
                             draft.sensitivity,
+                            draft.suggested_action,
+                            draft.target_memory_id,
                             draft.created_at,
                         ),
                     )
@@ -1099,6 +1351,9 @@ class LocalMemoryCore:
         review: _ReviewInstruction,
         canonical_memory_id: str | None,
         canonical_content: str | None,
+        action: IntegrationAction,
+        applied_action: AppliedIntegrationAction,
+        target_memory_id: str | None,
         reviewed_at: str,
     ) -> bytes:
         temporary_path: Path | None = None
@@ -1120,7 +1375,8 @@ class LocalMemoryCore:
                 if canonical_memory_id is not None and canonical_content is not None:
                     existing = connection.execute(
                         """
-                        SELECT 1 FROM canonical_memories
+                        SELECT content, current_version, sensitivity
+                        FROM canonical_memories
                         WHERE memory_id = ? AND state = 'active'
                         """,
                         (canonical_memory_id,),
@@ -1141,28 +1397,189 @@ class LocalMemoryCore:
                                 reviewed_at,
                             ),
                         )
-                        connection.executemany(
-                            """
-                            INSERT INTO canonical_memory_relations
-                                (memory_id, related_memory_id, relationship, created_at)
-                            VALUES (?, ?, 'related', ?)
-                            """,
-                            (
-                                (canonical_memory_id, related_memory_id, reviewed_at)
-                                for related_memory_id
-                                in proposal.related_canonical_memory_ids
-                                if related_memory_id != canonical_memory_id
-                            ),
-                        )
-                    elif proposal.sensitivity == "local-only":
                         connection.execute(
                             """
-                            UPDATE canonical_memories
-                            SET sensitivity = 'local-only', updated_at = ?
-                            WHERE memory_id = ?
+                            INSERT INTO canonical_memory_versions
+                                (memory_id, version, content, action, change_reason,
+                                 created_at, superseded_at, supersession_reason)
+                            VALUES (?, 1, ?, 'created', ?, ?, NULL, NULL)
                             """,
-                            (reviewed_at, canonical_memory_id),
+                            (
+                                canonical_memory_id,
+                                canonical_content,
+                                review.reason,
+                                reviewed_at,
+                            ),
                         )
+                        if action == "new":
+                            connection.executemany(
+                                """
+                                INSERT INTO canonical_memory_relations
+                                    (memory_id, related_memory_id, relationship,
+                                     created_at)
+                                VALUES (?, ?, 'related', ?)
+                                """,
+                                (
+                                    (
+                                        canonical_memory_id,
+                                        related_memory_id,
+                                        reviewed_at,
+                                    )
+                                    for related_memory_id
+                                    in proposal.related_canonical_memory_ids
+                                    if related_memory_id != canonical_memory_id
+                                ),
+                            )
+                        if action == "conflict" and target_memory_id is not None:
+                            first_memory_id, second_memory_id = sorted(
+                                (canonical_memory_id, target_memory_id)
+                            )
+                            conflict_identity = (
+                                f"{first_memory_id}:{second_memory_id}".encode()
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO canonical_memory_conflicts
+                                    (conflict_id, first_memory_id, second_memory_id,
+                                     reason, status, created_at, resolved_at)
+                                VALUES (?, ?, ?, ?, 'unresolved', ?, NULL)
+                                """,
+                                (
+                                    "con_"
+                                    + hashlib.sha256(conflict_identity).hexdigest(),
+                                    first_memory_id,
+                                    second_memory_id,
+                                    review.reason,
+                                    reviewed_at,
+                                ),
+                            )
+                    else:
+                        existing_content, current_version, existing_sensitivity = (
+                            existing
+                        )
+                        if not isinstance(existing_content, str) or not isinstance(
+                            current_version, int
+                        ):
+                            raise IntegrityError(
+                                "canonical memory has invalid revision state"
+                            )
+                        effective_sensitivity = (
+                            "local-only"
+                            if proposal.sensitivity == "local-only"
+                            or existing_sensitivity == "local-only"
+                            else "cloud-allowed"
+                        )
+                        if (
+                            _normalized_memory_body(existing_content)
+                            == _normalized_memory_body(canonical_content)
+                        ):
+                            connection.execute(
+                                """
+                                UPDATE canonical_memories
+                                SET sensitivity = ?, updated_at = ?
+                                WHERE memory_id = ?
+                                """,
+                                (
+                                    effective_sensitivity,
+                                    reviewed_at,
+                                    canonical_memory_id,
+                                ),
+                            )
+                        else:
+                            next_version = current_version + 1
+                            superseded = connection.execute(
+                                """
+                                UPDATE canonical_memory_versions
+                                SET superseded_at = ?, supersession_reason = ?
+                                WHERE memory_id = ? AND version = ?
+                                  AND superseded_at IS NULL
+                                """,
+                                (
+                                    reviewed_at,
+                                    review.reason,
+                                    canonical_memory_id,
+                                    current_version,
+                                ),
+                            )
+                            if superseded.rowcount != 1:
+                                raise IntegrityError(
+                                    "canonical memory current version is missing"
+                                )
+                            connection.execute(
+                                """
+                                UPDATE canonical_memories
+                                SET content = ?, current_version = ?, sensitivity = ?,
+                                    updated_at = ?
+                                WHERE memory_id = ?
+                                """,
+                                (
+                                    canonical_content,
+                                    next_version,
+                                    effective_sensitivity,
+                                    reviewed_at,
+                                    canonical_memory_id,
+                                ),
+                            )
+                            version_action = (
+                                "supplemented"
+                                if action == "supplement"
+                                else "revised"
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO canonical_memory_versions
+                                    (memory_id, version, content, action,
+                                     change_reason, created_at, superseded_at,
+                                     supersession_reason)
+                                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+                                """,
+                                (
+                                    canonical_memory_id,
+                                    next_version,
+                                    canonical_content,
+                                    version_action,
+                                    review.reason,
+                                    reviewed_at,
+                                ),
+                            )
+                            if action == "supplement":
+                                connection.execute(
+                                    """
+                                    INSERT INTO canonical_memory_version_sources
+                                        (memory_id, version, source_id)
+                                    SELECT memory_id, ?, source_id
+                                    FROM canonical_memory_version_sources
+                                    WHERE memory_id = ? AND version = ?
+                                    """,
+                                    (
+                                        next_version,
+                                        canonical_memory_id,
+                                        current_version,
+                                    ),
+                                )
+                    current_version_row = connection.execute(
+                        """
+                        SELECT current_version FROM canonical_memories
+                        WHERE memory_id = ?
+                        """,
+                        (canonical_memory_id,),
+                    ).fetchone()
+                    if current_version_row is None or not isinstance(
+                        current_version_row[0], int
+                    ):
+                        raise IntegrityError("canonical memory has no current version")
+                    current_version = current_version_row[0]
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO canonical_memory_version_sources
+                            (memory_id, version, source_id)
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            (canonical_memory_id, current_version, source_id)
+                            for source_id in proposal.source_scope
+                        ),
+                    )
                     connection.executemany(
                         """
                         INSERT OR IGNORE INTO canonical_memory_sources
@@ -1194,14 +1611,15 @@ class LocalMemoryCore:
                 connection.execute(
                     """
                     INSERT INTO integration_reviews
-                        (review_id, proposal_id, decision, reviewed_content,
+                        (review_id, proposal_id, decision, action, reviewed_content,
                          reason, canonical_memory_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         review_id,
                         proposal.proposal_id,
                         review.decision,
+                        applied_action,
                         canonical_content,
                         review.reason,
                         canonical_memory_id,
@@ -1234,6 +1652,97 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v3_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    ALTER TABLE integration_proposals
+                    ADD COLUMN suggested_action TEXT NOT NULL DEFAULT 'new'
+                        CHECK (suggested_action IN
+                            ('new', 'supplement', 'revise', 'conflict'));
+                    ALTER TABLE integration_proposals
+                    ADD COLUMN target_memory_id TEXT
+                        REFERENCES canonical_memories(memory_id);
+                    ALTER TABLE integration_reviews
+                    ADD COLUMN action TEXT NOT NULL DEFAULT 'created'
+                        CHECK (action IN
+                            ('created', 'supplemented', 'revised',
+                             'conflicted', 'rejected'));
+                    UPDATE integration_reviews
+                    SET action = 'rejected'
+                    WHERE decision = 'rejected';
+
+                    CREATE TABLE canonical_memory_versions (
+                        memory_id TEXT NOT NULL
+                            REFERENCES canonical_memories(memory_id),
+                        version INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        action TEXT NOT NULL
+                            CHECK (action IN ('created', 'supplemented', 'revised')),
+                        change_reason TEXT,
+                        created_at TEXT NOT NULL,
+                        superseded_at TEXT,
+                        supersession_reason TEXT,
+                        PRIMARY KEY (memory_id, version)
+                    );
+                    CREATE TABLE canonical_memory_version_sources (
+                        memory_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        source_id TEXT NOT NULL REFERENCES source_objects(source_id),
+                        FOREIGN KEY (memory_id, version)
+                            REFERENCES canonical_memory_versions(memory_id, version),
+                        PRIMARY KEY (memory_id, version, source_id)
+                    );
+                    INSERT INTO canonical_memory_versions
+                        (memory_id, version, content, action, change_reason,
+                         created_at, superseded_at, supersession_reason)
+                    SELECT memory_id, current_version, content, 'created', NULL,
+                           created_at, NULL, NULL
+                    FROM canonical_memories;
+                    INSERT INTO canonical_memory_version_sources
+                        (memory_id, version, source_id)
+                    SELECT source.memory_id, memory.current_version, source.source_id
+                    FROM canonical_memory_sources AS source
+                    JOIN canonical_memories AS memory
+                      ON memory.memory_id = source.memory_id;
+                    CREATE TABLE canonical_memory_conflicts (
+                        conflict_id TEXT PRIMARY KEY,
+                        first_memory_id TEXT NOT NULL
+                            REFERENCES canonical_memories(memory_id),
+                        second_memory_id TEXT NOT NULL
+                            REFERENCES canonical_memories(memory_id),
+                        reason TEXT NOT NULL,
+                        status TEXT NOT NULL
+                            CHECK (status IN ('unresolved', 'resolved')),
+                        created_at TEXT NOT NULL,
+                        resolved_at TEXT,
+                        CHECK (first_memory_id < second_memory_id),
+                        UNIQUE (first_memory_id, second_memory_id)
+                    );
+                    PRAGMA user_version = 4;
+                    """
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -1322,7 +1831,7 @@ class LocalMemoryCore:
                     );
                     """
                 )
-                connection.execute(f"PRAGMA user_version = {MEMORY_SCHEMA_VERSION}")
+                connection.execute("PRAGMA user_version = 3")
                 connection.commit()
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
@@ -1435,6 +1944,81 @@ def _normalized_memory_body(content: str) -> str:
 def _parse_review_instruction(instruction: str) -> _ReviewInstruction:
     normalized = _required_text("review instruction", instruction)
     folded = normalized.casefold()
+    evolution_match = re.fullmatch(
+        r"(revise|supplement)\s+(mem_[0-9a-f]{64})"
+        r"(?:\s+with\s*[:：]\s*(.*?))?\s+because\s*[:：]\s*(.+)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if evolution_match is not None:
+        action_text, target_memory_id, edited_content, reason_text = (
+            evolution_match.groups()
+        )
+        action: IntegrationAction = (
+            "revise" if action_text.casefold() == "revise" else "supplement"
+        )
+        if action == "supplement" and edited_content is None:
+            raise UserInputError(
+                "a supplement review must state the complete updated wording"
+            )
+        content = (
+            _required_text("updated canonical understanding", edited_content)
+            if edited_content is not None
+            else None
+        )
+        if content is not None and len(content) > 500:
+            raise UserInputError(
+                "updated canonical understanding must not exceed 500 characters"
+            )
+        return _ReviewInstruction(
+            decision="accepted",
+            content=content,
+            reason=_required_text("integration reason", reason_text),
+            action=action,
+            target_memory_id=target_memory_id,
+        )
+    chinese_evolution_match = re.fullmatch(
+        r"(修订|补充)\s*(mem_[0-9a-f]{64})"
+        r"(?:\s*(?:改为|完整表述为)\s*[:：]\s*(.*?))?"
+        r"\s*(?:因为|原因是)\s*[:：]?\s*(.+)",
+        normalized,
+    )
+    if chinese_evolution_match is not None:
+        action_text, target_memory_id, edited_content, reason_text = (
+            chinese_evolution_match.groups()
+        )
+        action = "revise" if action_text == "修订" else "supplement"
+        if action == "supplement" and edited_content is None:
+            raise UserInputError("补充审阅必须给出完整的新表述")
+        return _ReviewInstruction(
+            decision="accepted",
+            content=(
+                _required_text("updated canonical understanding", edited_content)
+                if edited_content is not None
+                else None
+            ),
+            reason=_required_text("integration reason", reason_text),
+            action=action,
+            target_memory_id=target_memory_id,
+        )
+    conflict_match = re.fullmatch(
+        r"preserve\s+conflict\s+with\s+(mem_[0-9a-f]{64})"
+        r"\s+because\s*[:：]\s*(.+)",
+        normalized,
+        flags=re.IGNORECASE,
+    ) or re.fullmatch(
+        r"(?:保留|并列保留)冲突\s*(?:与|和)\s*(mem_[0-9a-f]{64})"
+        r"\s*(?:因为|原因是)\s*[:：]?\s*(.+)",
+        normalized,
+    )
+    if conflict_match is not None:
+        return _ReviewInstruction(
+            decision="accepted",
+            content=None,
+            reason=_required_text("conflict reason", conflict_match.group(2)),
+            action="conflict",
+            target_memory_id=conflict_match.group(1),
+        )
     if re.fullmatch(
         r"(?:i\s+)?(?:accept|approve)(?:\s+(?:this|the|it))?"
         r"(?:\s+proposal)?[.!]?",
@@ -1600,6 +2184,10 @@ def _integration_proposal_drafts(
             if _normalized_memory_body(candidate[1])
             == _normalized_memory_body(proposed_understanding)
         )
+        suggested_action: IntegrationAction = (
+            "supplement" if exact_related else "new"
+        )
+        target_memory_id = exact_related[0][0] if exact_related else None
         sensitivity: Sensitivity = (
             "local-only"
             if any(row[3] == "local-only" for row in group)
@@ -1627,6 +2215,8 @@ def _integration_proposal_drafts(
                 digest_ids=digest_ids,
                 source_ids=source_ids,
                 related_memory_ids=tuple(candidate[0] for candidate in related),
+                suggested_action=suggested_action,
+                target_memory_id=target_memory_id,
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
         )

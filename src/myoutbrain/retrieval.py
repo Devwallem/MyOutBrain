@@ -15,6 +15,7 @@ class EvidenceKind(StrEnum):
 
 class EvidenceState(StrEnum):
     ACTIVE = "active"
+    CONFLICTING = "conflicting"
     SUPERSEDED = "superseded"
 
 
@@ -57,7 +58,7 @@ class LexicalNoEmbeddingsRetriever:
         scores = {
             item.evidence_id: len(question_terms & lexical_terms(item.text))
             for item in evidence
-            if item.state is EvidenceState.ACTIVE
+            if item.state in (EvidenceState.ACTIVE, EvidenceState.CONFLICTING)
         }
         best_score = max(scores.values(), default=0)
         if best_score == 0:
@@ -69,7 +70,13 @@ class LexicalNoEmbeddingsRetriever:
                 if score == best_score
             )
         )
-        return RetrievalDecision(evidence_ids=selected_ids, should_refuse=False)
+        selected_states = {
+            item.state for item in evidence if item.evidence_id in selected_ids
+        }
+        return RetrievalDecision(
+            evidence_ids=selected_ids,
+            should_refuse=EvidenceState.CONFLICTING in selected_states,
+        )
 
 
 class SemanticCandidateRetriever:
@@ -90,7 +97,11 @@ class SemanticCandidateRetriever:
             cosine_similarity,
         )
 
-        active = tuple(item for item in evidence if item.state is EvidenceState.ACTIVE)
+        active = tuple(
+            item
+            for item in evidence
+            if item.state in (EvidenceState.ACTIVE, EvidenceState.CONFLICTING)
+        )
         if not active:
             return RetrievalDecision(evidence_ids=(), should_refuse=True)
         provider = DeterministicEmbeddingProvider()
@@ -111,7 +122,13 @@ class SemanticCandidateRetriever:
                 and score >= best_score - 0.05
             )
         )
-        return RetrievalDecision(evidence_ids=selected_ids, should_refuse=False)
+        selected_states = {
+            item.state for item in active if item.evidence_id in selected_ids
+        }
+        return RetrievalDecision(
+            evidence_ids=selected_ids,
+            should_refuse=EvidenceState.CONFLICTING in selected_states,
+        )
 
 
 _STOP_WORDS = frozenset(

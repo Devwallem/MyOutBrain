@@ -63,7 +63,10 @@ def downgrade_memory_store_to_v2(instance_root: Path) -> None:
             DROP TABLE integration_proposal_related;
             DROP TABLE integration_proposal_buffered;
             DROP TABLE integration_proposals;
+            DROP TABLE canonical_memory_conflicts;
             DROP TABLE canonical_memory_relations;
+            DROP TABLE canonical_memory_version_sources;
+            DROP TABLE canonical_memory_versions;
             CREATE TABLE buffered_digests_v2 (
                 digest_id TEXT PRIMARY KEY,
                 experience_id TEXT NOT NULL UNIQUE REFERENCES experiences(experience_id),
@@ -399,6 +402,8 @@ class ManualMemoryConsolidationTests(unittest.TestCase):
                     "json",
                 ).stdout
             )["proposals"][0]
+            self.assertEqual(duplicate_proposal["suggested_action"], "supplement")
+            self.assertEqual(duplicate_proposal["target_memory_id"], canonical_id)
 
             duplicate_review = run_cli(
                 "review-memory",
