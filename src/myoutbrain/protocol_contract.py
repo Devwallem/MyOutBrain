@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import cast
 
 
+SERVER_MINIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 0}
 SERVER_PROTOCOL_VERSION = {"major": 2, "minor": 1}
 SERVER_CAPABILITIES = (
     "instance_status.v1",

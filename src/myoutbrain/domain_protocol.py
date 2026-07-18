@@ -17,6 +17,7 @@ from myoutbrain.memory_gateway import MemoryGateway
 from myoutbrain.protocol_contract import (
     load_domain_schema,
     SERVER_CAPABILITIES,
+    SERVER_MINIMUM_PROTOCOL_VERSION,
     SERVER_PROTOCOL_VERSION,
 )
 from myoutbrain.unified_review import ReviewBatchRequest, ReviewDecision
@@ -45,6 +46,7 @@ class ProtocolVersion:
         if not isinstance(data, dict):
             raise UserInputError(f"{field} must be an object")
         values = cast(dict[object, object], data)
+        _reject_unknown_fields(values, {"major", "minor"}, field)
         major = values.get("major")
         minor = values.get("minor")
         if (
@@ -77,10 +79,18 @@ class DomainRequest:
         if not isinstance(data, dict):
             raise UserInputError("gateway request must be a JSON object")
         request = cast(dict[object, object], data)
+        _reject_unknown_fields(
+            request,
+            {"protocol", "client", "operation", "parameters", "write"},
+            "gateway request",
+        )
         protocol = request.get("protocol")
         if not isinstance(protocol, dict):
             raise UserInputError("gateway request protocol must be an object")
         protocol_data = cast(dict[object, object], protocol)
+        _reject_unknown_fields(
+            protocol_data, {"minimum", "maximum"}, "gateway request protocol"
+        )
         minimum = ProtocolVersion.from_data(
             protocol_data.get("minimum"), field="protocol.minimum"
         )
@@ -93,15 +103,20 @@ class DomainRequest:
         if not isinstance(client, dict):
             raise UserInputError("gateway request client must be an object")
         client_data = cast(dict[object, object], client)
+        _reject_unknown_fields(
+            client_data, {"name", "capabilities"}, "gateway request client"
+        )
         name = client_data.get("name")
         raw_capabilities = client_data.get("capabilities")
         if not isinstance(name, str) or not name.strip():
             raise UserInputError("client.name must be non-blank text")
         if not isinstance(raw_capabilities, list) or not all(
-            isinstance(capability, str) and capability
+            isinstance(capability, str) and capability.strip()
             for capability in raw_capabilities
         ):
             raise UserInputError("client.capabilities must be an array of non-blank text")
+        if len(raw_capabilities) != len(set(raw_capabilities)):
+            raise UserInputError("client.capabilities must not contain duplicates")
         operation = request.get("operation")
         parameters = request.get("parameters")
         if not isinstance(operation, str) or not operation.strip():
@@ -136,6 +151,9 @@ class WriteCondition:
         if not isinstance(data, dict):
             raise UserInputError("write must be a JSON object")
         values = cast(dict[object, object], data)
+        _reject_unknown_fields(
+            values, {"idempotency_key", "expected_version"}, "write"
+        )
         idempotency_key = values.get("idempotency_key")
         expected_version = values.get("expected_version")
         if (
@@ -264,23 +282,15 @@ class DomainProtocol:
 
     @staticmethod
     def _negotiate(request: DomainRequest) -> ProtocolVersion:
+        server_minimum = ProtocolVersion(**SERVER_MINIMUM_PROTOCOL_VERSION)
         server = ProtocolVersion(**SERVER_PROTOCOL_VERSION)
-        if request.minimum_version.major != server.major:
+        if (
+            request.maximum_version < server_minimum
+            or request.minimum_version > server
+        ):
             raise DomainProtocolError(
                 "protocol_incompatible",
-                "client protocol major version is incompatible",
-                details=_version_details(request),
-            )
-        if request.maximum_version.major != server.major:
-            raise DomainProtocolError(
-                "protocol_incompatible",
-                "client protocol major version is incompatible",
-                details=_version_details(request),
-            )
-        if request.minimum_version > server:
-            raise DomainProtocolError(
-                "protocol_incompatible",
-                "client requires a newer protocol minor version",
+                "client protocol range is incompatible",
                 details=_version_details(request),
             )
         return min(server, request.maximum_version)
@@ -294,104 +304,50 @@ def execute_domain_request(
     try:
         response = DomainProtocol(root).dispatch(DomainRequest.from_data(data))
     except DomainProtocolError as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": error.category,
-                    "message": str(error),
-                    "details": error.details,
-                },
-            },
-            2,
+        return _error_response(
+            operation, error.category, str(error), 2, details=error.details
         )
     except IdempotencyConflict as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "idempotency_conflict",
-                    "message": str(error),
-                    "details": {},
-                },
-            },
-            2,
-        )
+        return _error_response(operation, "idempotency_conflict", str(error), 2)
     except ConfigurationConflict as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "configuration_conflict",
-                    "message": str(error),
-                    "details": {},
-                },
-            },
-            3,
-        )
+        return _error_response(operation, "configuration_conflict", str(error), 3)
     except WriterLocked as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "writer_locked",
-                    "message": str(error) or "another MyOutBrain writer is active",
-                    "details": {},
-                },
-            },
+        return _error_response(
+            operation,
+            "writer_locked",
+            str(error) or "another MyOutBrain writer is active",
             4,
         )
     except IntegrityError as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "integrity_failure",
-                    "message": str(error),
-                    "details": {},
-                },
-            },
-            7,
-        )
+        return _error_response(operation, "integrity_failure", str(error), 7)
     except OSError as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "io_failure",
-                    "message": str(error),
-                    "details": {},
-                },
-            },
-            5,
-        )
+        return _error_response(operation, "io_failure", str(error), 5)
     except UserInputError as error:
-        return (
-            {
-                "ok": False,
-                "operation": operation,
-                "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
-                "error": {
-                    "category": "invalid_request",
-                    "message": str(error),
-                    "details": {},
-                },
-            },
-            2,
-        )
+        return _error_response(operation, "invalid_request", str(error), 2)
     return response, 0
+
+
+def _error_response(
+    operation: str | None,
+    category: str,
+    message: str,
+    exit_code: int,
+    *,
+    details: dict[str, object] | None = None,
+) -> tuple[dict[str, object], int]:
+    return (
+        {
+            "ok": False,
+            "operation": operation,
+            "server_protocol_version": dict(SERVER_PROTOCOL_VERSION),
+            "error": {
+                "category": category,
+                "message": message,
+                "details": details or {},
+            },
+        },
+        exit_code,
+    )
 
 
 def _operation_from_data(data: object) -> str | None:
@@ -408,3 +364,16 @@ def _version_details(request: DomainRequest) -> dict[str, object]:
         "server": dict(SERVER_PROTOCOL_VERSION),
     }
 
+
+def _reject_unknown_fields(
+    values: dict[object, object],
+    allowed: set[str],
+    field: str,
+) -> None:
+    unknown = sorted(
+        key if isinstance(key, str) else repr(key)
+        for key in values
+        if key not in allowed
+    )
+    if unknown:
+        raise UserInputError(f"{field} contains unknown fields: {', '.join(unknown)}")

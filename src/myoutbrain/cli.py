@@ -146,9 +146,10 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("install", "reinstall", "check", "uninstall"):
         action_parser = adapter_actions.add_parser(action)
         action_parser.add_argument("client", choices=ADAPTER_CLIENTS)
-        action_parser.add_argument("--root", type=Path, default=Path.cwd())
+        action_parser.add_argument("--root", type=Path)
         action_parser.add_argument("--config", type=Path)
         action_parser.add_argument("--skills-dir", type=Path)
+        action_parser.add_argument("--registry", type=Path)
     source_memory_parser = subcommands.add_parser(
         "propose-source-memory",
         help="Submit a local source as one pending integration proposal",
@@ -860,16 +861,18 @@ def _gateway(root: Path, request_path: Path) -> int:
 def _adapter(
     action: str,
     client: AdapterClient,
-    root: Path,
+    root: Path | None,
     *,
     config_path: Path | None,
     skills_dir: Path | None,
+    registry_path: Path | None,
 ) -> int:
     installer = AdapterInstaller(
         client,
         root,
         config_path=config_path,
         skills_dir=skills_dir,
+        registry_path=registry_path,
     )
     if action in ("install", "reinstall"):
         result = installer.install()
@@ -2009,6 +2012,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 config_path=parsed_arguments.config,
                 skills_dir=parsed_arguments.skills_dir,
+                registry_path=parsed_arguments.registry,
             )
         if parsed_arguments.command == "propose-source-memory":
             return _propose_source_memory(

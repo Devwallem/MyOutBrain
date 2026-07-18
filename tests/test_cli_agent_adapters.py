@@ -208,6 +208,100 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             self.assertEqual(response["result"]["canonical_schema_version"], 9)
             self.assertEqual(response["result"]["integrity"]["overall"], "ok")
 
+    def test_protocol_range_with_a_supported_intersection_is_negotiated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            request_path = temporary_root / "request.json"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            for minimum, maximum in (
+                ((1, 0), (2, 1)),
+                ((2, 0), (3, 0)),
+            ):
+                with self.subTest(minimum=minimum, maximum=maximum):
+                    write_request(
+                        request_path,
+                        {
+                            "protocol": {
+                                "minimum": {"major": minimum[0], "minor": minimum[1]},
+                                "maximum": {"major": maximum[0], "minor": maximum[1]},
+                            },
+                            "client": {"name": "range-client", "capabilities": []},
+                            "operation": "instance.status",
+                            "parameters": {},
+                        },
+                    )
+
+                    result = run_cli(
+                        "gateway",
+                        str(request_path),
+                        "--root",
+                        str(instance_root),
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(
+                        json.loads(result.stdout)["protocol_version"],
+                        {"major": 2, "minor": 1},
+                    )
+
+    def test_request_parser_enforces_the_published_schema_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            request_path = temporary_root / "request.json"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            request: dict[str, object] = {
+                "protocol": {
+                    "minimum": {"major": 2, "minor": 0},
+                    "maximum": {"major": 2, "minor": 1},
+                },
+                "client": {
+                    "name": "schema-client",
+                    "capabilities": ["instance_status.v1", "instance_status.v1"],
+                },
+                "operation": "instance.status",
+                "parameters": {},
+                "unexpected": True,
+            }
+            write_request(request_path, request)
+
+            unknown = run_cli(
+                "gateway",
+                str(request_path),
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(unknown.returncode, 2, unknown.stderr)
+            self.assertEqual(
+                json.loads(unknown.stdout)["error"],
+                {
+                    "category": "invalid_request",
+                    "details": {},
+                    "message": "gateway request contains unknown fields: unexpected",
+                },
+            )
+
+            request.pop("unexpected")
+            write_request(request_path, request)
+            duplicate = run_cli(
+                "gateway",
+                str(request_path),
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(duplicate.returncode, 2, duplicate.stderr)
+            self.assertEqual(
+                json.loads(duplicate.stdout)["error"]["message"],
+                "client.capabilities must not contain duplicates",
+            )
+
     def test_incompatible_major_rejects_semantic_write_with_stable_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -258,7 +352,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                 response["error"],
                 {
                     "category": "protocol_incompatible",
-                    "message": "client protocol major version is incompatible",
+                    "message": "client protocol range is incompatible",
                     "details": {
                         "client_maximum": {"major": 1, "minor": 9},
                         "client_minimum": {"major": 1, "minor": 0},
@@ -595,6 +689,7 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                 0,
             )
             original_instance = canonical_snapshot(instance_root)
+            registry_path = temporary_root / "instances.json"
             clients = {
                 "codex": ("config.toml", 'model = "test"\n'),
                 "opencode": ("opencode.json", '{"theme":"test"}\n'),
@@ -615,6 +710,8 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                         str(config_path),
                         "--skills-dir",
                         str(skills_dir),
+                        "--registry",
+                        str(registry_path),
                     )
 
                     installed = run_cli("adapter", "install", *common)
@@ -632,7 +729,15 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                     self.assertEqual(check["status"], "installed")
                     self.assertEqual(
                         check["protocol"],
-                        {"compatible": True, "server": {"major": 2, "minor": 1}},
+                        {
+                            "client": {
+                                "maximum": {"major": 2, "minor": 1},
+                                "minimum": {"major": 2, "minor": 0},
+                            },
+                            "compatible": True,
+                            "negotiated": {"major": 2, "minor": 1},
+                            "server": {"major": 2, "minor": 1},
+                        },
                     )
                     self.assertTrue(check["config_matches"])
                     self.assertTrue(check["skill_matches"])
@@ -641,6 +746,25 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                     )
                     self.assertFalse(any(client_root.rglob("*.sqlite3")))
                     self.assertFalse((client_root / "store").exists())
+
+                    discovered_check = run_cli(
+                        "adapter",
+                        "check",
+                        client,
+                        "--config",
+                        str(config_path),
+                        "--skills-dir",
+                        str(skills_dir),
+                        "--registry",
+                        str(registry_path),
+                    )
+                    self.assertEqual(
+                        discovered_check.returncode, 0, discovered_check.stderr
+                    )
+                    self.assertEqual(
+                        json.loads(discovered_check.stdout)["instance"],
+                        str(instance_root.resolve()),
+                    )
 
                     before_uninstall = canonical_snapshot(instance_root)
                     removed = run_cli("adapter", "uninstall", *common)
@@ -659,6 +783,94 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                     self.assertEqual(canonical_snapshot(instance_root), before_uninstall)
 
             self.assertEqual(canonical_snapshot(instance_root), original_instance)
+
+            discovered = run_cli(
+                "adapter",
+                "check",
+                "codex",
+                "--config",
+                str(temporary_root / "codex" / "config.toml"),
+                "--skills-dir",
+                str(temporary_root / "codex" / "skills"),
+                "--registry",
+                str(registry_path),
+            )
+            self.assertEqual(discovered.returncode, 3, discovered.stderr)
+            self.assertEqual(
+                json.loads(discovered.stdout)["instance"],
+                str(instance_root.resolve()),
+            )
+
+    def test_installer_preserves_unmanaged_config_and_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            config_path = temporary_root / "opencode.json"
+            skill_path = temporary_root / "skills" / "myoutbrain" / "SKILL.md"
+            registry_path = temporary_root / "instances.json"
+            self.assertEqual(
+                run_cli("init", "--root", str(instance_root)).returncode,
+                0,
+            )
+            unmanaged_config = {
+                "mcp": {"myoutbrain": {"type": "remote", "url": "https://example.test"}}
+            }
+            config_path.write_text(json.dumps(unmanaged_config), encoding="utf-8")
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text("user-owned skill\n", encoding="utf-8")
+
+            result = run_cli(
+                "adapter",
+                "install",
+                "opencode",
+                "--root",
+                str(instance_root),
+                "--config",
+                str(config_path),
+                "--skills-dir",
+                str(temporary_root / "skills"),
+                "--registry",
+                str(registry_path),
+            )
+
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(json.loads(config_path.read_text()), unmanaged_config)
+            self.assertEqual(skill_path.read_text(encoding="utf-8"), "user-owned skill\n")
+
+            config_path.write_text("{}\n", encoding="utf-8")
+            skill_path.unlink()
+            installed = run_cli(
+                "adapter",
+                "install",
+                "opencode",
+                "--root",
+                str(instance_root),
+                "--config",
+                str(config_path),
+                "--skills-dir",
+                str(temporary_root / "skills"),
+                "--registry",
+                str(registry_path),
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            config_path.write_text(json.dumps(unmanaged_config), encoding="utf-8")
+
+            removed = run_cli(
+                "adapter",
+                "uninstall",
+                "opencode",
+                "--root",
+                str(instance_root),
+                "--config",
+                str(config_path),
+                "--skills-dir",
+                str(temporary_root / "skills"),
+                "--registry",
+                str(registry_path),
+            )
+            self.assertEqual(removed.returncode, 3, removed.stderr)
+            self.assertEqual(json.loads(config_path.read_text()), unmanaged_config)
+            self.assertTrue(skill_path.is_file())
 
 
 if __name__ == "__main__":

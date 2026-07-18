@@ -7,16 +7,16 @@
       "additionalProperties": false,
       "properties": {
         "capabilities": {
-          "items": {"minLength": 1, "type": "string"},
+          "items": {"minLength": 1, "pattern": "\\S", "type": "string"},
           "type": "array",
           "uniqueItems": true
         },
-        "name": {"minLength": 1, "type": "string"}
+        "name": {"minLength": 1, "pattern": "\\S", "type": "string"}
       },
       "required": ["name", "capabilities"],
       "type": "object"
     },
-    "operation": {"minLength": 1, "type": "string"},
+    "operation": {"minLength": 1, "pattern": "\\S", "type": "string"},
     "parameters": {"type": "object"},
     "protocol": {
       "additionalProperties": false,
@@ -31,7 +31,7 @@
       "additionalProperties": false,
       "properties": {
         "expected_version": {"minimum": 0, "type": "integer"},
-        "idempotency_key": {"maxLength": 200, "minLength": 1, "type": "string"}
+        "idempotency_key": {"maxLength": 200, "minLength": 1, "pattern": "\\S", "type": "string"}
       },
       "required": ["idempotency_key", "expected_version"],
       "type": "object"
