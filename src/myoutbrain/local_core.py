@@ -691,6 +691,27 @@ class LocalMemoryCore:
             database_content = self._new_database_content(database_path.parent)
             atomic_commit(self._root, [(database_path, database_content)])
 
+    def initialization_change(self) -> tuple[Path, bytes] | None:
+        """Prepare a clean V2 database without upgrading an existing schema."""
+        database_path = self._root / MEMORY_DATABASE
+        if database_path.exists():
+            if not database_path.is_file():
+                raise ConfigurationConflict(
+                    f"expected a canonical database at: {database_path}"
+                )
+            self._validate_database(database_path)
+            return None
+        return database_path, self._new_database_content(database_path.parent)
+
+    def inspect_schema_version(self) -> int:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        self._validate_database(database_path)
+        return MEMORY_SCHEMA_VERSION
+
     def capture_experience(
         self,
         conversation_path: Path,

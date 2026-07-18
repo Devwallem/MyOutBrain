@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 首次初始化建立带版本的 SQLite 规范状态和内容寻址对象存储。
 - [ ] 重复初始化保持幂等，不覆盖已存在数据或隐式迁移 V1 语义内容。

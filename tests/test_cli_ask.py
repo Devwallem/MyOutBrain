@@ -122,6 +122,7 @@ class AskFromEvidencePackageTests(unittest.TestCase):
             configuration_path = library_root / "myoutbrain.toml"
             configuration_path.write_text(
                 "# retained user comment\n"
+                "instance_version = 2\n"
                 "schema_version = 1\n"
                 "single_writer = true\n\n"
                 "[storage]\n"

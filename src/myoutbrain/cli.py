@@ -99,6 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     initialize_parser = subcommands.add_parser("init", help="Initialize a private cognitive library")
     initialize_parser.add_argument("--root", type=Path, default=Path.cwd())
+    initialize_parser.add_argument("--format", choices=("json", "text"), default="text")
+    status_parser = subcommands.add_parser("status", help="Inspect a V2 private instance")
+    status_parser.add_argument("--root", type=Path, default=Path.cwd())
+    status_parser.add_argument("--format", choices=("json", "text"), default="text")
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
     capture_parser.add_argument("source", type=Path)
     capture_parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -452,15 +456,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _initialize(root: Path) -> int:
+def _initialize(root: Path, output_format: str) -> int:
     KnowledgeWorkflow(root).initialize()
-    print(f"Initialized MyOutBrain at {root.resolve()}")
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "instance_version": 2,
+                    "root": str(root.resolve()),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"Initialized MyOutBrain at {root.resolve()}")
     if shutil.which("obsidian") is None:
         print(
             "Warning: Obsidian CLI not found. Install Obsidian 1.12.7+ on Windows, "
             "then enable Command line interface in Settings > General and register it on PATH.",
             file=sys.stderr,
         )
+    return 0
+
+
+def _instance_status(root: Path, output_format: str) -> int:
+    status = KnowledgeWorkflow(root).instance_status().to_data()
+    if output_format == "json":
+        print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+    else:
+        integrity = status["integrity"]
+        write = status["write"]
+        if not isinstance(integrity, dict) or not isinstance(write, dict):
+            raise IntegrityError("instance status response is invalid")
+        print(f"MyOutBrain V{status['instance_version']} schema {status['schema_version']}")
+        print(f"Canonical store: {integrity['canonical_store']}")
+        print(f"Object store: {integrity['object_store']}")
+        print(
+            "Writer: "
+            + ("available" if write["available"] else "locked")
+            + f" ({write['mode']})"
+        )
+        print(f"Integrity: {integrity['overall']}")
     return 0
 
 
@@ -1033,7 +1070,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parsed_arguments = build_parser().parse_args(arguments)
     try:
         if parsed_arguments.command == "init":
-            return _initialize(parsed_arguments.root)
+            return _initialize(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "status":
+            return _instance_status(parsed_arguments.root, parsed_arguments.format)
         if parsed_arguments.command == "capture":
             return _capture(
                 parsed_arguments.root,
@@ -1393,7 +1432,26 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(f"Configuration conflict: {error}", file=sys.stderr)
         return EXIT_CONFIGURATION
     except WriterLocked:
-        print("Another MyOutBrain writer is active.", file=sys.stderr)
+        message = "Another MyOutBrain writer is active."
+        if (
+            parsed_arguments.command == "init"
+            and parsed_arguments.format == "json"
+        ):
+            print(
+                json.dumps(
+                    {
+                        "error": {
+                            "category": "writer_locked",
+                            "message": message,
+                        }
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(message, file=sys.stderr)
         return EXIT_LOCKED
     except ProviderFailure as error:
         print(f"Provider failure: {error}", file=sys.stderr)

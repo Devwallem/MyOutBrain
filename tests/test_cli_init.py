@@ -143,7 +143,7 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
             library_root = Path(temporary_directory) / "My Knowledge"
             library_root.mkdir()
             (library_root / "myoutbrain.toml").write_text(
-                "schema_version = 99\n",
+                "instance_version = 2\nschema_version = 99\n",
                 encoding="utf-8",
             )
 

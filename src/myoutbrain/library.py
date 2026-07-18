@@ -50,11 +50,11 @@ from myoutbrain.core_types import (
     IntegrityError,
     Sensitivity,
     UserInputError,
+    WriterLocked,
 )
 from myoutbrain.local_core import LocalMemoryCore
 from myoutbrain.persistence import (
     atomic_commit as _atomic_commit,
-    atomic_write as _atomic_write,
     event_journal_change as _event_journal_change,
     hold_writer_lock_for_acceptance_test as _hold_writer_lock_for_acceptance_test,
     json_document as _json_document,
@@ -90,6 +90,7 @@ INITIAL_DIRECTORIES = (
     "runtime/logs",
 )
 
+INSTANCE_VERSION = 2
 SCHEMA_VERSION = 1
 PERMANENT_STORAGE = ("vault", "store")
 REBUILDABLE_STORAGE = ("runtime",)
@@ -146,6 +147,27 @@ class GenerationContext:
     provider: GenerationProvider
     request: GenerationRequest
     configuration: dict[str, object]
+
+
+@dataclass(frozen=True)
+class InstanceStatus:
+    schema_version: int
+    write_available: bool
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "instance_version": INSTANCE_VERSION,
+            "schema_version": self.schema_version,
+            "write": {
+                "available": self.write_available,
+                "mode": "single-writer",
+            },
+            "integrity": {
+                "canonical_store": "ok",
+                "object_store": "ok",
+                "overall": "ok",
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -270,6 +292,7 @@ def _render_initial_configuration() -> str:
     permanent = ", ".join(f'"{name}"' for name in PERMANENT_STORAGE)
     rebuildable = ", ".join(f'"{name}"' for name in REBUILDABLE_STORAGE)
     return (
+        f"instance_version = {INSTANCE_VERSION}\n"
         f"schema_version = {SCHEMA_VERSION}\n"
         "single_writer = true\n\n"
         "[storage]\n"
@@ -348,6 +371,11 @@ def _load_configuration(path: Path) -> dict[str, object]:
 
 def _load_validated_configuration(path: Path) -> dict[str, object]:
     configuration = _load_configuration(path)
+    if configuration.get("instance_version") != INSTANCE_VERSION:
+        raise ConfigurationConflict(
+            "existing workspace is not a V2 private instance; "
+            "initialize a clean V2 instance instead"
+        )
     if configuration.get("schema_version") != SCHEMA_VERSION:
         raise ConfigurationConflict("unsupported schema_version in existing configuration")
     if configuration.get("single_writer") is not True:
@@ -486,14 +514,53 @@ class KnowledgeWorkflow:
             for relative_path in INITIAL_DIRECTORIES:
                 (root / relative_path).mkdir(parents=True, exist_ok=True)
             updated_git_ignore = _with_required_git_ignore_rules(existing_git_ignore)
-            if updated_git_ignore != existing_git_ignore:
-                _atomic_write(git_ignore, updated_git_ignore.encode("utf-8"))
+            changes: list[tuple[Path, bytes]] = []
             if not configuration.exists():
-                _atomic_write(configuration, _render_initial_configuration().encode("utf-8"))
+                changes.append(
+                    (
+                        configuration,
+                        _render_initial_configuration().encode("utf-8"),
+                    )
+                )
             elif migrated_configuration is not None:
-                _atomic_write(configuration, migrated_configuration.encode("utf-8"))
-        LocalMemoryCore(root).initialize()
+                changes.append(
+                    (configuration, migrated_configuration.encode("utf-8"))
+                )
+            database_change = LocalMemoryCore(root).initialization_change()
+            if database_change is not None:
+                changes.append(database_change)
+            if updated_git_ignore != existing_git_ignore:
+                changes.append((git_ignore, updated_git_ignore.encode("utf-8")))
+            if changes:
+                _atomic_commit(
+                    root,
+                    changes,
+                    fault_injections={0: "initialize-after-configuration"},
+                )
         prepare_default_local_embedding_model()
+
+    def instance_status(self) -> InstanceStatus:
+        configuration = self._root / "myoutbrain.toml"
+        if not configuration.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain is not initialized at: {self._root}"
+            )
+        _load_validated_configuration(configuration)
+        object_store = self._root / "store" / "objects" / "sha256"
+        if not object_store.is_dir():
+            raise IntegrityError(f"content-addressed object store is missing: {object_store}")
+        try:
+            with _writer_lock(self._root):
+                _recover_transactions(self._root)
+                schema_version = LocalMemoryCore(self._root).inspect_schema_version()
+            write_available = True
+        except WriterLocked:
+            schema_version = LocalMemoryCore(self._root).inspect_schema_version()
+            write_available = False
+        return InstanceStatus(
+            schema_version=schema_version,
+            write_available=write_available,
+        )
 
     def capture(self, source_path: Path, sensitivity: Sensitivity) -> CaptureResult:
         configuration = self._root / "myoutbrain.toml"
