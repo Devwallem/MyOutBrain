@@ -947,6 +947,7 @@ class LocalMemoryCore:
         self,
         source_path: Path,
         *,
+        source_id: str | None = None,
         canonical_name: str,
         body: str,
         applicability_scope: str,
@@ -961,6 +962,9 @@ class LocalMemoryCore:
         normalized_key = _bounded_text(
             "idempotency key", idempotency_key, maximum=200
         )
+        normalized_source_id = (
+            _validated_source_id(source_id) if source_id is not None else None
+        )
         locator = str(source_path.resolve())
         content_hash = f"sha256:{hashlib.sha256(source_body).hexdigest()}"
         request_hash = _stable_hash(
@@ -968,6 +972,7 @@ class LocalMemoryCore:
                 "operation": "propose-source-memory",
                 "locator": locator,
                 "content_hash": content_hash,
+                "source_id": normalized_source_id,
                 "canonical_name": normalized_name,
                 "body": normalized_body,
                 "applicability_scope": normalized_scope,
@@ -1002,6 +1007,7 @@ class LocalMemoryCore:
                 applicability_scope=normalized_scope,
                 idempotency_key=normalized_key,
                 request_hash=request_hash,
+                existing_source_id=normalized_source_id,
             )
             atomic_commit(
                 self._root,
@@ -2479,6 +2485,7 @@ class LocalMemoryCore:
         applicability_scope: str,
         idempotency_key: str,
         request_hash: str,
+        existing_source_id: str | None,
     ) -> tuple[bytes, SourceMemoryProposal]:
         temporary_path: Path | None = None
         created_at = datetime.now(timezone.utc).isoformat()
@@ -2494,13 +2501,26 @@ class LocalMemoryCore:
                 temporary_file.write(database_path.read_bytes())
             with closing(sqlite3.connect(temporary_path)) as connection:
                 connection.execute("PRAGMA foreign_keys = ON")
-                source_row = connection.execute(
-                    """
-                    SELECT source_id FROM evidence_sources
-                    WHERE current_locator = ?
-                    """,
-                    (locator,),
-                ).fetchone()
+                if existing_source_id is None:
+                    source_row = connection.execute(
+                        """
+                        SELECT source_id FROM evidence_sources
+                        WHERE current_locator = ?
+                        """,
+                        (locator,),
+                    ).fetchone()
+                else:
+                    source_row = connection.execute(
+                        """
+                        SELECT source_id FROM evidence_sources
+                        WHERE source_id = ?
+                        """,
+                        (existing_source_id,),
+                    ).fetchone()
+                    if source_row is None:
+                        raise UserInputError(
+                            f"local source does not exist: {existing_source_id}"
+                        )
                 if source_row is None:
                     source_id = f"src_{uuid.uuid4().hex}"
                     source_version = 1
@@ -2519,7 +2539,7 @@ class LocalMemoryCore:
                         raise IntegrityError("local source identity is invalid")
                     latest = connection.execute(
                         """
-                        SELECT version, content_hash
+                        SELECT version, content_hash, applicability_scope, locator
                         FROM evidence_source_versions
                         WHERE source_id = ?
                         ORDER BY version DESC
@@ -2530,15 +2550,28 @@ class LocalMemoryCore:
                     if (
                         latest is None
                         or not isinstance(latest[0], int)
-                        or not isinstance(latest[1], str)
+                        or not all(isinstance(latest[index], str) for index in (1, 2, 3))
                     ):
                         raise IntegrityError("local source version is invalid")
-                    if latest[1] == content_hash:
+                    if (
+                        latest[1] == content_hash
+                        and latest[2] == applicability_scope
+                        and latest[3] == locator
+                    ):
                         source_version = latest[0]
                         add_source_version = False
                     else:
                         source_version = latest[0] + 1
                         add_source_version = True
+                    if latest[3] != locator:
+                        connection.execute(
+                            """
+                            UPDATE evidence_sources
+                            SET current_locator = ?
+                            WHERE source_id = ?
+                            """,
+                            (locator, source_id),
+                        )
                 if add_source_version:
                     connection.execute(
                         """
@@ -4105,32 +4138,23 @@ class LocalMemoryCore:
 
 
 def _read_conversation(conversation_path: Path) -> bytes:
-    if not conversation_path.is_file():
-        raise UserInputError(f"conversation does not exist: {conversation_path}")
-    try:
-        body = conversation_path.read_bytes()
-        text = body.decode("utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise UserInputError(
-            f"conversation is not readable UTF-8: {conversation_path}"
-        ) from error
-    if not text.strip():
-        raise UserInputError("conversation must not be blank")
-    return body
+    return _read_required_utf8_file(conversation_path, label="conversation")
 
 
 def _read_local_source(source_path: Path) -> bytes:
-    if not source_path.is_file():
-        raise UserInputError(f"local source does not exist: {source_path}")
+    return _read_required_utf8_file(source_path, label="local source")
+
+
+def _read_required_utf8_file(path: Path, *, label: str) -> bytes:
+    if not path.is_file():
+        raise UserInputError(f"{label} does not exist: {path}")
     try:
-        body = source_path.read_bytes()
+        body = path.read_bytes()
         text = body.decode("utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        raise UserInputError(
-            f"local source is not readable UTF-8: {source_path}"
-        ) from error
+        raise UserInputError(f"{label} is not readable UTF-8: {path}") from error
     if not text.strip():
-        raise UserInputError("local source must not be blank")
+        raise UserInputError(f"{label} must not be blank")
     return body
 
 
@@ -4146,6 +4170,13 @@ def _bounded_text(name: str, value: str, *, maximum: int) -> str:
     if len(normalized) > maximum:
         raise UserInputError(f"{name} must not exceed {maximum} characters")
     return normalized
+
+
+def _validated_source_id(value: str) -> str:
+    source_id = _required_text("source id", value)
+    if re.fullmatch(r"src_[0-9a-f]{32}", source_id) is None:
+        raise UserInputError(f"invalid local source id: {source_id}")
+    return source_id
 
 
 def _validated_memory_body(value: str) -> str:

@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Submit a local source as one pending integration proposal",
     )
     source_memory_parser.add_argument("source", type=Path)
+    source_memory_parser.add_argument("--source-id")
     source_memory_parser.add_argument("--name", required=True)
     source_memory_parser.add_argument("--body", required=True)
     source_memory_parser.add_argument("--scope", required=True)
@@ -529,6 +530,7 @@ def _propose_source_memory(
     root: Path,
     source: Path,
     *,
+    source_id: str | None,
     name: str,
     body: str,
     scope: str,
@@ -537,6 +539,7 @@ def _propose_source_memory(
 ) -> int:
     proposal = LocalMemoryCore(root).propose_source_memory(
         source,
+        source_id=source_id,
         canonical_name=name,
         body=body,
         applicability_scope=scope,
@@ -1152,6 +1155,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _propose_source_memory(
                 parsed_arguments.root,
                 parsed_arguments.source,
+                source_id=parsed_arguments.source_id,
                 name=parsed_arguments.name,
                 body=parsed_arguments.body,
                 scope=parsed_arguments.scope,

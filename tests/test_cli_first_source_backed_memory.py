@@ -374,6 +374,91 @@ class FirstSourceBackedMemoryTests(unittest.TestCase):
             self.assertEqual(oversized.returncode, 2)
             self.assertIn("8192-byte hard limit", oversized.stderr)
 
+    def test_source_identity_survives_relocation_and_scope_changes_are_versioned(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            original_path = temporary_root / "Original.md"
+            moved_path = temporary_root / "Moved.md"
+            original_path.write_text("Original source wording.\n", encoding="utf-8")
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            original = run_cli(
+                "propose-source-memory",
+                str(original_path),
+                "--name",
+                "Stable source",
+                "--body",
+                "A source keeps its identity when its locator changes.",
+                "--scope",
+                "original scope",
+                "--idempotency-key",
+                "proposal-stable-source-v1",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            original_proposal = json.loads(original.stdout)
+            moved_path.write_text("Revised source wording.\n", encoding="utf-8")
+
+            revised = run_cli(
+                "propose-source-memory",
+                str(moved_path),
+                "--source-id",
+                original_proposal["source"]["source_id"],
+                "--name",
+                "Stable source revision",
+                "--body",
+                "The relocated source now supports a revised understanding.",
+                "--scope",
+                "revised scope",
+                "--idempotency-key",
+                "proposal-stable-source-v2",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            retried = run_cli(
+                "propose-source-memory",
+                str(moved_path),
+                "--source-id",
+                original_proposal["source"]["source_id"],
+                "--name",
+                "Stable source revision",
+                "--body",
+                "The relocated source now supports a revised understanding.",
+                "--scope",
+                "revised scope",
+                "--idempotency-key",
+                "proposal-stable-source-v2",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(original.returncode, 0, original.stderr)
+            self.assertEqual(revised.returncode, 0, revised.stderr)
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            revised_proposal = json.loads(revised.stdout)
+            self.assertEqual(json.loads(retried.stdout), revised_proposal)
+            self.assertEqual(
+                revised_proposal["source"]["source_id"],
+                original_proposal["source"]["source_id"],
+            )
+            self.assertEqual(revised_proposal["source"]["version"], 2)
+            self.assertEqual(
+                revised_proposal["source"]["applicability_scope"],
+                "revised scope",
+            )
+            self.assertEqual(
+                revised_proposal["source"]["locator"],
+                str(moved_path.resolve()),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
