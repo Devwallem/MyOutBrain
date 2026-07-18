@@ -1819,6 +1819,8 @@ def _stage_erasure(
                 "canonical_memory_version_sources",
                 "canonical_memory_sources",
                 "legacy_knowledge_metadata",
+                "memory_name_changes",
+                "memory_names",
                 "knowledge_dictionary",
             ):
                 _delete_for_values(connection, table, "memory_id", memory_ids)

@@ -1738,7 +1738,7 @@ class LocalMemoryCore:
                      AND version.version = dictionary.current_version
                     JOIN canonical_memories AS memory
                       ON memory.memory_id = dictionary.memory_id
-                    WHERE memory.state = 'active'
+                    WHERE memory.state IN ('current', 'historical-trusted')
                     ORDER BY dictionary.memory_id
                     """
                 ).fetchall()
@@ -1782,7 +1782,7 @@ class LocalMemoryCore:
                      AND version.version = dictionary.current_version
                     JOIN canonical_memories AS memory
                       ON memory.memory_id = dictionary.memory_id
-                    WHERE memory.state = 'active'
+                    WHERE memory.state IN ('current', 'historical-trusted')
                     ORDER BY dictionary.memory_id
                     """
                 ).fetchall()
@@ -2113,7 +2113,8 @@ class LocalMemoryCore:
                     FROM knowledge_dictionary AS dictionary
                     JOIN canonical_memories AS memory
                       ON memory.memory_id = dictionary.memory_id
-                    WHERE dictionary.memory_id = ? AND memory.state = 'active'
+                    WHERE dictionary.memory_id = ?
+                      AND memory.state IN ('current', 'historical-trusted')
                     """,
                     (memory_id,),
                 ).fetchone()
