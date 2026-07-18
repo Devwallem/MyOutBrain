@@ -19,7 +19,7 @@ from myoutbrain.retrieval import lexical_terms
 
 
 DEFAULT_RECALL_BUDGET_BYTES = 16 * 1024
-MINIMUM_RECALL_BUDGET_BYTES = 256
+MINIMUM_RECALL_BUDGET_BYTES = 1024
 MAXIMUM_RECALL_BUDGET_BYTES = 64 * 1024
 PROTOCOL_VERSION = {"major": 2, "minor": 0}
 RECALL_PATHS = ("dictionary", "partition-tree", "local-fts", "global-fts")
@@ -157,7 +157,7 @@ class V2RecallService:
         entrance = _stable_identifier("recall entrance", request.entrance, maximum=64)
         if not MINIMUM_RECALL_BUDGET_BYTES <= request.budget_bytes <= MAXIMUM_RECALL_BUDGET_BYTES:
             raise UserInputError(
-                "recall budget must be between 256 and 65536 bytes"
+                "recall budget must be between 1024 and 65536 bytes"
             )
         LocalMemoryCore(self._root).inspect_schema_version()
         database_path = self._root / MEMORY_DATABASE
@@ -173,9 +173,13 @@ class V2RecallService:
                         question,
                     )
                     candidates = _load_candidates(connection, candidate_paths)
-                    selected, used_bytes, truncated = _within_budget(
+                    selected, truncated = _within_budget(
                         candidates,
                         request.budget_bytes,
+                        reserved_bytes=_recall_package_overhead_bytes(
+                            recall_id,
+                            request.budget_bytes,
+                        ),
                     )
                     selected_ids = tuple(candidate.memory_id for candidate in selected)
                     unresolved_conflict = _has_unresolved_conflict(
@@ -208,16 +212,26 @@ class V2RecallService:
                         and candidate.capsule_id not in routed_capsules
                         for candidate in selected
                     )
-                    budget = {
-                        "limit_bytes": request.budget_bytes,
-                        "used_bytes": used_bytes,
-                        "truncated": truncated,
-                    }
-                    answerability = {
+                    answerability: dict[str, object] = {
                         "answerable": answerable,
                         "reason": reason,
                         "overridden_by_core": overridden,
                     }
+                    package = _recall_package(
+                        recall_id=recall_id,
+                        limit_bytes=request.budget_bytes,
+                        truncated=truncated,
+                        answerability=answerability,
+                        selected=selected,
+                        cross_partition_hit=cross_partition_hit,
+                        ambiguity=ambiguity,
+                        unresolved_conflict=unresolved_conflict,
+                    )
+                    used_bytes = _measure_recall_package(package)
+                    if used_bytes > request.budget_bytes:
+                        raise IntegrityError(
+                            "recall package exceeded its byte budget"
+                        )
                     connection.execute(
                         """
                         INSERT INTO recall_events
@@ -268,29 +282,9 @@ class V2RecallService:
                         ),
                     )
                     connection.commit()
+                    return package
         except sqlite3.Error as error:
             raise IntegrityError("cannot recall V2 canonical memory") from error
-        return {
-            "protocol_version": PROTOCOL_VERSION,
-            "recall_id": recall_id,
-            "paths_attempted": list(RECALL_PATHS),
-            "budget": budget,
-            "answerability": answerability,
-            "source_declaration": {
-                "kind": "myoutbrain" if selected else "none",
-                "label": (
-                    "根据你的 MyOutBrain 知识库" if selected else "未找到可用的本地知识"
-                ),
-                "evidence_disclosure": "on-request",
-            },
-            "memories": [candidate.to_data() for candidate in selected],
-            "signals": {
-                "cross_partition_hit": cross_partition_hit,
-                "ambiguity": ambiguity,
-                "missing_dependency": False,
-                "unresolved_conflict": unresolved_conflict,
-            },
-        }
 
     def assess_answerability(
         self,
@@ -722,20 +716,116 @@ def _load_candidates(
     )
 
 
+def _recall_package(
+    *,
+    recall_id: str,
+    limit_bytes: int,
+    truncated: bool,
+    answerability: dict[str, object],
+    selected: tuple[_Candidate, ...],
+    cross_partition_hit: bool,
+    ambiguity: bool,
+    unresolved_conflict: bool,
+) -> dict[str, object]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "recall_id": recall_id,
+        "paths_attempted": list(RECALL_PATHS),
+        "budget": {
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "truncated": truncated,
+        },
+        "answerability": answerability,
+        "source_declaration": {
+            "kind": "myoutbrain" if selected else "none",
+            "label": (
+                "根据你的 MyOutBrain 知识库" if selected else "未找到可用的本地知识"
+            ),
+            "evidence_disclosure": "on-request",
+        },
+        "memories": [candidate.to_data() for candidate in selected],
+        "signals": {
+            "cross_partition_hit": cross_partition_hit,
+            "ambiguity": ambiguity,
+            "missing_dependency": False,
+            "unresolved_conflict": unresolved_conflict,
+        },
+    }
+
+
+def _recall_package_overhead_bytes(recall_id: str, limit_bytes: int) -> int:
+    worst_case_shell = {
+        "protocol_version": PROTOCOL_VERSION,
+        "recall_id": recall_id,
+        "paths_attempted": list(RECALL_PATHS),
+        "budget": {
+            "limit_bytes": limit_bytes,
+            "used_bytes": limit_bytes,
+            "truncated": False,
+        },
+        "answerability": {
+            "answerable": False,
+            "reason": "freshness-insufficient",
+            "overridden_by_core": False,
+        },
+        "source_declaration": {
+            "kind": "myoutbrain",
+            "label": "根据你的 MyOutBrain 知识库",
+            "evidence_disclosure": "on-request",
+        },
+        "memories": [],
+        "signals": {
+            "cross_partition_hit": False,
+            "ambiguity": False,
+            "missing_dependency": False,
+            "unresolved_conflict": False,
+        },
+    }
+    return _serialized_bytes(worst_case_shell)
+
+
+def _measure_recall_package(package: dict[str, object]) -> int:
+    budget = package.get("budget")
+    if not isinstance(budget, dict):
+        raise IntegrityError("recall package budget is malformed")
+    previous = -1
+    while True:
+        measured = _serialized_bytes(package)
+        if measured == previous:
+            return measured
+        budget["used_bytes"] = measured
+        previous = measured
+
+
+def _serialized_bytes(value: object) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
 def _within_budget(
     candidates: Iterable[_Candidate],
     limit_bytes: int,
-) -> tuple[tuple[_Candidate, ...], int, bool]:
+    *,
+    reserved_bytes: int,
+) -> tuple[tuple[_Candidate, ...], bool]:
     selected: list[_Candidate] = []
-    used_bytes = 0
+    used_bytes = reserved_bytes
     truncated = False
     for candidate in candidates:
-        if used_bytes + candidate.payload_bytes > limit_bytes:
+        separator_bytes = 1 if selected else 0
+        if used_bytes + separator_bytes + candidate.payload_bytes > limit_bytes:
             truncated = True
             continue
         selected.append(candidate)
-        used_bytes += candidate.payload_bytes
-    return tuple(selected), used_bytes, truncated
+        used_bytes += separator_bytes + candidate.payload_bytes
+    return tuple(selected), truncated
 
 
 def _has_unresolved_conflict(

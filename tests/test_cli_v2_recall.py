@@ -154,6 +154,17 @@ class V2RecallTests(unittest.TestCase):
             self.assertEqual(package["budget"]["limit_bytes"], 16384)
             self.assertGreater(package["budget"]["used_bytes"], 62)
             self.assertLessEqual(package["budget"]["used_bytes"], 16384)
+            self.assertEqual(
+                package["budget"]["used_bytes"],
+                len(
+                    json.dumps(
+                        package,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ),
+            )
             self.assertFalse(package["budget"]["truncated"])
             self.assertEqual(
                 package["answerability"],
@@ -537,7 +548,7 @@ class V2RecallTests(unittest.TestCase):
                 "--answerability-reason",
                 "covered",
                 "--budget-bytes",
-                "256",
+                "1024",
                 "--root",
                 str(instance_root),
                 "--format",
@@ -546,10 +557,9 @@ class V2RecallTests(unittest.TestCase):
             self.assertEqual(recalled.returncode, 0, recalled.stderr)
             package = json.loads(recalled.stdout)
             self.assertEqual(package["memories"], [])
-            self.assertEqual(
-                package["budget"],
-                {"limit_bytes": 256, "used_bytes": 0, "truncated": True},
-            )
+            self.assertEqual(package["budget"]["limit_bytes"], 1024)
+            self.assertLessEqual(package["budget"]["used_bytes"], 1024)
+            self.assertTrue(package["budget"]["truncated"])
             self.assertEqual(
                 package["answerability"],
                 {

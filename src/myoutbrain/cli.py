@@ -687,7 +687,14 @@ def _recall_memory(
         )
     )
     if output_format == "json":
-        print(json.dumps(package, ensure_ascii=False, sort_keys=True))
+        print(
+            json.dumps(
+                package,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
     else:
         print(f"Recall {package['recall_id']}")
         declaration = package["source_declaration"]
