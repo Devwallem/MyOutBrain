@@ -6,7 +6,7 @@ from typing import cast
 
 
 SERVER_MINIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 0}
-SERVER_PROTOCOL_VERSION = {"major": 2, "minor": 2}
+SERVER_PROTOCOL_VERSION = {"major": 2, "minor": 3}
 SERVER_CAPABILITIES = (
     "instance_status.v1",
     "capsule_maintenance.v1",
@@ -27,6 +27,12 @@ SERVER_CAPABILITIES = (
     "migration_export.v1",
     "migration_import_preview.v1",
     "migration_import.v1",
+    "backup_create.v1",
+    "backup_verify.v1",
+    "backup_restore.v1",
+    "doctor_read.v1",
+    "doctor_repair.v1",
+    "orphan_gc.v1",
 )
 
 

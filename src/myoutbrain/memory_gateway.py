@@ -59,6 +59,7 @@ from myoutbrain.v2_public_search import (
 from myoutbrain.v2_memory_lifecycle import V2MemoryLifecycleService
 from myoutbrain.capsule_maintenance import CapsuleMaintenanceService
 from myoutbrain.v2_migration import V2MigrationService
+from myoutbrain.instance_maintenance import InstanceMaintenanceService
 from myoutbrain.unified_review import ReviewBatchRequest
 
 
@@ -413,6 +414,80 @@ class MemoryGateway:
 
     def inspect_capsule_structure(self) -> dict[str, object]:
         return CapsuleMaintenanceService(self._root).inspect()
+
+    def doctor_instance(
+        self,
+        *,
+        repair: bool,
+        expected_version: int | None = None,
+        idempotency_key: str | None = None,
+        entrance: str | None = None,
+    ) -> dict[str, object]:
+        service = InstanceMaintenanceService(self._root)
+        if not repair:
+            return service.doctor()
+        if expected_version is None or idempotency_key is None or entrance is None:
+            raise UserInputError("Doctor repair requires a complete write contract")
+        return service.repair(
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def create_cold_backup(
+        self,
+        output_path: Path,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return InstanceMaintenanceService(self._root).create_backup(
+            output_path,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def verify_cold_backup(self, archive_path: Path) -> dict[str, object]:
+        return InstanceMaintenanceService.verify_backup(archive_path)
+
+    def restore_cold_backup(
+        self,
+        archive_path: Path,
+        destination_path: Path,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return InstanceMaintenanceService.restore_backup(
+            archive_path,
+            destination_path,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def plan_orphan_gc(self) -> dict[str, object]:
+        return InstanceMaintenanceService(self._root).plan_gc()
+
+    def apply_orphan_gc(
+        self,
+        plan_id: str,
+        *,
+        confirmation: str,
+        confirmed_large_source_ids: tuple[str, ...],
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return InstanceMaintenanceService(self._root).apply_gc(
+            plan_id,
+            confirmation=confirmation,
+            confirmed_large_source_ids=confirmed_large_source_ids,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
 
     def plan_capsule_maintenance(
         self,

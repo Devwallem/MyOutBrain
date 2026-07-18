@@ -149,7 +149,7 @@ class V2RecallTests(unittest.TestCase):
 
             self.assertEqual(recalled.returncode, 0, recalled.stderr)
             package = json.loads(recalled.stdout)
-            self.assertEqual(package["protocol_version"], {"major": 2, "minor": 2})
+            self.assertEqual(package["protocol_version"], {"major": 2, "minor": 3})
             self.assertRegex(package["recall_id"], r"^rec_[0-9a-f]{32}$")
             self.assertEqual(package["budget"]["limit_bytes"], 16384)
             self.assertGreater(package["budget"]["used_bytes"], 62)
@@ -327,7 +327,7 @@ class V2RecallTests(unittest.TestCase):
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
             expansion = json.loads(first.stdout)
             self.assertEqual(json.loads(repeated.stdout), expansion)
-            self.assertEqual(expansion["protocol_version"], {"major": 2, "minor": 2})
+            self.assertEqual(expansion["protocol_version"], {"major": 2, "minor": 3})
             self.assertEqual(expansion["recall_id"], package["recall_id"])
             self.assertEqual(
                 expansion["budget"],

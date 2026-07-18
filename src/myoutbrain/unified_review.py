@@ -1640,6 +1640,30 @@ def _materialize_canonical_memory(
             materialized_at,
         ),
     )
+    partition_id = "prt_" + hashlib.sha256(capsule_id.encode("utf-8")).hexdigest()[:32]
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO knowledge_partitions
+            (partition_id, parent_partition_id, node_kind, topic, normalized_topic)
+        VALUES ('prt_root', NULL, 'root', 'All knowledge', 'all knowledge')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO knowledge_partitions
+            (partition_id, parent_partition_id, node_kind, topic, normalized_topic)
+        VALUES (?, 'prt_root', 'leaf', ?, ?)
+        """,
+        (
+            partition_id,
+            proposal.payload.applicability_scope,
+            " ".join(proposal.payload.applicability_scope.casefold().split()),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO capsule_partitions (capsule_id, partition_id) VALUES (?, ?)",
+        (capsule_id, partition_id),
+    )
     connection.execute(
         """
         INSERT INTO canonical_memories

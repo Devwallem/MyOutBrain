@@ -1,12 +1,12 @@
 {
-  "current": {"major": 2, "minor": 2},
+  "current": {"major": 2, "minor": 3},
   "operations": {
-    "reads": ["instance.status", "maintenance.inspect", "maintenance.plan", "migration.import_dry_run", "migration.plan", "protocol.describe", "review.list"],
-    "writes": ["maintenance.configure_partition", "maintenance.reorganize", "migration.export", "migration.import", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
+    "reads": ["backup.verify", "instance.doctor", "instance.status", "maintenance.gc_plan", "maintenance.inspect", "maintenance.plan", "migration.import_dry_run", "migration.plan", "protocol.describe", "review.list"],
+    "writes": ["backup.create", "backup.restore", "instance.doctor(repair)", "maintenance.configure_partition", "maintenance.gc_apply", "maintenance.reorganize", "migration.export", "migration.import", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
   },
   "rules": {
     "major": "Semantic writes require protocol major 2.",
-    "minor": "Protocol 2.0 clients remain read-compatible with 2.2 responses.",
+    "minor": "Protocol 2.0 clients remain read-compatible with 2.3 responses.",
     "unknown_fields": "Unknown display-only response fields may be ignored.",
     "unknown_effects": "Approval requires the exact review_effect.<type>.v1 capability.",
     "writes": "Every semantic write requires idempotency_key and expected_version."

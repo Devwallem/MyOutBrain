@@ -147,12 +147,15 @@ class AgentAdapterProtocolTests(unittest.TestCase):
 
             self.assertEqual(described.returncode, 0, described.stderr)
             response = json.loads(described.stdout)
-            self.assertEqual(response["result"]["current"], {"major": 2, "minor": 2})
+            self.assertEqual(response["result"]["current"], {"major": 2, "minor": 3})
             self.assertEqual(
                 response["result"]["operations"],
                 {
                     "reads": [
+                        "backup.verify",
+                        "instance.doctor",
                         "instance.status",
+                        "maintenance.gc_plan",
                         "maintenance.inspect",
                         "maintenance.plan",
                         "migration.import_dry_run",
@@ -161,7 +164,11 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                         "review.list",
                     ],
                     "writes": [
+                        "backup.create",
+                        "backup.restore",
+                        "instance.doctor(repair)",
                         "maintenance.configure_partition",
+                        "maintenance.gc_apply",
                         "maintenance.reorganize",
                         "migration.export",
                         "migration.import",
@@ -191,7 +198,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             )
             self.assertEqual(request_schema["$id"], "myoutbrain://schema/domain-request-v2")
             self.assertEqual(response_schema["$id"], "myoutbrain://schema/domain-response-v2")
-            self.assertEqual(compatibility["current"], {"major": 2, "minor": 2})
+            self.assertEqual(compatibility["current"], {"major": 2, "minor": 3})
 
     def test_old_minor_adapter_can_read_current_instance_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -229,9 +236,9 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             self.assertEqual(response["protocol_version"], {"major": 2, "minor": 0})
             self.assertEqual(
                 response["server_protocol_version"],
-                {"major": 2, "minor": 2},
+                {"major": 2, "minor": 3},
             )
-            self.assertEqual(response["result"]["canonical_schema_version"], 10)
+            self.assertEqual(response["result"]["canonical_schema_version"], 11)
             self.assertEqual(response["result"]["integrity"]["overall"], "ok")
 
     def test_protocol_range_with_a_supported_intersection_is_negotiated(self) -> None:
@@ -245,7 +252,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             )
             for minimum, maximum, expected in (
                 ((1, 0), (2, 1), (2, 1)),
-                ((2, 0), (3, 0), (2, 2)),
+                ((2, 0), (3, 0), (2, 3)),
             ):
                 with self.subTest(minimum=minimum, maximum=maximum):
                     write_request(
@@ -382,7 +389,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                     "details": {
                         "client_maximum": {"major": 1, "minor": 9},
                         "client_minimum": {"major": 1, "minor": 0},
-                        "server": {"major": 2, "minor": 2},
+                        "server": {"major": 2, "minor": 3},
                     },
                 },
             )
@@ -888,7 +895,7 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                             },
                             "compatible": True,
                             "negotiated": {"major": 2, "minor": 2},
-                            "server": {"major": 2, "minor": 2},
+                            "server": {"major": 2, "minor": 3},
                         },
                     )
                     self.assertTrue(check["config_matches"])

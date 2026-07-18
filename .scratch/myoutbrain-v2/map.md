@@ -8,6 +8,7 @@
 - 工单 13：手动增量迁移以经审计的传递知识闭包和逻辑 ZIP 为边界；导入先 dry-run，按包与检查点幂等，目标分歧经统一审阅批准后重映射版本并完成关系导入。详见 [工单 13](issues/13-transfer-an-audited-knowledge-closure.md)。
 - 工单 11：三种可替换代理入口通过统一主实例注册表与 V2.1 MCP/CLI 领域协议接入；协议按版本区间和能力协商，未理解的审阅效果禁止批准，语义写入使用幂等键与期望版本。详见 [工单 11](issues/11-install-adapters-and-negotiate-capabilities.md)。
 - 工单 12：计划反思通过 V2.2 客户端中立协议在 SQLite 核心中冻结输入闭包并提供跨入口租约；空队列不唤醒，完成/归还/过期/永久缺失均幂等收敛，显式反思可接管计划闭包。详见 [工单 12](issues/12-claim-scheduled-reflection-across-adapters.md)。
+- 工单 14：实例维护通过 V2.3 统一领域协议提供带维护锁的冷全量 ZIP、恢复到新目录后的只读 Doctor 门禁、只重建投影的显式 repair，以及保护所有历史引用并需精确确认的孤立对象 GC；规范损坏进入受限只读且最小删除标记阻止静默恢复。详见 [工单 14](issues/14-back-up-diagnose-and-garbage-collect-the-instance.md)。
 
 ## Notes
 
@@ -15,4 +16,4 @@
 
 ## Fog
 
-- 工单 14/15 尚未实施，不属于已完成工单 10–13 的范围。
+- 工单 15 尚未实施，不属于已完成工单 10–14 的范围。

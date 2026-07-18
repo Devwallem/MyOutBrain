@@ -184,6 +184,33 @@ class DomainProtocol:
         negotiated = self._negotiate(request)
         if request.operation == "instance.status":
             result = KnowledgeWorkflow(self._root).instance_status().to_data()
+        elif request.operation == "instance.doctor":
+            result = self._doctor(request, negotiated)
+        elif request.operation == "backup.create":
+            write = self._require_maintenance_write(
+                request, negotiated, "backup_create.v1"
+            )
+            result = MemoryGateway(self._root).create_cold_backup(
+                self._maintenance_path(request, "output_path"),
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+                entrance=request.client_name,
+            )
+        elif request.operation == "backup.verify":
+            self._require_capability(request, "backup_verify.v1")
+            result = MemoryGateway(self._root).verify_cold_backup(
+                self._maintenance_path(request, "archive_path")
+            )
+        elif request.operation == "backup.restore":
+            write = self._require_maintenance_write(
+                request, negotiated, "backup_restore.v1"
+            )
+            result = MemoryGateway(self._root).restore_cold_backup(
+                self._maintenance_path(request, "archive_path"),
+                self._maintenance_path(request, "destination_path"),
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+            )
         elif request.operation == "protocol.describe":
             result = load_domain_schema("compatibility-v2.json")
         elif request.operation == "review.list":
@@ -208,6 +235,33 @@ class DomainProtocol:
             write = self._require_capsule_maintenance_write(request, negotiated)
             result = MemoryGateway(self._root).reorganize_capsules(
                 request.parameters,
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+                entrance=request.client_name,
+            )
+        elif request.operation == "maintenance.gc_plan":
+            self._require_capability(request, "orphan_gc.v1")
+            _reject_unknown_fields(
+                cast(dict[object, object], request.parameters),
+                set(),
+                "maintenance.gc_plan parameters",
+            )
+            result = MemoryGateway(self._root).plan_orphan_gc()
+        elif request.operation == "maintenance.gc_apply":
+            write = self._require_maintenance_write(
+                request, negotiated, "orphan_gc.v1"
+            )
+            _reject_unknown_fields(
+                cast(dict[object, object], request.parameters),
+                {"plan_id", "confirmation", "confirmed_large_source_ids"},
+                "maintenance.gc_apply parameters",
+            )
+            result = MemoryGateway(self._root).apply_orphan_gc(
+                self._required_parameter_text(request, "plan_id"),
+                confirmation=self._required_parameter_text(request, "confirmation"),
+                confirmed_large_source_ids=self._string_list_parameter(
+                    request, "confirmed_large_source_ids"
+                ),
                 expected_version=write.expected_version,
                 idempotency_key=write.idempotency_key,
                 entrance=request.client_name,
@@ -268,6 +322,82 @@ class DomainProtocol:
             "server_capabilities": list(SERVER_CAPABILITIES),
             "result": result,
         }
+
+    @staticmethod
+    def _require_maintenance_write(
+        request: DomainRequest,
+        negotiated: ProtocolVersion,
+        capability: str,
+    ) -> WriteCondition:
+        if negotiated < ProtocolVersion(major=2, minor=3):
+            raise DomainProtocolError(
+                "protocol_incompatible",
+                "instance maintenance writes require protocol 2.3",
+                details=_version_details(request),
+            )
+        if capability not in request.capabilities:
+            raise DomainProtocolError(
+                "capability_required",
+                "client cannot understand the requested maintenance effect",
+                details={"missing": [capability]},
+            )
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "instance maintenance writes require idempotency_key and expected_version",
+            )
+        return request.write
+
+    def _doctor(
+        self,
+        request: DomainRequest,
+        negotiated: ProtocolVersion,
+    ) -> dict[str, object]:
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"repair"},
+            "instance.doctor parameters",
+        )
+        repair = request.parameters.get("repair", False)
+        if not isinstance(repair, bool):
+            raise UserInputError("instance.doctor repair must be boolean")
+        if not repair:
+            self._require_capability(request, "doctor_read.v1")
+            if request.write is not None:
+                raise UserInputError("read-only Doctor does not accept a write contract")
+            return MemoryGateway(self._root).doctor_instance(repair=False)
+        write = self._require_maintenance_write(
+            request, negotiated, "doctor_repair.v1"
+        )
+        return MemoryGateway(self._root).doctor_instance(
+            repair=True,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+            entrance=request.client_name,
+        )
+
+    @staticmethod
+    def _maintenance_path(request: DomainRequest, field: str) -> Path:
+        value = request.parameters.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise UserInputError(f"{request.operation} {field} must be non-blank text")
+        return Path(value)
+
+    @staticmethod
+    def _required_parameter_text(request: DomainRequest, field: str) -> str:
+        value = request.parameters.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise UserInputError(f"{request.operation} {field} must be non-blank text")
+        return value.strip()
+
+    @staticmethod
+    def _string_list_parameter(request: DomainRequest, field: str) -> tuple[str, ...]:
+        value = request.parameters.get(field, [])
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            raise UserInputError(f"{request.operation} {field} must be an array of text")
+        return tuple(cast(list[str], value))
 
     @staticmethod
     def _require_capsule_maintenance_write(

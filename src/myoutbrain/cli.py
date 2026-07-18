@@ -44,6 +44,7 @@ from myoutbrain.core_types import (
 from myoutbrain.domain_protocol import execute_domain_request
 from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.legacy_migration import MigrationSummary, V1PermanentKnowledgeMigrator
+from myoutbrain.instance_maintenance import InstanceMaintenanceService
 from myoutbrain.knowledge_views import KnowledgeViewService
 from myoutbrain.generation import ProviderFailure
 from myoutbrain.local_core import (
@@ -131,6 +132,59 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subcommands.add_parser("status", help="Inspect a V2 private instance")
     status_parser.add_argument("--root", type=Path, default=Path.cwd())
     status_parser.add_argument("--format", choices=("json", "text"), default="text")
+    doctor_parser = subcommands.add_parser(
+        "doctor", help="Diagnose a V2 private instance without changing it"
+    )
+    doctor_parser.add_argument("--root", type=Path, default=Path.cwd())
+    doctor_parser.add_argument("--format", choices=("json", "text"), default="text")
+    doctor_parser.add_argument("--repair", action="store_true")
+    doctor_parser.add_argument("--expected-version", type=int)
+    doctor_parser.add_argument("--idempotency-key")
+    doctor_parser.add_argument("--entrance")
+    backup_create_parser = subcommands.add_parser(
+        "backup-create", help="Create a cold ZIP snapshot of the whole instance"
+    )
+    backup_create_parser.add_argument("output", type=Path)
+    backup_create_parser.add_argument("--expected-version", type=int, required=True)
+    backup_create_parser.add_argument("--idempotency-key", required=True)
+    backup_create_parser.add_argument("--entrance", required=True)
+    backup_create_parser.add_argument("--root", type=Path, default=Path.cwd())
+    backup_create_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    backup_verify_parser = subcommands.add_parser(
+        "backup-verify", help="Verify a cold ZIP snapshot through read-only Doctor"
+    )
+    backup_verify_parser.add_argument("archive", type=Path)
+    backup_verify_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    backup_restore_parser = subcommands.add_parser(
+        "backup-restore", help="Restore a verified cold ZIP snapshot to a new directory"
+    )
+    backup_restore_parser.add_argument("archive", type=Path)
+    backup_restore_parser.add_argument("destination", type=Path)
+    backup_restore_parser.add_argument("--expected-version", type=int, required=True)
+    backup_restore_parser.add_argument("--idempotency-key", required=True)
+    backup_restore_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    gc_plan_parser = subcommands.add_parser(
+        "gc-plan", help="Preview truly orphaned source objects without deleting them"
+    )
+    gc_plan_parser.add_argument("--root", type=Path, default=Path.cwd())
+    gc_plan_parser.add_argument("--format", choices=("json", "text"), default="text")
+    gc_apply_parser = subcommands.add_parser(
+        "gc-apply", help="Explicitly apply a current orphan-object GC preview"
+    )
+    gc_apply_parser.add_argument("plan_id")
+    gc_apply_parser.add_argument("--confirmation", required=True)
+    gc_apply_parser.add_argument("--confirm-large-source-id", action="append", default=[])
+    gc_apply_parser.add_argument("--expected-version", type=int, required=True)
+    gc_apply_parser.add_argument("--idempotency-key", required=True)
+    gc_apply_parser.add_argument("--entrance", required=True)
+    gc_apply_parser.add_argument("--root", type=Path, default=Path.cwd())
+    gc_apply_parser.add_argument("--format", choices=("json", "text"), default="text")
     gateway_parser = subcommands.add_parser(
         "gateway", help="Invoke the transport-neutral V2 domain protocol"
     )
@@ -911,6 +965,14 @@ def _instance_status(root: Path, output_format: str) -> int:
             + " (single-writer)"
         )
         print(f"Integrity: {status.overall_integrity}")
+    return 0
+
+
+def _maintenance_result(result: dict[str, object], output_format: str) -> int:
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -2230,6 +2292,73 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _initialize(parsed_arguments.root, parsed_arguments.format)
         if parsed_arguments.command == "status":
             return _instance_status(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "doctor":
+            maintenance = InstanceMaintenanceService(parsed_arguments.root)
+            if parsed_arguments.repair:
+                if (
+                    parsed_arguments.expected_version is None
+                    or parsed_arguments.idempotency_key is None
+                    or parsed_arguments.entrance is None
+                ):
+                    raise UserInputError(
+                        "Doctor repair requires expected version, idempotency key, and entrance"
+                    )
+                return _maintenance_result(
+                    maintenance.repair(
+                        expected_version=parsed_arguments.expected_version,
+                        idempotency_key=parsed_arguments.idempotency_key,
+                        entrance=parsed_arguments.entrance,
+                    ),
+                    parsed_arguments.format,
+                )
+            return _maintenance_result(
+                maintenance.doctor(),
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "backup-create":
+            return _maintenance_result(
+                InstanceMaintenanceService(parsed_arguments.root).create_backup(
+                    parsed_arguments.output,
+                    expected_version=parsed_arguments.expected_version,
+                    idempotency_key=parsed_arguments.idempotency_key,
+                    entrance=parsed_arguments.entrance,
+                ),
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "backup-verify":
+            return _maintenance_result(
+                InstanceMaintenanceService.verify_backup(parsed_arguments.archive),
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "backup-restore":
+            return _maintenance_result(
+                InstanceMaintenanceService.restore_backup(
+                    parsed_arguments.archive,
+                    parsed_arguments.destination,
+                    expected_version=parsed_arguments.expected_version,
+                    idempotency_key=parsed_arguments.idempotency_key,
+                ),
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "gc-plan":
+            return _maintenance_result(
+                InstanceMaintenanceService(parsed_arguments.root).plan_gc(),
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "gc-apply":
+            return _maintenance_result(
+                InstanceMaintenanceService(parsed_arguments.root).apply_gc(
+                    parsed_arguments.plan_id,
+                    confirmation=parsed_arguments.confirmation,
+                    confirmed_large_source_ids=tuple(
+                        parsed_arguments.confirm_large_source_id
+                    ),
+                    expected_version=parsed_arguments.expected_version,
+                    idempotency_key=parsed_arguments.idempotency_key,
+                    entrance=parsed_arguments.entrance,
+                ),
+                parsed_arguments.format,
+            )
         if parsed_arguments.command == "gateway":
             return _gateway(parsed_arguments.root, parsed_arguments.request)
         if parsed_arguments.command == "mcp":

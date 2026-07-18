@@ -15,6 +15,7 @@ from myoutbrain.core_types import IntegrityError, WriterLocked
 
 
 PERMANENT_DELETION_CLEANUP = Path("store") / "permanent-deletion-cleanup.json"
+GC_CLEANUP = Path("store") / "gc-cleanup.json"
 
 
 def atomic_write(path: Path, content: bytes) -> None:
@@ -97,6 +98,73 @@ def recover_transactions(root: Path) -> None:
                 continue
             _recover_transaction(root, transaction_path)
     _recover_permanent_deletion_cleanup(root)
+    _recover_gc_cleanup(root)
+
+
+def gc_cleanup_change(
+    root: Path,
+    *,
+    object_references: tuple[str, ...],
+    record_paths: tuple[str, ...],
+) -> tuple[Path, bytes]:
+    for object_reference in object_references:
+        _deletion_cleanup_target(
+            root / "store" / "objects",
+            object_reference,
+            label="garbage-collected source object",
+        )
+    for record_path in record_paths:
+        _deletion_cleanup_target(
+            root / "store" / "records",
+            record_path,
+            label="garbage-collected source record",
+        )
+    return (
+        root / GC_CLEANUP,
+        json_document(
+            {
+                "schema_version": 1,
+                "object_references": list(object_references),
+                "record_paths": list(record_paths),
+            }
+        ),
+    )
+
+
+def _recover_gc_cleanup(root: Path) -> None:
+    manifest_path = root / GC_CLEANUP
+    if not manifest_path.is_file():
+        return
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        object_references = document.get("object_references")
+        record_paths = document.get("record_paths")
+        if (
+            document.get("schema_version") != 1
+            or not isinstance(object_references, list)
+            or not all(isinstance(value, str) for value in object_references)
+            or not isinstance(record_paths, list)
+            or not all(isinstance(value, str) for value in record_paths)
+        ):
+            raise TypeError
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError(f"invalid garbage-collection manifest: {manifest_path}") from error
+    for object_reference in object_references:
+        target = _deletion_cleanup_target(
+            root / "store" / "objects",
+            object_reference,
+            label="garbage-collected source object",
+        )
+        target.unlink(missing_ok=True)
+        _remove_empty_directories(target.parent, root / "store" / "objects")
+    for record_path in record_paths:
+        target = _deletion_cleanup_target(
+            root / "store" / "records",
+            record_path,
+            label="garbage-collected source record",
+        )
+        target.unlink(missing_ok=True)
+    manifest_path.unlink()
 
 
 def permanent_deletion_cleanup_change(
@@ -216,6 +284,14 @@ def atomic_commit(
     *,
     fault_injections: dict[int, str] | None = None,
 ) -> None:
+    from myoutbrain.instance_maintenance import canonical_write_blocker
+
+    blocker = canonical_write_blocker(root)
+    if blocker is not None:
+        raise IntegrityError(
+            "private instance is restricted read-only because canonical content "
+            f"failed integrity checks: {blocker}"
+        )
     transactions_root = root / "store" / "transactions"
     transactions_root.mkdir(parents=True, exist_ok=True)
     transaction_path = transactions_root / f"txn_{uuid.uuid4().hex}"

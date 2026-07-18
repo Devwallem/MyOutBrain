@@ -80,7 +80,7 @@ from myoutbrain.unified_review import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 10
+MEMORY_SCHEMA_VERSION = 11
 MEMORY_DATABASE = "store/memory.sqlite3"
 MEMORY_BODY_TARGET_BYTES = 4 * 1024
 MEMORY_BODY_HARD_LIMIT_BYTES = 8 * 1024
@@ -558,6 +558,22 @@ CREATE TABLE deletion_markers (
     subject_fingerprint TEXT NOT NULL UNIQUE,
     deleted_at TEXT NOT NULL,
     backup_exclusion_after TEXT NOT NULL
+);
+
+CREATE TABLE maintenance_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version INTEGER NOT NULL CHECK (version >= 0)
+);
+
+INSERT INTO maintenance_state (singleton, version) VALUES (1, 0);
+
+CREATE TABLE maintenance_writes (
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (operation, idempotency_key)
 );
 """ + UNIFIED_REVIEW_SCHEMA + REFLECTION_SCHEMA + SCHEDULED_REFLECTION_SCHEMA
 
@@ -2667,6 +2683,7 @@ class LocalMemoryCore:
             7: self._migrate_v7_database,
             8: self._migrate_v8_database,
             9: self._migrate_v9_database,
+            10: self._migrate_v10_database,
         }
         try:
             with tempfile.NamedTemporaryFile(
@@ -5603,6 +5620,73 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v10_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS maintenance_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        version INTEGER NOT NULL CHECK (version >= 0)
+                    );
+                    INSERT OR IGNORE INTO maintenance_state (singleton, version) VALUES (1, 0);
+                    CREATE TABLE IF NOT EXISTS maintenance_writes (
+                        operation TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (operation, idempotency_key)
+                    );
+                    INSERT OR IGNORE INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    VALUES
+                        ('prt_root', NULL, 'root', 'All knowledge', 'all knowledge');
+                    INSERT OR IGNORE INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    SELECT 'prt_legacy_' || capsule.capsule_id, 'prt_root',
+                           'leaf', capsule.topic, lower(trim(capsule.topic))
+                    FROM knowledge_capsules AS capsule
+                    LEFT JOIN capsule_partitions AS membership
+                      ON membership.capsule_id = capsule.capsule_id
+                    WHERE capsule.status = 'active'
+                      AND membership.capsule_id IS NULL;
+                    INSERT OR IGNORE INTO capsule_partitions
+                        (capsule_id, partition_id)
+                    SELECT capsule.capsule_id,
+                           'prt_legacy_' || capsule.capsule_id
+                    FROM knowledge_capsules AS capsule
+                    LEFT JOIN capsule_partitions AS membership
+                      ON membership.capsule_id = capsule.capsule_id
+                    WHERE capsule.status = 'active'
+                      AND membership.capsule_id IS NULL;
+                    PRAGMA user_version = 11;
+                    """
+                )
+                connection.commit()
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise IntegrityError("schema 11 migration broke references")
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
