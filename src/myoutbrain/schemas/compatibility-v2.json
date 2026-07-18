@@ -1,0 +1,19 @@
+{
+  "current": {"major": 2, "minor": 1},
+  "operations": {
+    "reads": ["instance.status", "protocol.describe", "review.list"],
+    "writes": ["review.decide"]
+  },
+  "rules": {
+    "major": "Semantic writes require protocol major 2.",
+    "minor": "Protocol 2.0 clients remain read-compatible with 2.1 responses.",
+    "unknown_fields": "Unknown display-only response fields may be ignored.",
+    "unknown_effects": "Approval requires the exact review_effect.<type>.v1 capability.",
+    "writes": "Every semantic write requires idempotency_key and expected_version."
+  },
+  "schema_versions": {
+    "domain_request": 2,
+    "domain_response": 2,
+    "review_payload": 1
+  }
+}

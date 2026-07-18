@@ -34,5 +34,9 @@ class UserInputError(Exception):
     """Raised when a command input cannot be accepted."""
 
 
+class IdempotencyConflict(UserInputError):
+    """Raised when one idempotency key is reused for another request."""
+
+
 class WriterLocked(Exception):
     """Raised when another writer already owns the private-instance lock."""

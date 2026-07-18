@@ -53,6 +53,7 @@ from myoutbrain.reflection import (
     stage_learning_signal,
 )
 from myoutbrain.unified_review import (
+    ReviewProposal,
     ReviewProposalInput,
     ReviewProposalSubmission,
     ReviewBatchRequest,
@@ -60,6 +61,7 @@ from myoutbrain.unified_review import (
     ReviewExpirationResult,
     ReviewQueue,
     UNIFIED_REVIEW_SCHEMA,
+    read_review_proposal,
     read_review_queue,
     merge_review_proposal_supporting_evidence,
     register_source_memory_proposal,
@@ -2327,6 +2329,15 @@ class LocalMemoryCore:
             )
         self._validate_database(database_path)
         return read_review_queue(database_path)
+
+    def review_proposal(self, proposal_id: str) -> ReviewProposal | None:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        self._validate_database(database_path)
+        return read_review_proposal(database_path, proposal_id)
 
     def decide_review_batch(
         self,

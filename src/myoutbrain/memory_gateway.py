@@ -53,6 +53,7 @@ from myoutbrain.v2_public_search import (
     V2PublicSearchService,
 )
 from myoutbrain.v2_memory_lifecycle import V2MemoryLifecycleService
+from myoutbrain.unified_review import ReviewBatchRequest
 
 
 class MemoryAccess(StrEnum):
@@ -473,6 +474,26 @@ class MemoryGateway:
             applicability_scope=applicability_scope,
             idempotency_key=idempotency_key,
         )
+
+    def review_queue(self) -> dict[str, object]:
+        return self._memory_core.review_queue().to_data()
+
+    def unified_review_proposal(self, proposal_id: str) -> dict[str, object] | None:
+        proposal = self._memory_core.review_proposal(proposal_id)
+        return proposal.to_data() if proposal is not None else None
+
+    def decide_review_batch(
+        self,
+        request: ReviewBatchRequest,
+        *,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return self._memory_core.decide_review_batch(
+            request,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        ).to_data()
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()

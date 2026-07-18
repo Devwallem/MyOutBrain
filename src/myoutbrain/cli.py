@@ -8,6 +8,8 @@ import shutil
 import sys
 from typing import cast
 
+from myoutbrain.adapter_installer import ADAPTER_CLIENTS, AdapterClient, AdapterInstaller
+
 from myoutbrain.answering import (
     AnswerRequest,
     CompanionAnswer,
@@ -36,6 +38,7 @@ from myoutbrain.core_types import (
     UserInputError,
     WriterLocked,
 )
+from myoutbrain.domain_protocol import execute_domain_request
 from myoutbrain.library import KnowledgeWorkflow
 from myoutbrain.legacy_migration import MigrationSummary, V1PermanentKnowledgeMigrator
 from myoutbrain.knowledge_views import KnowledgeViewService
@@ -55,6 +58,7 @@ from myoutbrain.memory_gateway import (
     RecallRequest,
 )
 from myoutbrain.memory_governance import MemoryGovernanceService
+from myoutbrain.mcp_server import run_stdio_mcp
 from myoutbrain.reflection import (
     load_immediate_reflection,
     load_learning_signal,
@@ -124,6 +128,27 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subcommands.add_parser("status", help="Inspect a V2 private instance")
     status_parser.add_argument("--root", type=Path, default=Path.cwd())
     status_parser.add_argument("--format", choices=("json", "text"), default="text")
+    gateway_parser = subcommands.add_parser(
+        "gateway", help="Invoke the transport-neutral V2 domain protocol"
+    )
+    gateway_parser.add_argument("request", type=Path)
+    gateway_parser.add_argument("--root", type=Path, default=Path.cwd())
+    mcp_parser = subcommands.add_parser(
+        "mcp", help="Run the MyOutBrain MCP server over stdio"
+    )
+    mcp_parser.add_argument("--root", type=Path, default=Path.cwd())
+    adapter_parser = subcommands.add_parser(
+        "adapter", help="Install and maintain a replaceable agent-client entrance"
+    )
+    adapter_actions = adapter_parser.add_subparsers(
+        dest="adapter_action", required=True
+    )
+    for action in ("install", "reinstall", "check", "uninstall"):
+        action_parser = adapter_actions.add_parser(action)
+        action_parser.add_argument("client", choices=ADAPTER_CLIENTS)
+        action_parser.add_argument("--root", type=Path, default=Path.cwd())
+        action_parser.add_argument("--config", type=Path)
+        action_parser.add_argument("--skills-dir", type=Path)
     source_memory_parser = subcommands.add_parser(
         "propose-source-memory",
         help="Submit a local source as one pending integration proposal",
@@ -815,6 +840,47 @@ def _instance_status(root: Path, output_format: str) -> int:
         )
         print(f"Integrity: {status.overall_integrity}")
     return 0
+
+
+def _gateway(root: Path, request_path: Path) -> int:
+    response, exit_code = execute_domain_request(
+        root,
+        _load_json_payload(request_path, "gateway request"),
+    )
+    print(
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return exit_code
+
+
+def _adapter(
+    action: str,
+    client: AdapterClient,
+    root: Path,
+    *,
+    config_path: Path | None,
+    skills_dir: Path | None,
+) -> int:
+    installer = AdapterInstaller(
+        client,
+        root,
+        config_path=config_path,
+        skills_dir=skills_dir,
+    )
+    if action in ("install", "reinstall"):
+        result = installer.install()
+        success = True
+    elif action == "check":
+        result, success = installer.check()
+    else:
+        result = installer.uninstall()
+        success = True
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if success else EXIT_CONFIGURATION
 
 
 def _propose_source_memory(
@@ -1932,6 +1998,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _initialize(parsed_arguments.root, parsed_arguments.format)
         if parsed_arguments.command == "status":
             return _instance_status(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "gateway":
+            return _gateway(parsed_arguments.root, parsed_arguments.request)
+        if parsed_arguments.command == "mcp":
+            return run_stdio_mcp(parsed_arguments.root)
+        if parsed_arguments.command == "adapter":
+            return _adapter(
+                parsed_arguments.adapter_action,
+                cast(AdapterClient, parsed_arguments.client),
+                parsed_arguments.root,
+                config_path=parsed_arguments.config,
+                skills_dir=parsed_arguments.skills_dir,
+            )
         if parsed_arguments.command == "propose-source-memory":
             return _propose_source_memory(
                 parsed_arguments.root,

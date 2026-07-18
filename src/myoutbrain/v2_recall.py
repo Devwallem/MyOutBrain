@@ -15,13 +15,14 @@ import uuid
 from myoutbrain.core_types import IntegrityError, UserInputError
 from myoutbrain.local_core import LocalMemoryCore, MEMORY_DATABASE
 from myoutbrain.persistence import recover_transactions, writer_lock
+from myoutbrain.protocol_contract import SERVER_PROTOCOL_VERSION
 from myoutbrain.retrieval import lexical_terms
 
 
 DEFAULT_RECALL_BUDGET_BYTES = 16 * 1024
 MINIMUM_RECALL_BUDGET_BYTES = 1024
 MAXIMUM_RECALL_BUDGET_BYTES = 64 * 1024
-PROTOCOL_VERSION = {"major": 2, "minor": 0}
+PROTOCOL_VERSION = SERVER_PROTOCOL_VERSION
 RECALL_PATHS = ("dictionary", "partition-tree", "local-fts", "global-fts")
 
 AnswerabilityReason = Literal[

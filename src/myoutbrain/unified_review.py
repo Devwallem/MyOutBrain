@@ -13,7 +13,7 @@ import tempfile
 from typing import Literal, cast
 import uuid
 
-from myoutbrain.core_types import IntegrityError, UserInputError
+from myoutbrain.core_types import IdempotencyConflict, IntegrityError, UserInputError
 
 
 ReviewIntent = Literal["derive", "integrate", "archive", "research"]
@@ -607,7 +607,7 @@ def stage_review_proposal(
             ).fetchone()
             if existing is not None:
                 if existing[0] != request_hash:
-                    raise UserInputError(
+                    raise IdempotencyConflict(
                         "idempotency key was already used for a different request"
                     )
                 return temporary_path.read_bytes(), ReviewProposalSubmission(
@@ -936,7 +936,7 @@ def stage_review_batch(
             ).fetchone()
             if existing is not None:
                 if existing[0] != request_hash or not isinstance(existing[1], str):
-                    raise UserInputError(
+                    raise IdempotencyConflict(
                         "idempotency key was already used for a different request"
                     )
                 stored_result_data = json.loads(existing[1])
@@ -2071,6 +2071,21 @@ def read_review_queue(database_path: Path) -> ReviewQueue:
         proposals=proposals,
         groups=groups,
     )
+
+
+def read_review_proposal(
+    database_path: Path,
+    proposal_id: str,
+) -> ReviewProposal | None:
+    try:
+        with closing(sqlite3.connect(database_path)) as connection:
+            row = connection.execute(
+                "SELECT * FROM review_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+    except sqlite3.Error as error:
+        raise IntegrityError("cannot read unified review proposal") from error
+    return _proposal_from_row(row) if row is not None else None
 
 
 def _merge_duplicate_evidence(
