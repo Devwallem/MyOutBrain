@@ -966,7 +966,7 @@ class V2MemoryLifecycleTests(unittest.TestCase):
                 {
                     "kind": "source",
                     "source_id": receipt["source_id"],
-                    "source_version": receipt["version"],
+                    "version": receipt["version"],
                     "locator": receipt["locator"],
                 }
             ]
@@ -975,6 +975,28 @@ class V2MemoryLifecycleTests(unittest.TestCase):
                 temporary_root / "pending-receipt-proposal.json",
                 pending_payload,
                 "pending-receipt-proposal",
+            )
+            alias_payload = proposal_payload(
+                intent="derive",
+                formation="derived",
+                priority="routine",
+                title="Pending aliased receipt proposal",
+                content="This proposal uses the accepted source_version alias.",
+                effect_type="create_derived_memory",
+            )
+            alias_payload["supporting_evidence"] = [
+                {
+                    "kind": "source",
+                    "source_id": receipt["source_id"],
+                    "source_version": receipt["version"],
+                    "locator": receipt["locator"],
+                }
+            ]
+            alias_proposal = submit_proposal(
+                instance_root,
+                temporary_root / "pending-aliased-receipt-proposal.json",
+                alias_payload,
+                "pending-aliased-receipt-proposal",
             )
             target_payload = proposal_payload(
                 intent="derive",
@@ -1062,6 +1084,7 @@ class V2MemoryLifecycleTests(unittest.TestCase):
             self.assertTrue(preview["experience_ids"])
             self.assertTrue(preview["digest_ids"])
             self.assertIn(pending_proposal["proposal_id"], preview["proposal_ids"])
+            self.assertIn(alias_proposal["proposal_id"], preview["proposal_ids"])
             self.assertIn(target_proposal["proposal_id"], preview["proposal_ids"])
             self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
             self.assertFalse(object_path.exists())

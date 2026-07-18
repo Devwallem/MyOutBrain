@@ -1438,7 +1438,13 @@ def _erasure_impact_for_connection(
             connection,
             seed_proposal_ids=frozenset(proposal_id_set),
             sensitive_ids=frozenset(
-                (*memory_ids, *erased_source_ids_tuple, *experience_ids, *digest_ids)
+                (
+                    *memory_ids,
+                    *fully_erased_receipt_source_ids,
+                    *erased_source_ids_tuple,
+                    *experience_ids,
+                    *digest_ids,
+                )
             ),
             receipt_versions=erased_receipt_versions,
         )
@@ -2096,7 +2102,7 @@ def _json_references_erasure(
 ) -> bool:
     if isinstance(value, dict):
         source_id = value.get("source_id")
-        source_version = value.get("source_version")
+        source_version = value.get("version", value.get("source_version"))
         if (
             isinstance(source_id, str)
             and isinstance(source_version, int)
