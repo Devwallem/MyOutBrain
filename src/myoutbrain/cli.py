@@ -103,6 +103,31 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subcommands.add_parser("status", help="Inspect a V2 private instance")
     status_parser.add_argument("--root", type=Path, default=Path.cwd())
     status_parser.add_argument("--format", choices=("json", "text"), default="text")
+    source_memory_parser = subcommands.add_parser(
+        "propose-source-memory",
+        help="Submit a local source as one pending integration proposal",
+    )
+    source_memory_parser.add_argument("source", type=Path)
+    source_memory_parser.add_argument("--name", required=True)
+    source_memory_parser.add_argument("--body", required=True)
+    source_memory_parser.add_argument("--scope", required=True)
+    source_memory_parser.add_argument("--idempotency-key", required=True)
+    source_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    source_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    approve_source_memory_parser = subcommands.add_parser(
+        "approve-source-memory",
+        help="Explicitly approve and materialize one source-backed memory",
+    )
+    approve_source_memory_parser.add_argument("proposal_id")
+    approve_source_memory_parser.add_argument("--expected-version", type=int, required=True)
+    approve_source_memory_parser.add_argument("--idempotency-key", required=True)
+    approve_source_memory_parser.add_argument("--entrance", required=True)
+    approve_source_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    approve_source_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
     capture_parser.add_argument("source", type=Path)
     capture_parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -497,6 +522,57 @@ def _instance_status(root: Path, output_format: str) -> int:
             + " (single-writer)"
         )
         print(f"Integrity: {status.overall_integrity}")
+    return 0
+
+
+def _propose_source_memory(
+    root: Path,
+    source: Path,
+    *,
+    name: str,
+    body: str,
+    scope: str,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    proposal = LocalMemoryCore(root).propose_source_memory(
+        source,
+        canonical_name=name,
+        body=body,
+        applicability_scope=scope,
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(proposal.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Pending integration proposal {proposal.proposal_id}")
+        print(f"Source: {proposal.source.source_id} v{proposal.source.version}")
+        print(f"Approval effect: create canonical memory {proposal.planned_memory_id}")
+    return 0
+
+
+def _approve_source_memory(
+    root: Path,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    approval = LocalMemoryCore(root).approve_source_memory(
+        proposal_id,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(approval.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Approved {approval.proposal_id}; created canonical memory "
+            f"{approval.memory_id} v1 in capsule {approval.capsule_id}."
+        )
     return 0
 
 
@@ -1072,6 +1148,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _initialize(parsed_arguments.root, parsed_arguments.format)
         if parsed_arguments.command == "status":
             return _instance_status(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "propose-source-memory":
+            return _propose_source_memory(
+                parsed_arguments.root,
+                parsed_arguments.source,
+                name=parsed_arguments.name,
+                body=parsed_arguments.body,
+                scope=parsed_arguments.scope,
+                idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "approve-source-memory":
+            return _approve_source_memory(
+                parsed_arguments.root,
+                parsed_arguments.proposal_id,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
         if parsed_arguments.command == "capture":
             return _capture(
                 parsed_arguments.root,

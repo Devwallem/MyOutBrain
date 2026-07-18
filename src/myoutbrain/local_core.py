@@ -40,8 +40,10 @@ from myoutbrain.persistence import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 6
+MEMORY_SCHEMA_VERSION = 7
 MEMORY_DATABASE = "store/memory.sqlite3"
+MEMORY_BODY_TARGET_BYTES = 4 * 1024
+MEMORY_BODY_HARD_LIMIT_BYTES = 8 * 1024
 
 
 _SCHEMA = """
@@ -52,6 +54,34 @@ CREATE TABLE source_objects (
     content_hash TEXT NOT NULL UNIQUE,
     object_reference TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE evidence_sources (
+    source_id TEXT PRIMARY KEY,
+    source_kind TEXT NOT NULL CHECK (source_kind = 'local'),
+    current_locator TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE evidence_source_versions (
+    source_id TEXT NOT NULL REFERENCES evidence_sources(source_id),
+    version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    locator TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    applicability_scope TEXT NOT NULL,
+    retention TEXT NOT NULL CHECK (retention = 'receipt'),
+    PRIMARY KEY (source_id, version)
+);
+
+CREATE TABLE knowledge_capsules (
+    capsule_id TEXT PRIMARY KEY,
+    topic TEXT NOT NULL,
+    body_bytes INTEGER NOT NULL CHECK (body_bytes >= 0),
+    memory_record_count INTEGER NOT NULL CHECK (memory_record_count >= 0),
+    structural_version INTEGER NOT NULL CHECK (structural_version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE experiences (
@@ -95,6 +125,8 @@ CREATE TABLE canonical_memory_versions (
     memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
     version INTEGER NOT NULL,
     content TEXT NOT NULL,
+    applicability_scope TEXT,
+    capsule_id TEXT REFERENCES knowledge_capsules(capsule_id),
     action TEXT NOT NULL
         CHECK (action IN ('created', 'supplemented', 'revised')),
     change_reason TEXT,
@@ -111,6 +143,19 @@ CREATE TABLE canonical_memory_version_sources (
     FOREIGN KEY (memory_id, version)
         REFERENCES canonical_memory_versions(memory_id, version),
     PRIMARY KEY (memory_id, version, source_id)
+);
+
+CREATE TABLE canonical_memory_version_evidence (
+    memory_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version INTEGER NOT NULL,
+    relationship TEXT NOT NULL CHECK (relationship = 'supports'),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES canonical_memory_versions(memory_id, version),
+    FOREIGN KEY (source_id, source_version)
+        REFERENCES evidence_source_versions(source_id, version),
+    PRIMARY KEY (memory_id, version, source_id, source_version, relationship)
 );
 
 CREATE TABLE canonical_memory_relations (
@@ -166,6 +211,30 @@ CREATE TABLE integration_proposal_sources (
     PRIMARY KEY (proposal_id, source_id)
 );
 
+CREATE TABLE knowledge_dictionary (
+    memory_id TEXT PRIMARY KEY REFERENCES canonical_memories(memory_id),
+    canonical_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    current_version INTEGER NOT NULL,
+    primary_capsule_id TEXT NOT NULL REFERENCES knowledge_capsules(capsule_id),
+    FOREIGN KEY (memory_id, current_version)
+        REFERENCES canonical_memory_versions(memory_id, version)
+);
+
+CREATE TABLE source_memory_proposal_details (
+    proposal_id TEXT PRIMARY KEY REFERENCES integration_proposals(proposal_id),
+    proposal_version INTEGER NOT NULL CHECK (proposal_version = 1),
+    planned_memory_id TEXT NOT NULL UNIQUE,
+    canonical_name TEXT NOT NULL,
+    applicability_scope TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    FOREIGN KEY (source_id, source_version)
+        REFERENCES evidence_source_versions(source_id, version)
+);
+
 CREATE TABLE integration_reviews (
     review_id TEXT PRIMARY KEY,
     proposal_id TEXT NOT NULL UNIQUE REFERENCES integration_proposals(proposal_id),
@@ -176,6 +245,28 @@ CREATE TABLE integration_reviews (
     reason TEXT,
     canonical_memory_id TEXT REFERENCES canonical_memories(memory_id),
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE audit_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    proposal_id TEXT,
+    before_version INTEGER,
+    after_version INTEGER,
+    entrance TEXT NOT NULL,
+    result_hash TEXT NOT NULL
+);
+
+CREATE TABLE idempotent_writes (
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    result_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (operation, idempotency_key)
 );
 
 CREATE TABLE memory_events (
@@ -374,6 +465,128 @@ class IntegrationProposal:
             "suggested_action": self.suggested_action,
             "target_memory_id": self.target_memory_id,
             "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class SourceReceipt:
+    source_id: str
+    version: int
+    content_hash: str
+    locator: str
+    observed_at: str
+    applicability_scope: str
+    retention: Literal["receipt"] = "receipt"
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "source_id": self.source_id,
+            "version": self.version,
+            "content_hash": self.content_hash,
+            "locator": self.locator,
+            "observed_at": self.observed_at,
+            "applicability_scope": self.applicability_scope,
+            "retention": self.retention,
+        }
+
+
+@dataclass(frozen=True)
+class SourceMemoryProposal:
+    proposal_id: str
+    planned_memory_id: str
+    canonical_name: str
+    body: str
+    applicability_scope: str
+    source: SourceReceipt
+    status: Literal["pending"] = "pending"
+    proposal_version: int = 1
+
+    def to_data(self) -> dict[str, object]:
+        body_bytes = len(self.body.encode("utf-8"))
+        return {
+            "proposal_id": self.proposal_id,
+            "proposal_version": self.proposal_version,
+            "status": self.status,
+            "intent": "integrate",
+            "formation": "explicit",
+            "approval_effect": "create_source_backed_canonical_memory",
+            "planned_memory_id": self.planned_memory_id,
+            "proposed_memory": {
+                "name": self.canonical_name,
+                "body": self.body,
+                "body_bytes": body_bytes,
+                "scope": self.applicability_scope,
+            },
+            "body_budget": {
+                "target_bytes": MEMORY_BODY_TARGET_BYTES,
+                "hard_limit_bytes": MEMORY_BODY_HARD_LIMIT_BYTES,
+                "within_target": body_bytes <= MEMORY_BODY_TARGET_BYTES,
+            },
+            "source": self.source.to_data(),
+        }
+
+
+@dataclass(frozen=True)
+class AuditEventReceipt:
+    event_id: str
+    event_type: str
+    occurred_at: str
+    before_version: int | None
+    after_version: int
+    entrance: str
+    result_hash: str
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type,
+            "occurred_at": self.occurred_at,
+            "before_version": self.before_version,
+            "after_version": self.after_version,
+            "entrance": self.entrance,
+            "result_hash": self.result_hash,
+        }
+
+
+@dataclass(frozen=True)
+class SourceMemoryApproval:
+    proposal_id: str
+    memory_id: str
+    canonical_name: str
+    body: str
+    applicability_scope: str
+    source: SourceReceipt
+    capsule_id: str
+    audit_event: AuditEventReceipt
+
+    def to_data(self) -> dict[str, object]:
+        body_bytes = len(self.body.encode("utf-8"))
+        return {
+            "proposal_id": self.proposal_id,
+            "status": "applied",
+            "decision": "approved",
+            "memory": {
+                "memory_id": self.memory_id,
+                "current_version": 1,
+                "state": "current",
+                "name": self.canonical_name,
+                "body": self.body,
+                "body_bytes": body_bytes,
+                "scope": self.applicability_scope,
+            },
+            "dictionary": {
+                "memory_id": self.memory_id,
+                "canonical_name": self.canonical_name,
+                "current_version": 1,
+                "primary_capsule_id": self.capsule_id,
+            },
+            "primary_capsule": {
+                "capsule_id": self.capsule_id,
+                "body_bytes": body_bytes,
+                "memory_record_count": 1,
+            },
+            "source": self.source.to_data(),
+            "audit_event": self.audit_event.to_data(),
         }
 
 
@@ -730,6 +943,134 @@ class LocalMemoryCore:
                     f"content-addressed object hash mismatch: {object_path}"
                 )
 
+    def propose_source_memory(
+        self,
+        source_path: Path,
+        *,
+        canonical_name: str,
+        body: str,
+        applicability_scope: str,
+        idempotency_key: str,
+    ) -> SourceMemoryProposal:
+        source_body = _read_local_source(source_path)
+        normalized_name = _bounded_text("memory name", canonical_name, maximum=500)
+        normalized_body = _validated_memory_body(body)
+        normalized_scope = _bounded_text(
+            "memory applicability scope", applicability_scope, maximum=1_000
+        )
+        normalized_key = _bounded_text(
+            "idempotency key", idempotency_key, maximum=200
+        )
+        locator = str(source_path.resolve())
+        content_hash = f"sha256:{hashlib.sha256(source_body).hexdigest()}"
+        request_hash = _stable_hash(
+            {
+                "operation": "propose-source-memory",
+                "locator": locator,
+                "content_hash": content_hash,
+                "canonical_name": normalized_name,
+                "body": normalized_body,
+                "applicability_scope": normalized_scope,
+            }
+        )
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            hold_writer_lock_for_acceptance_test()
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            existing = self._source_memory_proposal_for_key(
+                database_path,
+                normalized_key,
+            )
+            if existing is not None:
+                proposal, existing_request_hash = existing
+                if existing_request_hash != request_hash:
+                    raise UserInputError(
+                        "idempotency key was already used for a different request"
+                    )
+                return proposal
+            staged_database, proposal = self._database_with_source_memory_proposal(
+                database_path,
+                locator=locator,
+                content_hash=content_hash,
+                canonical_name=normalized_name,
+                body=normalized_body,
+                applicability_scope=normalized_scope,
+                idempotency_key=normalized_key,
+                request_hash=request_hash,
+            )
+            atomic_commit(
+                self._root,
+                [(database_path, staged_database)],
+                fault_injections={0: "source-memory-proposal-after-database"},
+            )
+        return proposal
+
+    def approve_source_memory(
+        self,
+        proposal_id: str,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> SourceMemoryApproval:
+        normalized_proposal_id = _bounded_text(
+            "integration proposal id", proposal_id, maximum=200
+        )
+        normalized_key = _bounded_text(
+            "idempotency key", idempotency_key, maximum=200
+        )
+        normalized_entrance = _bounded_text("entrance", entrance, maximum=100)
+        if expected_version != 0:
+            raise UserInputError(
+                "first-memory approval expected_version must be 0"
+            )
+        request_hash = _stable_hash(
+            {
+                "operation": "approve-source-memory",
+                "proposal_id": normalized_proposal_id,
+                "expected_version": expected_version,
+                "entrance": normalized_entrance,
+            }
+        )
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            hold_writer_lock_for_acceptance_test()
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            existing = self._source_memory_approval_for_key(
+                database_path,
+                normalized_key,
+            )
+            if existing is not None:
+                approval, existing_request_hash = existing
+                if existing_request_hash != request_hash:
+                    raise UserInputError(
+                        "idempotency key was already used for a different request"
+                    )
+                return approval
+            staged_database, approval = self._database_with_source_memory_approval(
+                database_path,
+                proposal_id=normalized_proposal_id,
+                idempotency_key=normalized_key,
+                request_hash=request_hash,
+                entrance=normalized_entrance,
+            )
+            atomic_commit(
+                self._root,
+                [(database_path, staged_database)],
+                fault_injections={0: "source-memory-approval-after-database"},
+            )
+        return approval
+
     def _database_initialization_change(
         self,
         database_path: Path,
@@ -754,6 +1095,7 @@ class LocalMemoryCore:
             3: self._migrate_v3_database,
             4: self._migrate_v4_database,
             5: self._migrate_v5_database,
+            6: self._migrate_v6_database,
         }
         try:
             with tempfile.NamedTemporaryFile(
@@ -2070,6 +2412,523 @@ class LocalMemoryCore:
         except sqlite3.Error as error:
             raise IntegrityError("cannot check permanent deletion markers") from error
 
+    @staticmethod
+    def _source_memory_proposal_for_key(
+        database_path: Path,
+        idempotency_key: str,
+    ) -> tuple[SourceMemoryProposal, str] | None:
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                row = connection.execute(
+                    """
+                    SELECT detail.proposal_id, detail.planned_memory_id,
+                           detail.canonical_name, proposal.proposed_understanding,
+                           detail.applicability_scope, detail.source_id,
+                           detail.source_version, version.content_hash,
+                           version.locator, version.observed_at,
+                           version.applicability_scope, detail.request_hash
+                    FROM source_memory_proposal_details AS detail
+                    JOIN integration_proposals AS proposal
+                      ON proposal.proposal_id = detail.proposal_id
+                    JOIN evidence_source_versions AS version
+                      ON version.source_id = detail.source_id
+                     AND version.version = detail.source_version
+                    WHERE detail.idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot read source memory proposal") from error
+        if row is None:
+            return None
+        if (
+            not all(
+                isinstance(row[index], str)
+                for index in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11)
+            )
+            or not isinstance(row[6], int)
+        ):
+            raise IntegrityError("source memory proposal is invalid")
+        return (
+            SourceMemoryProposal(
+                proposal_id=row[0],
+                planned_memory_id=row[1],
+                canonical_name=row[2],
+                body=row[3],
+                applicability_scope=row[4],
+                source=SourceReceipt(
+                    source_id=row[5],
+                    version=row[6],
+                    content_hash=row[7],
+                    locator=row[8],
+                    observed_at=row[9],
+                    applicability_scope=row[10],
+                ),
+            ),
+            row[11],
+        )
+
+    @staticmethod
+    def _database_with_source_memory_proposal(
+        database_path: Path,
+        *,
+        locator: str,
+        content_hash: str,
+        canonical_name: str,
+        body: str,
+        applicability_scope: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> tuple[bytes, SourceMemoryProposal]:
+        temporary_path: Path | None = None
+        created_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".source-memory-proposal.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                source_row = connection.execute(
+                    """
+                    SELECT source_id FROM evidence_sources
+                    WHERE current_locator = ?
+                    """,
+                    (locator,),
+                ).fetchone()
+                if source_row is None:
+                    source_id = f"src_{uuid.uuid4().hex}"
+                    source_version = 1
+                    connection.execute(
+                        """
+                        INSERT INTO evidence_sources
+                            (source_id, source_kind, current_locator, created_at)
+                        VALUES (?, 'local', ?, ?)
+                        """,
+                        (source_id, locator, created_at),
+                    )
+                    add_source_version = True
+                else:
+                    source_id = source_row[0]
+                    if not isinstance(source_id, str):
+                        raise IntegrityError("local source identity is invalid")
+                    latest = connection.execute(
+                        """
+                        SELECT version, content_hash
+                        FROM evidence_source_versions
+                        WHERE source_id = ?
+                        ORDER BY version DESC
+                        LIMIT 1
+                        """,
+                        (source_id,),
+                    ).fetchone()
+                    if (
+                        latest is None
+                        or not isinstance(latest[0], int)
+                        or not isinstance(latest[1], str)
+                    ):
+                        raise IntegrityError("local source version is invalid")
+                    if latest[1] == content_hash:
+                        source_version = latest[0]
+                        add_source_version = False
+                    else:
+                        source_version = latest[0] + 1
+                        add_source_version = True
+                if add_source_version:
+                    connection.execute(
+                        """
+                        INSERT INTO evidence_source_versions
+                            (source_id, version, content_hash, locator, observed_at,
+                             applicability_scope, retention)
+                        VALUES (?, ?, ?, ?, ?, ?, 'receipt')
+                        """,
+                        (
+                            source_id,
+                            source_version,
+                            content_hash,
+                            locator,
+                            created_at,
+                            applicability_scope,
+                        ),
+                    )
+                proposal_id = f"prp_{uuid.uuid4().hex}"
+                planned_memory_id = f"mem_{uuid.uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO integration_proposals
+                        (proposal_id, topic, proposed_understanding, possible_impact,
+                         sensitivity, suggested_action, target_memory_id, status,
+                         created_at, reviewed_at)
+                    VALUES (?, ?, ?, ?, 'local-only', 'new', NULL, 'pending', ?, NULL)
+                    """,
+                    (
+                        proposal_id,
+                        applicability_scope,
+                        body,
+                        "Creates one source-backed canonical memory after explicit approval.",
+                        created_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO source_memory_proposal_details
+                        (proposal_id, proposal_version, planned_memory_id,
+                         canonical_name, applicability_scope, source_id,
+                         source_version, idempotency_key, request_hash)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proposal_id,
+                        planned_memory_id,
+                        canonical_name,
+                        applicability_scope,
+                        source_id,
+                        source_version,
+                        idempotency_key,
+                        request_hash,
+                    ),
+                )
+                connection.commit()
+            proposal = SourceMemoryProposal(
+                proposal_id=proposal_id,
+                planned_memory_id=planned_memory_id,
+                canonical_name=canonical_name,
+                body=body,
+                applicability_scope=applicability_scope,
+                source=SourceReceipt(
+                    source_id=source_id,
+                    version=source_version,
+                    content_hash=content_hash,
+                    locator=locator,
+                    observed_at=created_at,
+                    applicability_scope=applicability_scope,
+                ),
+            )
+            return temporary_path.read_bytes(), proposal
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage source memory proposal") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _source_memory_approval_for_key(
+        database_path: Path,
+        idempotency_key: str,
+    ) -> tuple[SourceMemoryApproval, str] | None:
+        try:
+            with closing(sqlite3.connect(database_path)) as connection:
+                row = connection.execute(
+                    """
+                    SELECT write.request_hash, detail.proposal_id,
+                           detail.planned_memory_id, detail.canonical_name,
+                           proposal.proposed_understanding,
+                           detail.applicability_scope, detail.source_id,
+                           detail.source_version, version.content_hash,
+                           version.locator, version.observed_at,
+                           version.applicability_scope,
+                           dictionary.primary_capsule_id,
+                           audit.event_id, audit.event_type, audit.occurred_at,
+                           audit.before_version, audit.after_version,
+                           audit.entrance, audit.result_hash
+                    FROM idempotent_writes AS write
+                    JOIN source_memory_proposal_details AS detail
+                      ON detail.proposal_id = write.subject_id
+                    JOIN integration_proposals AS proposal
+                      ON proposal.proposal_id = detail.proposal_id
+                    JOIN evidence_source_versions AS version
+                      ON version.source_id = detail.source_id
+                     AND version.version = detail.source_version
+                    JOIN knowledge_dictionary AS dictionary
+                      ON dictionary.memory_id = detail.planned_memory_id
+                    JOIN audit_events AS audit
+                      ON audit.proposal_id = detail.proposal_id
+                     AND audit.event_type = 'review.applied'
+                    WHERE write.operation = 'approve-source-memory'
+                      AND write.idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot read idempotent memory approval") from error
+        if row is None:
+            return None
+        string_indexes = (
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19
+        )
+        if (
+            not all(isinstance(row[index], str) for index in string_indexes)
+            or not isinstance(row[7], int)
+            or row[16] is not None
+            or not isinstance(row[17], int)
+        ):
+            raise IntegrityError("idempotent memory approval is invalid")
+        return (
+            SourceMemoryApproval(
+                proposal_id=row[1],
+                memory_id=row[2],
+                canonical_name=row[3],
+                body=row[4],
+                applicability_scope=row[5],
+                source=SourceReceipt(
+                    source_id=row[6],
+                    version=row[7],
+                    content_hash=row[8],
+                    locator=row[9],
+                    observed_at=row[10],
+                    applicability_scope=row[11],
+                ),
+                capsule_id=row[12],
+                audit_event=AuditEventReceipt(
+                    event_id=row[13],
+                    event_type=row[14],
+                    occurred_at=row[15],
+                    before_version=None,
+                    after_version=row[17],
+                    entrance=row[18],
+                    result_hash=row[19],
+                ),
+            ),
+            row[0],
+        )
+
+    @staticmethod
+    def _database_with_source_memory_approval(
+        database_path: Path,
+        *,
+        proposal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        entrance: str,
+    ) -> tuple[bytes, SourceMemoryApproval]:
+        temporary_path: Path | None = None
+        applied_at = datetime.now(timezone.utc).isoformat()
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".source-memory-approval.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                row = connection.execute(
+                    """
+                    SELECT detail.planned_memory_id, detail.canonical_name,
+                           proposal.proposed_understanding,
+                           detail.applicability_scope, detail.source_id,
+                           detail.source_version, version.content_hash,
+                           version.locator, version.observed_at,
+                           version.applicability_scope, proposal.status
+                    FROM source_memory_proposal_details AS detail
+                    JOIN integration_proposals AS proposal
+                      ON proposal.proposal_id = detail.proposal_id
+                    JOIN evidence_source_versions AS version
+                      ON version.source_id = detail.source_id
+                     AND version.version = detail.source_version
+                    WHERE detail.proposal_id = ?
+                    """,
+                    (proposal_id,),
+                ).fetchone()
+                if row is None or row[10] != "pending":
+                    raise UserInputError(
+                        f"pending source memory proposal does not exist: {proposal_id}"
+                    )
+                if (
+                    not all(
+                        isinstance(row[index], str)
+                        for index in (0, 1, 2, 3, 4, 6, 7, 8, 9)
+                    )
+                    or not isinstance(row[5], int)
+                ):
+                    raise IntegrityError("source memory proposal is invalid")
+                memory_id = row[0]
+                canonical_name = row[1]
+                body = row[2]
+                applicability_scope = row[3]
+                source = SourceReceipt(
+                    source_id=row[4],
+                    version=row[5],
+                    content_hash=row[6],
+                    locator=row[7],
+                    observed_at=row[8],
+                    applicability_scope=row[9],
+                )
+                body_bytes = len(body.encode("utf-8"))
+                if body_bytes > MEMORY_BODY_HARD_LIMIT_BYTES:
+                    raise IntegrityError("pending canonical memory exceeds its byte budget")
+                if connection.execute(
+                    "SELECT 1 FROM canonical_memories WHERE memory_id = ?",
+                    (memory_id,),
+                ).fetchone() is not None:
+                    raise UserInputError(
+                        "first-memory approval expected_version conflict: memory already exists"
+                    )
+                capsule_id = f"cap_{uuid.uuid4().hex}"
+                event_id = f"aud_{uuid.uuid4().hex}"
+                result_hash = _stable_hash(
+                    {
+                        "proposal_id": proposal_id,
+                        "memory_id": memory_id,
+                        "version": 1,
+                        "canonical_name": canonical_name,
+                        "body_hash": _stable_hash(body),
+                        "scope": applicability_scope,
+                        "source_id": source.source_id,
+                        "source_version": source.version,
+                        "capsule_id": capsule_id,
+                    }
+                )
+                audit_event = AuditEventReceipt(
+                    event_id=event_id,
+                    event_type="review.applied",
+                    occurred_at=applied_at,
+                    before_version=None,
+                    after_version=1,
+                    entrance=entrance,
+                    result_hash=result_hash,
+                )
+                approval = SourceMemoryApproval(
+                    proposal_id=proposal_id,
+                    memory_id=memory_id,
+                    canonical_name=canonical_name,
+                    body=body,
+                    applicability_scope=applicability_scope,
+                    source=source,
+                    capsule_id=capsule_id,
+                    audit_event=audit_event,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_capsules
+                        (capsule_id, topic, body_bytes, memory_record_count,
+                         structural_version, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (capsule_id, applicability_scope, body_bytes, applied_at, applied_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memories
+                        (memory_id, content, current_version, sensitivity, state,
+                         created_at, updated_at)
+                    VALUES (?, '', 1, 'local-only', 'active', ?, ?)
+                    """,
+                    (memory_id, applied_at, applied_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_versions
+                        (memory_id, version, content, applicability_scope, capsule_id,
+                         action, change_reason, created_at, superseded_at,
+                         supersession_reason)
+                    VALUES (?, 1, ?, ?, ?, 'created', ?, ?, NULL, NULL)
+                    """,
+                    (
+                        memory_id,
+                        body,
+                        applicability_scope,
+                        capsule_id,
+                        "Explicit source-memory proposal approved.",
+                        applied_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_version_evidence
+                        (memory_id, version, source_id, source_version, relationship)
+                    VALUES (?, 1, ?, ?, 'supports')
+                    """,
+                    (memory_id, source.source_id, source.version),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_dictionary
+                        (memory_id, canonical_name, normalized_name, current_version,
+                         primary_capsule_id)
+                    VALUES (?, ?, ?, 1, ?)
+                    """,
+                    (
+                        memory_id,
+                        canonical_name,
+                        " ".join(canonical_name.casefold().split()),
+                        capsule_id,
+                    ),
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE integration_proposals
+                    SET status = 'accepted', reviewed_at = ?
+                    WHERE proposal_id = ? AND status = 'pending'
+                    """,
+                    (applied_at, proposal_id),
+                )
+                if updated.rowcount != 1:
+                    raise IntegrityError("source memory proposal changed during approval")
+                connection.execute(
+                    """
+                    INSERT INTO integration_reviews
+                        (review_id, proposal_id, decision, action, reviewed_content,
+                         reason, canonical_memory_id, created_at)
+                    VALUES (?, ?, 'accepted', 'created', NULL, ?, ?, ?)
+                    """,
+                    (
+                        f"rev_{hashlib.sha256(proposal_id.encode()).hexdigest()}",
+                        proposal_id,
+                        "Explicit approval.",
+                        memory_id,
+                        applied_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events
+                        (event_id, event_type, occurred_at, subject_id, proposal_id,
+                         before_version, after_version, entrance, result_hash)
+                    VALUES (?, 'review.applied', ?, ?, ?, NULL, 1, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        applied_at,
+                        memory_id,
+                        proposal_id,
+                        entrance,
+                        result_hash,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO idempotent_writes
+                        (operation, idempotency_key, subject_id, request_hash,
+                         result_hash, created_at)
+                    VALUES ('approve-source-memory', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        idempotency_key,
+                        proposal_id,
+                        request_hash,
+                        result_hash,
+                        applied_at,
+                    ),
+                )
+                connection.commit()
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise IntegrityError("memory approval left a dangling reference")
+            return temporary_path.read_bytes(), approval
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot stage source memory approval") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
     def pending_integration_proposals(self) -> tuple[IntegrationProposal, ...]:
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
@@ -2143,6 +3002,11 @@ class LocalMemoryCore:
                     LEFT JOIN integration_proposal_related AS related
                       ON related.proposal_id = p.proposal_id
                     WHERE p.status = ?{topic_filter}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM source_memory_proposal_details AS source_memory
+                          WHERE source_memory.proposal_id = p.proposal_id
+                      )
                     GROUP BY p.proposal_id
                     ORDER BY p.created_at, p.proposal_id
                     """,
@@ -2747,6 +3611,141 @@ class LocalMemoryCore:
                 temporary_path.unlink(missing_ok=True)
 
     @staticmethod
+    def _migrate_v6_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_sources (
+                        source_id TEXT PRIMARY KEY,
+                        source_kind TEXT NOT NULL CHECK (source_kind = 'local'),
+                        current_locator TEXT NOT NULL UNIQUE,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS evidence_source_versions (
+                        source_id TEXT NOT NULL
+                            REFERENCES evidence_sources(source_id),
+                        version INTEGER NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        locator TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        applicability_scope TEXT NOT NULL,
+                        retention TEXT NOT NULL CHECK (retention = 'receipt'),
+                        PRIMARY KEY (source_id, version)
+                    );
+                    CREATE TABLE IF NOT EXISTS knowledge_capsules (
+                        capsule_id TEXT PRIMARY KEY,
+                        topic TEXT NOT NULL,
+                        body_bytes INTEGER NOT NULL CHECK (body_bytes >= 0),
+                        memory_record_count INTEGER NOT NULL
+                            CHECK (memory_record_count >= 0),
+                        structural_version INTEGER NOT NULL
+                            CHECK (structural_version >= 1),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS knowledge_dictionary (
+                        memory_id TEXT PRIMARY KEY
+                            REFERENCES canonical_memories(memory_id),
+                        canonical_name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        current_version INTEGER NOT NULL,
+                        primary_capsule_id TEXT NOT NULL
+                            REFERENCES knowledge_capsules(capsule_id),
+                        FOREIGN KEY (memory_id, current_version)
+                            REFERENCES canonical_memory_versions(memory_id, version)
+                    );
+                    CREATE TABLE IF NOT EXISTS canonical_memory_version_evidence (
+                        memory_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        source_id TEXT NOT NULL,
+                        source_version INTEGER NOT NULL,
+                        relationship TEXT NOT NULL
+                            CHECK (relationship = 'supports'),
+                        FOREIGN KEY (memory_id, version)
+                            REFERENCES canonical_memory_versions(memory_id, version),
+                        FOREIGN KEY (source_id, source_version)
+                            REFERENCES evidence_source_versions(source_id, version),
+                        PRIMARY KEY (
+                            memory_id, version, source_id, source_version, relationship
+                        )
+                    );
+                    CREATE TABLE IF NOT EXISTS source_memory_proposal_details (
+                        proposal_id TEXT PRIMARY KEY
+                            REFERENCES integration_proposals(proposal_id),
+                        proposal_version INTEGER NOT NULL
+                            CHECK (proposal_version = 1),
+                        planned_memory_id TEXT NOT NULL UNIQUE,
+                        canonical_name TEXT NOT NULL,
+                        applicability_scope TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        source_version INTEGER NOT NULL,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        request_hash TEXT NOT NULL,
+                        FOREIGN KEY (source_id, source_version)
+                            REFERENCES evidence_source_versions(source_id, version)
+                    );
+                    CREATE TABLE IF NOT EXISTS audit_events (
+                        event_id TEXT PRIMARY KEY,
+                        event_type TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        proposal_id TEXT,
+                        before_version INTEGER,
+                        after_version INTEGER,
+                        entrance TEXT NOT NULL,
+                        result_hash TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS idempotent_writes (
+                        operation TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL,
+                        subject_id TEXT NOT NULL,
+                        request_hash TEXT NOT NULL,
+                        result_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (operation, idempotency_key)
+                    );
+                    PRAGMA user_version = 7;
+                    """
+                )
+                version_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(canonical_memory_versions)"
+                    ).fetchall()
+                    if isinstance(row[1], str)
+                }
+                if "applicability_scope" not in version_columns:
+                    connection.execute(
+                        "ALTER TABLE canonical_memory_versions "
+                        "ADD COLUMN applicability_scope TEXT"
+                    )
+                if "capsule_id" not in version_columns:
+                    connection.execute(
+                        "ALTER TABLE canonical_memory_versions "
+                        "ADD COLUMN capsule_id TEXT "
+                        "REFERENCES knowledge_capsules(capsule_id)"
+                    )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
     def _migrate_v5_database(database_path: Path) -> bytes:
         temporary_path: Path | None = None
         try:
@@ -3120,11 +4119,54 @@ def _read_conversation(conversation_path: Path) -> bytes:
     return body
 
 
+def _read_local_source(source_path: Path) -> bytes:
+    if not source_path.is_file():
+        raise UserInputError(f"local source does not exist: {source_path}")
+    try:
+        body = source_path.read_bytes()
+        text = body.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise UserInputError(
+            f"local source is not readable UTF-8: {source_path}"
+        ) from error
+    if not text.strip():
+        raise UserInputError("local source must not be blank")
+    return body
+
+
 def _required_text(name: str, value: str) -> str:
     normalized = value.strip()
     if not normalized:
         raise UserInputError(f"{name} must not be blank")
     return normalized
+
+
+def _bounded_text(name: str, value: str, *, maximum: int) -> str:
+    normalized = _required_text(name, value)
+    if len(normalized) > maximum:
+        raise UserInputError(f"{name} must not exceed {maximum} characters")
+    return normalized
+
+
+def _validated_memory_body(value: str) -> str:
+    body = _required_text("canonical memory body", value)
+    body_bytes = len(body.encode("utf-8"))
+    if body_bytes > MEMORY_BODY_HARD_LIMIT_BYTES:
+        raise UserInputError(
+            "canonical memory body exceeds the 8192-byte hard limit; "
+            "keep excess detail in the evidence source"
+        )
+    return body
+
+
+def _stable_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _without_evidence_marker(content: str) -> str:
@@ -3137,7 +4179,7 @@ def _canonical_memory_audit(
 ) -> CanonicalMemoryAudit:
     current = connection.execute(
         """
-        SELECT content, current_version, state
+        SELECT current_version, state
         FROM canonical_memories
         WHERE memory_id = ?
         """,
@@ -3148,11 +4190,16 @@ def _canonical_memory_audit(
         SELECT version.version, version.content, version.action,
                version.change_reason, version.superseded_at,
                version.supersession_reason,
-               GROUP_CONCAT(source.source_id, ',')
+               GROUP_CONCAT(
+                   DISTINCT COALESCE(source.source_id, receipt.source_id)
+               )
         FROM canonical_memory_versions AS version
         LEFT JOIN canonical_memory_version_sources AS source
           ON source.memory_id = version.memory_id
          AND source.version = version.version
+        LEFT JOIN canonical_memory_version_evidence AS receipt
+          ON receipt.memory_id = version.memory_id
+         AND receipt.version = version.version
         WHERE version.memory_id = ?
         GROUP BY version.memory_id, version.version
         ORDER BY version.version
@@ -3192,9 +4239,8 @@ def _canonical_memory_audit(
     ).fetchall()
     if (
         current is None
-        or not isinstance(current[0], str)
-        or not isinstance(current[1], int)
-        or current[2] not in ("active", "inactive")
+        or not isinstance(current[0], int)
+        or current[1] not in ("active", "inactive")
     ):
         raise UserInputError(f"canonical memory does not exist: {memory_id}")
     versions = tuple(
@@ -3238,7 +4284,17 @@ def _canonical_memory_audit(
                 reason=reason,
             )
         )
-    current_version = current[1]
+    current_version = current[0]
+    current_content = next(
+        (
+            version.content
+            for version in versions
+            if version.version == current_version
+        ),
+        None,
+    )
+    if current_content is None:
+        raise IntegrityError("canonical memory current version is missing")
     current_sources = next(
         (
             version.source_ids
@@ -3249,10 +4305,10 @@ def _canonical_memory_audit(
     )
     return CanonicalMemoryAudit(
         memory_id=memory_id,
-        state=current[2],
+        state=current[1],
         confirmation_status="conflicted" if conflicts else "confirmed",
         current_version=current_version,
-        current_content=current[0],
+        current_content=current_content,
         current_source_ids=current_sources,
         versions=versions,
         unresolved_conflicts=conflicts,

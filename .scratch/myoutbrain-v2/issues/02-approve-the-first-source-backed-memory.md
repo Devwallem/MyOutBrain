@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — 初始化并检查 V2 实例.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 来源拥有稳定身份、版本、内容哈希和最低来源凭证。
 - [ ] 提交只创建待审整合提案，不直接修改规范记忆。
