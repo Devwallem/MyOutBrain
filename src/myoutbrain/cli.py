@@ -24,6 +24,7 @@ from myoutbrain.codex_entrance import (
     CodexVisibleExperience,
 )
 from myoutbrain.consolidation import ConsolidationScheduler
+from myoutbrain.counterevidence import load_counterevidence_request
 from myoutbrain.evaluation import (
     evaluate_recall,
     load_recall_dataset,
@@ -405,6 +406,18 @@ def build_parser() -> argparse.ArgumentParser:
     search_public_parser.add_argument("--next-step", action="append", default=[])
     search_public_parser.add_argument("--root", type=Path, default=Path.cwd())
     search_public_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    route_counterevidence_parser = subcommands.add_parser(
+        "route-counterevidence",
+        help="Route task-scoped counterevidence through recall and unified review",
+    )
+    route_counterevidence_parser.add_argument("payload", type=Path)
+    route_counterevidence_parser.add_argument("--idempotency-key", required=True)
+    route_counterevidence_parser.add_argument(
+        "--root", type=Path, default=Path.cwd()
+    )
+    route_counterevidence_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     review_propose_parser = subcommands.add_parser(
@@ -1289,6 +1302,28 @@ def _review_propose(
     return 0
 
 
+def _route_counterevidence(
+    root: Path,
+    payload_path: Path,
+    *,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).route_counterevidence(
+        load_counterevidence_request(payload_path),
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        proposal = cast(dict[str, object], result["review_proposal"])
+        print(
+            "Counterevidence made the recall unanswerable; "
+            f"pending review proposal {proposal['proposal_id']}"
+        )
+    return 0
+
+
 def _submit_learning_signal(
     root: Path,
     payload_path: Path,
@@ -2137,6 +2172,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 verified_facts=parsed_arguments.verified_fact,
                 unresolved_gaps=parsed_arguments.unresolved_gap,
                 next_steps=parsed_arguments.next_step,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "route-counterevidence":
+            return _route_counterevidence(
+                parsed_arguments.root,
+                parsed_arguments.payload,
+                idempotency_key=parsed_arguments.idempotency_key,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "recall-activity":

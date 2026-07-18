@@ -324,7 +324,7 @@ class V2DeduplicationAndAliasTests(unittest.TestCase):
             )
             self.assertEqual(_dict(memory["evidence"])["source_count"], 1)
 
-    def test_conflict_is_grouped_reviewable_and_not_falsely_approvable(self) -> None:
+    def test_conflict_approval_materializes_through_the_existing_revision_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             instance_root = temporary_root / "MyOutBrain"
@@ -379,10 +379,19 @@ class V2DeduplicationAndAliasTests(unittest.TestCase):
             )
 
             self.assertEqual(conflict["suggested_action"], "conflict")
-            self.assertIsNone(conflict["approval_effect"])
-            self.assertEqual(conflict["available_decisions"], ["reject", "defer"])
-            self.assertEqual(queued["available_decisions"], ["reject", "defer"])
-            self.assertIsNone(queued["approval_effect"])
+            self.assertEqual(conflict["approval_effect"], "revise_canonical_memory")
+            self.assertEqual(
+                conflict["available_decisions"],
+                ["approve", "approve-edited", "reject", "defer"],
+            )
+            self.assertEqual(
+                queued["available_decisions"],
+                ["approve", "approve-edited", "reject", "defer"],
+            )
+            self.assertEqual(
+                _dict(queued["approval_effect"])["type"],
+                "revise_canonical_memory",
+            )
             self.assertEqual(group["kind"], "conflict")
             self.assertIn(original["proposal_id"], cast(list[object], group["proposal_ids"]))
             relation = _dict(cast(list[object], group["relations"])[0])
@@ -402,7 +411,7 @@ class V2DeduplicationAndAliasTests(unittest.TestCase):
                                 "proposal_version": conflict["proposal_version"],
                                 "decision": "approve",
                                 "edited_content": None,
-                                "reason": "Exercise the unsupported boundary.",
+                                "reason": "Adopt the reviewed counterevidence.",
                                 "defer_until": None,
                                 "confirm_personal_cognition": False,
                             }
@@ -411,11 +420,11 @@ class V2DeduplicationAndAliasTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            attempted = run_cli(
+            approved = run_cli(
                 "review-batch",
                 str(batch_path),
                 "--idempotency-key",
-                "conflict-approve-attempt",
+                "conflict-approve-through-review",
                 "--entrance",
                 "codex",
                 "--root",
@@ -423,59 +432,22 @@ class V2DeduplicationAndAliasTests(unittest.TestCase):
                 "--format",
                 "json",
             )
-            self.assertEqual(attempted.returncode, 0, attempted.stderr)
-            attempt = _dict(json.loads(attempted.stdout))
-            outcome = _dict(_dict_list(attempt["outcomes"])[0])
-            self.assertEqual(attempt["status"], "failed")
-            self.assertIn(
-                "conflict_approval_materialization_deferred_to_issue_09",
-                cast(str, outcome["error"]),
-            )
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            approval = _dict(json.loads(approved.stdout))
+            outcome = _dict(_dict_list(approval["outcomes"])[0])
+            self.assertEqual(approval["status"], "complete")
+            self.assertEqual(outcome["status"], "applied")
+            self.assertEqual(_dict(outcome["materialization"])["version"], 2)
 
             recalled = self._recall(instance_root, "Snapshot restore location")
             memories = _dict_list(recalled["memories"])
             self.assertEqual(len(memories), 1)
-            self.assertEqual(memories[0]["version"], 1)
+            self.assertEqual(memories[0]["version"], 2)
             self.assertEqual(
                 memories[0]["body"],
-                "Backups must always be restored into a new directory before verification.",
+                "Backups must never be restored into a new directory before verification.",
             )
             self.assertEqual(_dict(memories[0]["evidence"])["source_count"], 1)
-
-            batch_path.write_text(
-                json.dumps(
-                    {
-                        "batch_id": "bat_conflict_defer",
-                        "decisions": [
-                            {
-                                "proposal_id": conflict["proposal_id"],
-                                "proposal_version": conflict["proposal_version"],
-                                "decision": "defer",
-                                "edited_content": None,
-                                "reason": "Await issue 09.",
-                                "defer_until": "2030-01-01T00:00:00+00:00",
-                                "confirm_personal_cognition": False,
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            deferred = run_cli(
-                "review-batch",
-                str(batch_path),
-                "--idempotency-key",
-                "conflict-defer",
-                "--entrance",
-                "codex",
-                "--root",
-                str(instance_root),
-                "--format",
-                "json",
-            )
-            self.assertEqual(deferred.returncode, 0, deferred.stderr)
-            deferred_data = _dict(json.loads(deferred.stdout))
-            self.assertEqual(_dict_list(deferred_data["outcomes"])[0]["status"], "deferred")
 
     def test_renaming_back_to_an_old_alias_keeps_direct_non_cyclic_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -74,6 +74,17 @@ class RecallMaterial:
     has_unresolved_conflict: bool
 
 
+@dataclass(frozen=True)
+class RecalledCounterevidenceTarget:
+    task: str
+    memory_id: str
+    version: int
+    state: str
+    body: str
+    scope: str
+    canonical_name: str
+
+
 class AnswerabilityEngine(Protocol):
     def assess(
         self,
@@ -192,6 +203,7 @@ class V2RecallService:
                     unresolved_conflict = _has_unresolved_conflict(
                         connection,
                         selected_ids,
+                        task=task,
                     )
                     capability_answerability = answerability_engine.assess(
                         question,
@@ -310,16 +322,17 @@ class V2RecallService:
                         "SELECT memory_id FROM recall_event_items WHERE recall_id = ?",
                         (normalized_recall_id,),
                     ).fetchall()
-                    event_exists = connection.execute(
-                        "SELECT 1 FROM recall_events WHERE recall_id = ?",
+                    event_row = connection.execute(
+                        "SELECT task FROM recall_events WHERE recall_id = ?",
                         (normalized_recall_id,),
                     ).fetchone()
-                    if event_exists is None:
+                    if event_row is None:
                         raise UserInputError("recall id does not exist")
                     selected_ids = tuple(cast(str, row[0]) for row in selected_rows)
                     unresolved_conflict = _has_unresolved_conflict(
                         connection,
                         selected_ids,
+                        task=cast(str, event_row[0]),
                     )
                     answerable, reason, overridden = _enforce_answerability(
                         capability_answerability,
@@ -353,6 +366,57 @@ class V2RecallService:
                 "overridden_by_core": overridden,
             },
         }
+
+    def counterevidence_target(
+        self,
+        recall_id: str,
+        memory_id: str,
+    ) -> RecalledCounterevidenceTarget:
+        normalized_recall_id = _required_identifier("recall id", recall_id, "rec_")
+        normalized_memory_id = _required_identifier("memory id", memory_id, "mem_")
+        LocalMemoryCore(self._root).inspect_schema_version()
+        try:
+            with closing(sqlite3.connect(self._root / MEMORY_DATABASE)) as connection:
+                row = connection.execute(
+                    """
+                    SELECT event.task, item.version, memory.state,
+                           version.content, version.applicability_scope,
+                           dictionary.canonical_name
+                    FROM recall_events AS event
+                    JOIN recall_event_items AS item
+                      ON item.recall_id = event.recall_id
+                    JOIN canonical_memories AS memory
+                      ON memory.memory_id = item.memory_id
+                    JOIN canonical_memory_versions AS version
+                      ON version.memory_id = item.memory_id
+                     AND version.version = item.version
+                    JOIN knowledge_dictionary AS dictionary
+                      ON dictionary.memory_id = item.memory_id
+                    WHERE event.recall_id = ? AND item.memory_id = ?
+                    """,
+                    (normalized_recall_id, normalized_memory_id),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot inspect counterevidence recall") from error
+        if row is None:
+            raise UserInputError(
+                "counterevidence target must be selected by the specified recall"
+            )
+        if not (
+            isinstance(row[0], str)
+            and isinstance(row[1], int)
+            and all(isinstance(row[index], str) for index in range(2, 6))
+        ):
+            raise IntegrityError("counterevidence recall target is malformed")
+        return RecalledCounterevidenceTarget(
+            task=row[0],
+            memory_id=normalized_memory_id,
+            version=row[1],
+            state=row[2],
+            body=row[3],
+            scope=row[4],
+            canonical_name=row[5],
+        )
 
     def expand_evidence(
         self,
@@ -403,11 +467,14 @@ class V2RecallService:
                         """
                         SELECT evidence.source_id, evidence.source_version,
                                source.retention, source.content_hash, source.locator,
-                               source.observed_at, source.applicability_scope
+                               source.observed_at, source.applicability_scope,
+                               registry.source_kind
                         FROM canonical_memory_version_evidence AS evidence
                         JOIN evidence_source_versions AS source
                           ON source.source_id = evidence.source_id
                          AND source.version = evidence.source_version
+                        JOIN evidence_sources AS registry
+                          ON registry.source_id = source.source_id
                         WHERE evidence.memory_id = ? AND evidence.version = ?
                         ORDER BY evidence.source_id, evidence.source_version
                         """,
@@ -435,11 +502,14 @@ class V2RecallService:
                         source_version = cast(int, row[1])
                         locator = cast(str, row[4])
                         remaining = budget_bytes - used_bytes
-                        excerpt, source_truncated, status = _read_evidence_excerpt(
-                            Path(locator),
-                            cast(str, row[3]),
-                            remaining,
-                        )
+                        if row[7] == "public":
+                            excerpt, source_truncated, status = "", False, "receipt-only"
+                        else:
+                            excerpt, source_truncated, status = _read_evidence_excerpt(
+                                Path(locator),
+                                cast(str, row[3]),
+                                remaining,
+                            )
                         excerpt_bytes = len(excerpt.encode("utf-8"))
                         used_bytes += excerpt_bytes
                         truncated = truncated or source_truncated
@@ -856,6 +926,8 @@ def _within_budget(
 def _has_unresolved_conflict(
     connection: sqlite3.Connection,
     selected_ids: tuple[str, ...],
+    *,
+    task: str,
 ) -> bool:
     if not selected_ids:
         return False
@@ -871,7 +943,37 @@ def _has_unresolved_conflict(
         """,
         (*selected_ids, *selected_ids),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+    proposal_rows = connection.execute(
+        """
+        SELECT target_json, supporting_evidence_json, context_coverage_json
+        FROM review_proposals
+        WHERE status IN ('pending', 'deferred') AND intent = 'integrate'
+        """
+    ).fetchall()
+    selected = set(selected_ids)
+    try:
+        for target_json, evidence_json, coverage_json in proposal_rows:
+            target = json.loads(cast(str, target_json))
+            evidence = json.loads(cast(str, evidence_json))
+            coverage = json.loads(cast(str, coverage_json))
+            if (
+                isinstance(target, dict)
+                and target.get("memory_id") in selected
+                and isinstance(evidence, list)
+                and isinstance(coverage, list)
+                and f"task:{task}" in coverage
+                and any(
+                    isinstance(item, dict)
+                    and item.get("relationship") == "contradicts"
+                    for item in evidence
+                )
+            ):
+                return True
+    except (json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError("pending counterevidence proposal is malformed") from error
+    return False
 
 
 def _enforce_answerability(

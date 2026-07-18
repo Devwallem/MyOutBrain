@@ -71,7 +71,7 @@ from myoutbrain.unified_review import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 9
+MEMORY_SCHEMA_VERSION = 10
 MEMORY_DATABASE = "store/memory.sqlite3"
 MEMORY_BODY_TARGET_BYTES = 4 * 1024
 MEMORY_BODY_HARD_LIMIT_BYTES = 8 * 1024
@@ -89,7 +89,7 @@ CREATE TABLE source_objects (
 
 CREATE TABLE evidence_sources (
     source_id TEXT PRIMARY KEY,
-    source_kind TEXT NOT NULL CHECK (source_kind = 'local'),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('local', 'public')),
     current_locator TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
 );
@@ -774,11 +774,7 @@ class SourceMemoryProposal:
         approval_effect: str | None = (
             "create_source_backed_canonical_memory"
             if self.suggested_action == "new"
-            else (
-                None
-                if self.suggested_action == "conflict"
-                else "revise_canonical_memory"
-            )
+            else "revise_canonical_memory"
         )
         data: dict[str, object] = {
             "disposition": self.disposition,
@@ -806,10 +802,12 @@ class SourceMemoryProposal:
             "source": self.source.to_data(),
         }
         if self.suggested_action == "conflict":
-            data["available_decisions"] = ["reject", "defer"]
-            data["approval_unavailable_reason"] = (
-                "conflict approval materialization is deferred to issue 09"
-            )
+            data["available_decisions"] = [
+                "approve",
+                "approve-edited",
+                "reject",
+                "defer",
+            ]
         return data
 
 
@@ -2416,6 +2414,7 @@ class LocalMemoryCore:
             6: self._migrate_v6_database,
             7: self._migrate_v7_database,
             8: self._migrate_v8_database,
+            9: self._migrate_v9_database,
         }
         try:
             with tempfile.NamedTemporaryFile(
@@ -5352,6 +5351,50 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v9_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.executescript(
+                    """
+                    CREATE TABLE evidence_sources_v10 (
+                        source_id TEXT PRIMARY KEY,
+                        source_kind TEXT NOT NULL
+                            CHECK (source_kind IN ('local', 'public')),
+                        current_locator TEXT NOT NULL UNIQUE,
+                        created_at TEXT NOT NULL
+                    );
+                    INSERT INTO evidence_sources_v10
+                        (source_id, source_kind, current_locator, created_at)
+                    SELECT source_id, source_kind, current_locator, created_at
+                    FROM evidence_sources;
+                    DROP TABLE evidence_sources;
+                    ALTER TABLE evidence_sources_v10 RENAME TO evidence_sources;
+                    PRAGMA user_version = 10;
+                    """
+                )
+                connection.commit()
+                connection.execute("PRAGMA foreign_keys = ON")
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise IntegrityError("counterevidence source migration broke references")
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)

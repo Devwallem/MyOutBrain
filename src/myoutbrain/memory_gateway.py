@@ -16,6 +16,10 @@ from myoutbrain.core_types import (
     Sensitivity,
     UserInputError,
 )
+from myoutbrain.counterevidence import (
+    CounterevidenceRequest,
+    CounterevidenceService,
+)
 from myoutbrain.embeddings import (
     EmbeddingFailure,
     EmbeddingLocation,
@@ -434,6 +438,17 @@ class MemoryGateway:
             sanitizer,
             provider,
             answerability_engine,
+        )
+
+    def route_counterevidence(
+        self,
+        request: CounterevidenceRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return CounterevidenceService(self._root).route(
+            request,
+            idempotency_key=idempotency_key,
         )
 
     def v2_recall_activity(self) -> dict[str, object]:

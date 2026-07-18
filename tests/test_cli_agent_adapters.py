@@ -211,7 +211,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                 response["server_protocol_version"],
                 {"major": 2, "minor": 1},
             )
-            self.assertEqual(response["result"]["canonical_schema_version"], 9)
+            self.assertEqual(response["result"]["canonical_schema_version"], 10)
             self.assertEqual(response["result"]["integrity"]["overall"], "ok")
 
     def test_protocol_range_with_a_supported_intersection_is_negotiated(self) -> None:

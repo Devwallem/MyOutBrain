@@ -37,11 +37,6 @@ AVAILABLE_DECISIONS: tuple[ReviewDecisionKind, ...] = (
     "defer",
 )
 
-CONFLICT_AVAILABLE_DECISIONS: tuple[ReviewDecisionKind, ...] = ("reject", "defer")
-CONFLICT_APPROVAL_UNAVAILABLE_REASON = (
-    "conflict approval materialization is deferred to issue 09"
-)
-CONFLICT_APPROVAL_ERROR = "conflict_approval_materialization_deferred_to_issue_09"
 UNIFIED_REVIEW_SCHEMA = """
 
 CREATE TABLE IF NOT EXISTS review_proposals (
@@ -1223,22 +1218,6 @@ def stage_review_expiration(
         temporary_path.unlink(missing_ok=True)
 
 
-def _is_nonapprovable_source_conflict(
-    connection: sqlite3.Connection,
-    proposal_id: str,
-) -> bool:
-    return connection.execute(
-        """
-        SELECT 1
-        FROM source_memory_proposal_details AS detail
-        JOIN integration_proposals AS proposal
-          ON proposal.proposal_id = detail.proposal_id
-        WHERE detail.proposal_id = ? AND proposal.suggested_action = 'conflict'
-        """,
-        (proposal_id,),
-    ).fetchone() is not None
-
-
 def _apply_review_decision(
     connection: sqlite3.Connection,
     proposal: ReviewProposal,
@@ -1303,15 +1282,6 @@ def _apply_review_decision(
             "final_content": proposal.payload.content,
             "defer_until": decision.defer_until,
         }
-    if _is_nonapprovable_source_conflict(connection, proposal.proposal_id):
-        return _record_failed_decision(
-            connection,
-            proposal,
-            base,
-            decision="approve",
-            error=CONFLICT_APPROVAL_ERROR,
-            failed_at=decided_at,
-        )
     personal_cognition = proposal.payload.approval_effect.personal_cognition
     target_error = _target_version_error(connection, proposal)
     if target_error is not None:
@@ -1946,6 +1916,40 @@ def _materialize_canonical_revision(
         """,
         (target_memory_id, new_version, proposal.proposal_id),
     )
+    source_proposal = connection.execute(
+        """
+        SELECT 1
+        FROM integration_proposals
+        WHERE proposal_id = ?
+        """,
+        (proposal.proposal_id,),
+    ).fetchone()
+    if source_proposal is not None:
+        updated = connection.execute(
+            """
+            UPDATE integration_proposals
+            SET status = 'accepted', reviewed_at = ?
+            WHERE proposal_id = ? AND status = 'pending'
+            """,
+            (materialized_at, proposal.proposal_id),
+        )
+        if updated.rowcount != 1:
+            raise IntegrityError("source revision changed during unified approval")
+        connection.execute(
+            """
+            INSERT INTO integration_reviews
+                (review_id, proposal_id, decision, action, reviewed_content,
+                 reason, canonical_memory_id, created_at)
+            VALUES (?, ?, 'accepted', 'revised', NULL, ?, ?, ?)
+            """,
+            (
+                f"rev_{hashlib.sha256(proposal.proposal_id.encode()).hexdigest()}",
+                proposal.proposal_id,
+                "Approved through unified review batch.",
+                target_memory_id,
+                materialized_at,
+            ),
+        )
     for evidence in proposal.payload.supporting_evidence:
         source_id = evidence.get("source_id")
         source_version = evidence.get("version", evidence.get("source_version"))
@@ -2039,32 +2043,7 @@ def read_review_queue(database_path: Path) -> ReviewQueue:
             groups = tuple(
                 _review_group_from_row(connection, row) for row in group_rows
             )
-            conflict_ids = {
-                row[0]
-                for row in connection.execute(
-                    """
-                    SELECT detail.proposal_id
-                    FROM source_memory_proposal_details AS detail
-                    JOIN integration_proposals AS proposal
-                      ON proposal.proposal_id = detail.proposal_id
-                    JOIN review_proposals AS review
-                      ON review.proposal_id = detail.proposal_id
-                    WHERE proposal.suggested_action = 'conflict'
-                      AND review.status IN ('pending', 'deferred')
-                    """
-                ).fetchall()
-                if isinstance(row[0], str)
-            }
-            proposals = tuple(
-                replace(
-                    _proposal_from_row(row),
-                    available_decisions=CONFLICT_AVAILABLE_DECISIONS,
-                    approval_unavailable_reason=CONFLICT_APPROVAL_UNAVAILABLE_REASON,
-                )
-                if row[0] in conflict_ids
-                else _proposal_from_row(row)
-                for row in rows
-            )
+            proposals = tuple(_proposal_from_row(row) for row in rows)
     except sqlite3.Error as error:
         raise IntegrityError("cannot read unified review queue") from error
     return ReviewQueue(
