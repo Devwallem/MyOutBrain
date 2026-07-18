@@ -16,7 +16,6 @@ from myoutbrain.persistence import (
     hold_writer_lock_for_acceptance_test,
     operation_lock,
 )
-
 AdapterClient = Literal["codex", "opencode", "claude-code"]
 ADAPTER_CLIENTS: tuple[AdapterClient, ...] = (
     "codex",
@@ -41,6 +40,10 @@ ADAPTER_CAPABILITIES = (
     "reflection_claim.v1",
     "reflection_complete.v1",
     "reflection_abandon.v1",
+    "migration_plan.v1",
+    "migration_export.v1",
+    "migration_import_preview.v1",
+    "migration_import.v1",
 )
 _CODEX_START = "# BEGIN MYOUTBRAIN MANAGED ADAPTER"
 _CODEX_END = "# END MYOUTBRAIN MANAGED ADAPTER"

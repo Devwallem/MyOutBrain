@@ -1,8 +1,8 @@
 {
   "current": {"major": 2, "minor": 2},
   "operations": {
-    "reads": ["instance.status", "maintenance.inspect", "maintenance.plan", "protocol.describe", "review.list"],
-    "writes": ["maintenance.configure_partition", "maintenance.reorganize", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
+    "reads": ["instance.status", "maintenance.inspect", "maintenance.plan", "migration.import_dry_run", "migration.plan", "protocol.describe", "review.list"],
+    "writes": ["maintenance.configure_partition", "maintenance.reorganize", "migration.export", "migration.import", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
   },
   "rules": {
     "major": "Semantic writes require protocol major 2.",

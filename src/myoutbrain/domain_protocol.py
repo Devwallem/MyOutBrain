@@ -212,6 +212,40 @@ class DomainProtocol:
                 idempotency_key=write.idempotency_key,
                 entrance=request.client_name,
             )
+        elif request.operation == "migration.plan":
+            self._require_capability(request, "migration_plan.v1")
+            result = MemoryGateway(self._root).plan_v2_migration(
+                self._migration_memory_ids(request),
+                target=self._migration_target(request),
+            )
+        elif request.operation == "migration.export":
+            write = self._require_migration_write(
+                request, capability="migration_export.v1"
+            )
+            output = self._migration_path(request, "output_path")
+            result = MemoryGateway(self._root).export_v2_migration(
+                output,
+                self._migration_memory_ids(request),
+                target=self._migration_target(request),
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+                entrance=request.client_name,
+            )
+        elif request.operation == "migration.import_dry_run":
+            self._require_capability(request, "migration_import_preview.v1")
+            result = MemoryGateway(self._root).preview_v2_migration_import(
+                self._migration_path(request, "package_path")
+            )
+        elif request.operation == "migration.import":
+            write = self._require_migration_write(
+                request, capability="migration_import.v1"
+            )
+            result = MemoryGateway(self._root).import_v2_migration(
+                self._migration_path(request, "package_path"),
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+                entrance=request.client_name,
+            )
         elif request.operation == "reflection.schedule":
             result = self._configure_reflection_schedule(request)
         elif request.operation == "reflection.enqueue":
@@ -517,6 +551,52 @@ class DomainProtocol:
                 details={"missing": missing},
             )
         return cast(dict[object, object], proposal)
+
+    @staticmethod
+    def _require_capability(request: DomainRequest, capability: str) -> None:
+        if capability not in request.capabilities:
+            raise DomainProtocolError(
+                "capability_required",
+                "client cannot understand this migration operation",
+                details={"missing": [capability]},
+            )
+
+    def _require_migration_write(
+        self,
+        request: DomainRequest,
+        *,
+        capability: str,
+    ) -> WriteCondition:
+        self._require_capability(request, capability)
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "semantic writes require idempotency_key and expected_version",
+            )
+        return request.write
+
+    @staticmethod
+    def _migration_memory_ids(request: DomainRequest) -> tuple[str, ...]:
+        value = request.parameters.get("memory_ids")
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise UserInputError("migration memory_ids must be an array of text")
+        return tuple(cast(list[str], value))
+
+    @staticmethod
+    def _migration_target(request: DomainRequest) -> str:
+        value = request.parameters.get("target")
+        if not isinstance(value, str):
+            raise UserInputError("migration target must be text")
+        return value
+
+    @staticmethod
+    def _migration_path(request: DomainRequest, field: str) -> Path:
+        value = request.parameters.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise UserInputError(f"migration {field} must be non-blank text")
+        return Path(value)
 
     def _decide_review(
         self,

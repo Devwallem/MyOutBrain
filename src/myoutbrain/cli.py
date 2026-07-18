@@ -472,6 +472,51 @@ def build_parser() -> argparse.ArgumentParser:
     review_expire_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    migration_plan_parser = subcommands.add_parser(
+        "migration-plan",
+        help="Audit a selected transitive knowledge closure before export",
+    )
+    migration_plan_parser.add_argument("--memory-id", action="append", required=True)
+    migration_plan_parser.add_argument("--target", required=True)
+    migration_plan_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migration_plan_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    migration_export_parser = subcommands.add_parser(
+        "migration-export",
+        help="Create a manual incremental manifested ZIP migration package",
+    )
+    migration_export_parser.add_argument("output", type=Path)
+    migration_export_parser.add_argument("--memory-id", action="append", required=True)
+    migration_export_parser.add_argument("--target", required=True)
+    migration_export_parser.add_argument("--expected-version", type=int, required=True)
+    migration_export_parser.add_argument("--idempotency-key", required=True)
+    migration_export_parser.add_argument("--entrance", required=True)
+    migration_export_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migration_export_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    migration_dry_run_parser = subcommands.add_parser(
+        "migration-import-dry-run",
+        help="Verify and preview a migration package without changing the target",
+    )
+    migration_dry_run_parser.add_argument("package", type=Path)
+    migration_dry_run_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migration_dry_run_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    migration_import_parser = subcommands.add_parser(
+        "migration-import",
+        help="Idempotently import a verified logical migration package",
+    )
+    migration_import_parser.add_argument("package", type=Path)
+    migration_import_parser.add_argument("--expected-version", type=int, required=True)
+    migration_import_parser.add_argument("--idempotency-key", required=True)
+    migration_import_parser.add_argument("--entrance", required=True)
+    migration_import_parser.add_argument("--root", type=Path, default=Path.cwd())
+    migration_import_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
     capture_parser.add_argument("source", type=Path)
     capture_parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -1519,6 +1564,100 @@ def _review_expire(
     return 0
 
 
+def _migration_plan(
+    root: Path,
+    memory_ids: Sequence[str],
+    *,
+    target: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).plan_v2_migration(
+        tuple(memory_ids),
+        target=target,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        disposition = "allowed" if result["allowed"] else "blocked"
+        closure = cast(dict[str, object], result["closure"])
+        print(
+            f"Migration is {disposition}: "
+            f"{len(cast(list[object], closure['memory_ids']))} memory object(s)."
+        )
+        for blocker in cast(list[dict[str, object]], result["blockers"]):
+            print(f"Blocked path: {blocker['path']} — {blocker['reason']}")
+    return 0
+
+
+def _migration_export(
+    root: Path,
+    output: Path,
+    memory_ids: Sequence[str],
+    *,
+    target: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).export_v2_migration(
+        output,
+        tuple(memory_ids),
+        target=target,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Exported {result['package_id']} at checkpoint "
+            f"{result['checkpoint_version']}: {result['path']}"
+        )
+    return 0
+
+
+def _migration_import_dry_run(
+    root: Path,
+    package: Path,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).preview_v2_migration_import(package)
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Migration import preview: {result['status']}")
+        for blocker in cast(list[dict[str, object]], result["blockers"]):
+            print(f"Blocked path: {blocker['path']} — {blocker['reason']}")
+    return 0
+
+
+def _migration_import(
+    root: Path,
+    package: Path,
+    *,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).import_v2_migration(
+        package,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Migration package {result['package_id']}: "
+            f"{result['disposition']} at checkpoint {result['checkpoint_version']}"
+        )
+    return 0
+
+
 def _capture(root: Path, source: Path, sensitivity: Sensitivity) -> int:
     result = KnowledgeWorkflow(root).capture(source, sensitivity)
     if result.disposition == "captured":
@@ -2294,6 +2433,39 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 as_of=parsed_arguments.as_of,
                 retention_days=parsed_arguments.retention_days,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migration-plan":
+            return _migration_plan(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                target=parsed_arguments.target,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migration-export":
+            return _migration_export(
+                parsed_arguments.root,
+                parsed_arguments.output,
+                parsed_arguments.memory_id,
+                target=parsed_arguments.target,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migration-import-dry-run":
+            return _migration_import_dry_run(
+                parsed_arguments.root,
+                parsed_arguments.package,
+                parsed_arguments.format,
+            )
+        if parsed_arguments.command == "migration-import":
+            return _migration_import(
+                parsed_arguments.root,
+                parsed_arguments.package,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "capture":

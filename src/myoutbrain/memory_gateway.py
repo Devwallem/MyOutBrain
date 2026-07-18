@@ -58,6 +58,7 @@ from myoutbrain.v2_public_search import (
 )
 from myoutbrain.v2_memory_lifecycle import V2MemoryLifecycleService
 from myoutbrain.capsule_maintenance import CapsuleMaintenanceService
+from myoutbrain.v2_migration import V2MigrationService
 from myoutbrain.unified_review import ReviewBatchRequest
 
 
@@ -659,6 +660,54 @@ class MemoryGateway:
             idempotency_key=idempotency_key,
             entrance=entrance,
         ).to_data()
+
+    def plan_v2_migration(
+        self,
+        memory_ids: tuple[str, ...],
+        *,
+        target: str,
+    ) -> dict[str, object]:
+        return V2MigrationService(self._root).plan(memory_ids, target=target)
+
+    def export_v2_migration(
+        self,
+        output_path: Path,
+        memory_ids: tuple[str, ...],
+        *,
+        target: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MigrationService(self._root).export(
+            output_path,
+            memory_ids,
+            target=target,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def preview_v2_migration_import(
+        self,
+        package_path: Path,
+    ) -> dict[str, object]:
+        return V2MigrationService(self._root).import_dry_run(package_path)
+
+    def import_v2_migration(
+        self,
+        package_path: Path,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MigrationService(self._root).import_package(
+            package_path,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()

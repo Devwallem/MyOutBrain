@@ -23,6 +23,10 @@ SERVER_CAPABILITIES = (
     "reflection_claim.v1",
     "reflection_complete.v1",
     "reflection_abandon.v1",
+    "migration_plan.v1",
+    "migration_export.v1",
+    "migration_import_preview.v1",
+    "migration_import.v1",
 )
 
 
