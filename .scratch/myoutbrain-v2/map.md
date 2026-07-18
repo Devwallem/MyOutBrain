@@ -2,6 +2,7 @@
 
 ## Decisions-so-far
 
+- 工单 06：规范记忆生命周期只经显式迁移改变；修订与取代保留历史，可恢复停用退出普通召回，永久删除先展示完整影响闭包并以最小墓碑阻止静默恢复。详见 [工单 06](issues/06-revise-historicize-deactivate-and-erase-memory.md)。
 - 工单 09：本地或公开反证以规范来源凭证进入任务内召回并强制不可回答，同时生成 blocking 统一整合提案；待审不改规范知识，批准沿既有 revision 路径物化，拒绝保留来源与决定且不做多数裁决。详见 [工单 09](issues/09-route-counterevidence-through-review.md)。
 - 工单 10：胶囊重组采用写时复制、语义指纹、结构版本 CAS、原子指针切换与旧胶囊重定向；切换前故障清理 staged 副本，语义漂移转为统一 research 审阅提案，固定召回门禁保护身份、正文、关系与召回等价。详见 [工单 10](issues/10-reorganize-capsules-without-changing-recall.md)。
 - 工单 13：手动增量迁移以经审计的传递知识闭包和逻辑 ZIP 为边界；导入先 dry-run，按包与检查点幂等，目标分歧经统一审阅批准后重映射版本并完成关系导入。详见 [工单 13](issues/13-transfer-an-audited-knowledge-closure.md)。
