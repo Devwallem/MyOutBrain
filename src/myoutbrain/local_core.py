@@ -3787,7 +3787,7 @@ class LocalMemoryCore:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.executescript(
                     """
-                    CREATE TABLE knowledge_partitions (
+                    CREATE TABLE IF NOT EXISTS knowledge_partitions (
                         partition_id TEXT PRIMARY KEY,
                         parent_partition_id TEXT
                             REFERENCES knowledge_partitions(partition_id),
@@ -3801,27 +3801,28 @@ class LocalMemoryCore:
                                 AND parent_partition_id IS NOT NULL)
                         )
                     );
-                    CREATE TABLE capsule_partitions (
+                    CREATE TABLE IF NOT EXISTS capsule_partitions (
                         capsule_id TEXT PRIMARY KEY
                             REFERENCES knowledge_capsules(capsule_id),
                         partition_id TEXT NOT NULL
                             REFERENCES knowledge_partitions(partition_id)
                     );
-                    INSERT INTO knowledge_partitions
+                    INSERT OR IGNORE INTO knowledge_partitions
                         (partition_id, parent_partition_id, node_kind, topic,
                          normalized_topic)
                     VALUES ('prt_root', NULL, 'root', 'All knowledge', 'all knowledge');
-                    INSERT INTO knowledge_partitions
+                    INSERT OR IGNORE INTO knowledge_partitions
                         (partition_id, parent_partition_id, node_kind, topic,
                          normalized_topic)
                     SELECT 'prt_' || substr(capsule_id, 5, 32), 'prt_root', 'leaf',
                            topic, lower(trim(topic))
                     FROM knowledge_capsules;
-                    INSERT INTO capsule_partitions (capsule_id, partition_id)
+                    INSERT OR IGNORE INTO capsule_partitions
+                        (capsule_id, partition_id)
                     SELECT capsule_id, 'prt_' || substr(capsule_id, 5, 32)
                     FROM knowledge_capsules;
 
-                    CREATE VIRTUAL TABLE canonical_memory_fts USING fts5(
+                    CREATE VIRTUAL TABLE IF NOT EXISTS canonical_memory_fts USING fts5(
                         memory_id UNINDEXED,
                         capsule_id UNINDEXED,
                         canonical_name,
@@ -3831,7 +3832,7 @@ class LocalMemoryCore:
                         tokenize = 'unicode61'
                     );
 
-                    CREATE TABLE recall_events (
+                    CREATE TABLE IF NOT EXISTS recall_events (
                         recall_id TEXT PRIMARY KEY,
                         occurred_at TEXT NOT NULL,
                         entrance TEXT NOT NULL,
@@ -3855,7 +3856,7 @@ class LocalMemoryCore:
                         unresolved_conflict INTEGER NOT NULL
                             CHECK (unresolved_conflict IN (0, 1))
                     );
-                    CREATE TABLE recall_event_items (
+                    CREATE TABLE IF NOT EXISTS recall_event_items (
                         recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
                         memory_id TEXT NOT NULL
                             REFERENCES canonical_memories(memory_id),
@@ -3866,7 +3867,7 @@ class LocalMemoryCore:
                         FOREIGN KEY (memory_id, version)
                             REFERENCES canonical_memory_versions(memory_id, version)
                     );
-                    CREATE TABLE recall_evidence_expansions (
+                    CREATE TABLE IF NOT EXISTS recall_evidence_expansions (
                         recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
                         memory_id TEXT NOT NULL,
                         source_id TEXT NOT NULL,
@@ -3896,6 +3897,7 @@ class LocalMemoryCore:
                      AND version.version = dictionary.current_version
                     """
                 ).fetchall()
+                connection.execute("DELETE FROM canonical_memory_fts")
                 connection.executemany(
                     """
                     INSERT INTO canonical_memory_fts
