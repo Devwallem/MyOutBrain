@@ -3306,7 +3306,7 @@ class LocalMemoryCore:
                 removed_proposal_ids=removed_proposal_ids,
                 deleted_at=deleted_at,
             )
-            view_paths = _knowledge_view_paths_for_memory(
+            view_paths = knowledge_view_paths_for_memory(
                 self._root,
                 normalized_memory_id,
             )
@@ -3314,7 +3314,7 @@ class LocalMemoryCore:
                 self._root,
                 [
                     (database_path, staged_database),
-                    _redacted_event_journal_change(
+                    redacted_event_journal_change(
                         self._root,
                         sensitive_ids=(
                             normalized_memory_id,
@@ -6906,7 +6906,7 @@ def _resolved_object_reference(root: Path, object_reference: str) -> Path:
     return candidate
 
 
-def _knowledge_view_paths_for_memory(root: Path, memory_id: str) -> tuple[str, ...]:
+def knowledge_view_paths_for_memory(root: Path, memory_id: str) -> tuple[str, ...]:
     manifest_path = root / "runtime" / "knowledge-views" / "manifest.json"
     if not manifest_path.is_file():
         return ()
@@ -6932,7 +6932,7 @@ def _knowledge_view_paths_for_memory(root: Path, memory_id: str) -> tuple[str, .
         ) from error
 
 
-def _redacted_event_journal_change(
+def redacted_event_journal_change(
     root: Path,
     *,
     sensitive_ids: tuple[str, ...],

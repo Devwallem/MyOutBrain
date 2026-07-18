@@ -953,6 +953,45 @@ class V2MemoryLifecycleTests(unittest.TestCase):
             object_path = instance_root / "store" / "objects" / object_reference
             self.assertTrue(object_path.is_file())
 
+            receipt = cast(dict[str, object], materialized["source"])
+            pending_payload = proposal_payload(
+                intent="derive",
+                formation="derived",
+                priority="routine",
+                title="Pending receipt-derived proposal",
+                content="This pending proposal derives from the receipt being erased.",
+                effect_type="create_derived_memory",
+            )
+            pending_payload["supporting_evidence"] = [
+                {
+                    "kind": "source",
+                    "source_id": receipt["source_id"],
+                    "source_version": receipt["version"],
+                    "locator": receipt["locator"],
+                }
+            ]
+            pending_proposal = submit_proposal(
+                instance_root,
+                temporary_root / "pending-receipt-proposal.json",
+                pending_payload,
+                "pending-receipt-proposal",
+            )
+            target_payload = proposal_payload(
+                intent="derive",
+                formation="derived",
+                priority="routine",
+                title="Pending erased-target proposal",
+                content="This pending proposal targets the memory being erased.",
+                effect_type="create_derived_memory",
+            )
+            cast(dict[str, object], target_payload["target"])["memory_id"] = memory_id
+            target_proposal = submit_proposal(
+                instance_root,
+                temporary_root / "pending-target-proposal.json",
+                target_payload,
+                "pending-target-proposal",
+            )
+
             previewed = run_cli(
                 "erase-memory",
                 memory_id,
@@ -1022,12 +1061,227 @@ class V2MemoryLifecycleTests(unittest.TestCase):
             self.assertEqual(preview["legacy_source_impacts"][0]["action"], "erase-object")
             self.assertTrue(preview["experience_ids"])
             self.assertTrue(preview["digest_ids"])
+            self.assertIn(pending_proposal["proposal_id"], preview["proposal_ids"])
+            self.assertIn(target_proposal["proposal_id"], preview["proposal_ids"])
             self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
             self.assertFalse(object_path.exists())
             self.assertEqual(decided.returncode, 0, decided.stderr)
             outcome = json.loads(decided.stdout)["outcomes"][0]
             self.assertEqual(outcome["status"], "failed")
             self.assertEqual(outcome["error"], "permanently_erased")
+
+    def test_erasure_redacts_an_impacted_outcome_from_a_shared_review_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            materialized = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="shared-review-batch",
+                name="Shared batch deletion target",
+                body="The original shared-batch memory body.",
+            )
+            memory_id = cast(
+                str,
+                cast(dict[str, object], materialized["memory"])["memory_id"],
+            )
+            revised_body = "The revised shared-batch body must be erased."
+            revision_payload = proposal_payload(
+                intent="integrate",
+                formation="explicit",
+                priority="routine",
+                title="Revise shared batch target",
+                content=revised_body,
+                effect_type="revise_canonical_memory",
+            )
+            revision_payload["target"] = {
+                "memory_id": memory_id,
+                "expected_version": 1,
+            }
+            archive_payload = proposal_payload(
+                intent="archive",
+                formation="explicit",
+                priority="routine",
+                title="Unrelated retained archive",
+                content="Keep this unrelated creator archive.",
+                effect_type="create_human_archive",
+            )
+            revision = submit_proposal(
+                instance_root,
+                temporary_root / "shared-revision.json",
+                revision_payload,
+                "shared-batch-revision",
+            )
+            archive = submit_proposal(
+                instance_root,
+                temporary_root / "shared-archive.json",
+                archive_payload,
+                "shared-batch-archive",
+            )
+            batch_path = temporary_root / "shared-batch.json"
+            batch_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "bat_shared_erasure",
+                        "decisions": [
+                            {
+                                "proposal_id": proposal["proposal_id"],
+                                "proposal_version": proposal["proposal_version"],
+                                "decision": "approve",
+                                "edited_content": None,
+                                "reason": "Approve before exercising batch redaction.",
+                                "defer_until": None,
+                                "confirm_personal_cognition": False,
+                            }
+                            for proposal in (revision, archive)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            decided = run_cli(
+                "review-batch",
+                str(batch_path),
+                "--idempotency-key",
+                "shared-erasure-batch",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            previewed = run_cli(
+                "erase-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            preview = json.loads(previewed.stdout)
+            confirmed = run_cli(
+                "erase-memory",
+                memory_id,
+                "--confirm",
+                preview["confirmation_token"],
+                "--root",
+                str(instance_root),
+            )
+            replayed = run_cli(
+                "review-batch",
+                str(batch_path),
+                "--idempotency-key",
+                "shared-erasure-batch",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(decided.returncode, 0, decided.stderr)
+            self.assertEqual(previewed.returncode, 0, previewed.stderr)
+            self.assertEqual(
+                preview["review_batch_impacts"],
+                [
+                    {
+                        "batch_id": "bat_shared_erasure",
+                        "affected_proposal_ids": [revision["proposal_id"]],
+                        "action": "redact-shared",
+                    }
+                ],
+            )
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+            self.assertEqual(replayed.returncode, 0, replayed.stderr)
+            replay = json.loads(replayed.stdout)
+            self.assertEqual(
+                [outcome["proposal_id"] for outcome in replay["outcomes"]],
+                [archive["proposal_id"]],
+            )
+            self.assertNotIn(memory_id, replayed.stdout)
+            self.assertNotIn(revised_body, replayed.stdout)
+
+    def test_legacy_delete_uses_v2_closure_and_removes_views_and_journal_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            secret_body = "The obsolete private launch note says amber lighthouse."
+            materialized = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="legacy-delete-v2",
+                name="Obsolete private launch note",
+                body=secret_body,
+            )
+            memory_id = cast(
+                str,
+                cast(dict[str, object], materialized["memory"])["memory_id"],
+            )
+            built = run_cli("build-views", "--root", str(instance_root))
+            manifest = json.loads(
+                (instance_root / "runtime" / "knowledge-views" / "manifest.json")
+                .read_text(encoding="utf-8")
+            )
+            view_path = next(
+                instance_root / item["path"]
+                for item in manifest["views"]
+                if item["memory_id"] == memory_id
+            )
+            self.assertTrue(view_path.is_file())
+            forgotten = run_cli(
+                "forget-memory",
+                memory_id,
+                "forget this obsolete private launch note",
+                "--root",
+                str(instance_root),
+            )
+            restored = run_cli(
+                "forget-memory",
+                memory_id,
+                "restore this obsolete private launch note",
+                "--root",
+                str(instance_root),
+            )
+            previewed = run_cli(
+                "delete-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            preview = json.loads(previewed.stdout)
+            confirmed = run_cli(
+                "delete-memory",
+                memory_id,
+                "--confirm",
+                preview["confirmation_token"],
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(built.returncode, 0, built.stderr)
+            self.assertEqual(forgotten.returncode, 0, forgotten.stderr)
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(previewed.returncode, 0, previewed.stderr)
+            self.assertEqual(preview["scope"], "transitive-memory-impact-closure")
+            self.assertIn(view_path.relative_to(instance_root).as_posix(), preview["view_paths"])
+            self.assertTrue(preview["journal_event_hashes"])
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+            self.assertEqual(json.loads(confirmed.stdout)["disposition"], "erased")
+            self.assertFalse(view_path.exists())
+            journal = (
+                instance_root / "store" / "journal" / "events.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn(memory_id, journal)
+            self.assertNotIn(secret_body, journal)
+            self.assertNotIn("obsolete private launch note", journal.casefold())
 
     def test_time_recall_frequency_and_invalid_commands_cannot_change_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -2304,6 +2304,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 )
             return 0
         if parsed_arguments.command == "delete-memory":
+            if (
+                parsed_arguments.memory_id.startswith("mem_")
+                and len(parsed_arguments.memory_id) == 36
+            ):
+                return _erase_memory(
+                    parsed_arguments.root,
+                    parsed_arguments.memory_id,
+                    confirmation=parsed_arguments.confirm,
+                    entrance="legacy-delete-memory",
+                    output_format=parsed_arguments.format,
+                )
             deletion = MemoryGovernanceService(
                 parsed_arguments.root
             ).delete(

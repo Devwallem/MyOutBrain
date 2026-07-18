@@ -13,7 +13,12 @@ from typing import cast
 import uuid
 
 from myoutbrain.core_types import ConfigurationConflict, IntegrityError, UserInputError
-from myoutbrain.local_core import LocalMemoryCore, MEMORY_DATABASE
+from myoutbrain.local_core import (
+    knowledge_view_paths_for_memory,
+    LocalMemoryCore,
+    MEMORY_DATABASE,
+    redacted_event_journal_change,
+)
 from myoutbrain.persistence import (
     atomic_commit,
     permanent_deletion_cleanup_change,
@@ -321,7 +326,9 @@ class V2MemoryLifecycleService:
             existing_marker = _erasure_marker(database_path, normalized_memory_id)
             if existing_marker is not None:
                 return existing_marker
-            impact = _erasure_impact(database_path, normalized_memory_id)
+            impact, database_confirmation_token = _erasure_impact(
+                self._root, database_path, normalized_memory_id
+            )
             if confirmation is None:
                 return impact
             if confirmation != impact["confirmation_token"]:
@@ -331,16 +338,31 @@ class V2MemoryLifecycleService:
             staged_database, result, object_references = _stage_erasure(
                 database_path,
                 impact=impact,
+                database_confirmation_token=database_confirmation_token,
                 entrance=normalized_entrance,
             )
+            view_paths = _impact_string_tuple(impact, "view_paths")
+            sensitive_ids = _erasure_sensitive_ids(impact)
+            audit_event = cast(dict[str, object], result["audit_event"])
+            deletion_event = {
+                "id": audit_event["event_id"],
+                "type": "memory.erased",
+                "occurred_at": audit_event["occurred_at"],
+                "subject_tombstone": cast(list[str], result["tombstone_ids"])[0],
+            }
             atomic_commit(
                 self._root,
                 [
                     (database_path, staged_database),
+                    redacted_event_journal_change(
+                        self._root,
+                        sensitive_ids=sensitive_ids,
+                        deletion_event=deletion_event,
+                    ),
                     permanent_deletion_cleanup_change(
                         self._root,
                         object_references=object_references,
-                        view_paths=(),
+                        view_paths=view_paths,
                     ),
                 ],
             )
@@ -1173,12 +1195,44 @@ def _availability_result(
     }
 
 
-def _erasure_impact(database_path: Path, memory_id: str) -> dict[str, object]:
+def _erasure_impact(
+    root: Path,
+    database_path: Path,
+    memory_id: str,
+) -> tuple[dict[str, object], str]:
     try:
         with closing(sqlite3.connect(database_path)) as connection:
-            return _erasure_impact_for_connection(connection, memory_id)
+            impact = _erasure_impact_for_connection(connection, memory_id)
     except sqlite3.Error as error:
         raise IntegrityError("cannot preview permanent erasure") from error
+    database_confirmation_token = cast(str, impact["confirmation_token"])
+    memory_ids = _impact_string_tuple(impact, "memory_ids")
+    view_paths = tuple(
+        sorted(
+            {
+                path
+                for affected_memory_id in memory_ids
+                for path in knowledge_view_paths_for_memory(root, affected_memory_id)
+            }
+        )
+    )
+    sensitive_ids = _erasure_sensitive_ids(impact)
+    journal_event_hashes = _journal_redaction_hashes(root, sensitive_ids)
+    impact["view_paths"] = list(view_paths)
+    impact["journal_event_hashes"] = list(journal_event_hashes)
+    impact["confirmation_token"] = "erase_" + hashlib.sha256(
+        json.dumps(
+            {
+                "database_confirmation_token": database_confirmation_token,
+                "view_paths": view_paths,
+                "journal_event_hashes": journal_event_hashes,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return impact, database_confirmation_token
 
 
 def _erasure_impact_for_connection(
@@ -1363,6 +1417,11 @@ def _erasure_impact_for_connection(
         if isinstance(row[0], str)
     )
     proposal_id_set = set(_erasure_proposal_ids(connection, memory_ids))
+    erased_receipt_versions = frozenset(
+        (cast(str, item["source_id"]), cast(int, item["source_version"]))
+        for item in source_impacts
+        if item["action"] == "erase-receipt"
+    )
     for table, column, values in (
         ("integration_proposal_sources", "source_id", erased_source_ids_tuple),
         ("integration_proposal_buffered", "digest_id", digest_ids),
@@ -1374,6 +1433,16 @@ def _erasure_impact_for_connection(
             )
             if isinstance(row[0], str)
         )
+    proposal_id_set.update(
+        _unified_proposal_closure(
+            connection,
+            seed_proposal_ids=frozenset(proposal_id_set),
+            sensitive_ids=frozenset(
+                (*memory_ids, *erased_source_ids_tuple, *experience_ids, *digest_ids)
+            ),
+            receipt_versions=erased_receipt_versions,
+        )
+    )
     proposal_ids = tuple(sorted(proposal_id_set))
     batch_ids = tuple(
         sorted(
@@ -1388,6 +1457,33 @@ def _erasure_impact_for_connection(
             if isinstance(row[0], str)
         )
     )
+    review_batch_impacts: list[dict[str, object]] = []
+    for batch_id in batch_ids:
+        item_ids = tuple(
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT proposal_id FROM review_batch_items
+                WHERE batch_id = ? ORDER BY proposal_id
+                """,
+                (batch_id,),
+            ).fetchall()
+            if isinstance(row[0], str)
+        )
+        review_batch_impacts.append(
+            {
+                "batch_id": batch_id,
+                "affected_proposal_ids": [
+                    proposal_id for proposal_id in item_ids
+                    if proposal_id in proposal_id_set
+                ],
+                "action": (
+                    "delete" if all(
+                        proposal_id in proposal_id_set for proposal_id in item_ids
+                    ) else "redact-shared"
+                ),
+            }
+        )
     group_ids = tuple(
         sorted(
             row[0]
@@ -1534,6 +1630,7 @@ def _erasure_impact_for_connection(
         "digest_ids": digest_ids,
         "proposal_ids": proposal_ids,
         "review_batch_ids": batch_ids,
+        "review_batch_impacts": review_batch_impacts,
         "review_group_ids": group_ids,
         "recall_ids": recall_ids,
         "relation_impacts": relation_impacts,
@@ -1562,6 +1659,7 @@ def _erasure_impact_for_connection(
         "digest_ids": list(digest_ids),
         "proposal_ids": list(proposal_ids),
         "review_batch_ids": list(batch_ids),
+        "review_batch_impacts": review_batch_impacts,
         "review_group_ids": list(group_ids),
         "recall_ids": list(recall_ids),
         "relation_impacts": relation_impacts,
@@ -1582,6 +1680,7 @@ def _stage_erasure(
     database_path: Path,
     *,
     impact: dict[str, object],
+    database_confirmation_token: str,
     entrance: str,
 ) -> tuple[bytes, dict[str, object], tuple[str, ...]]:
     temporary_path: Path | None = None
@@ -1623,7 +1722,7 @@ def _stage_erasure(
             )
             target_memory_id = memory_ids[0]
             current_impact = _erasure_impact_for_connection(connection, target_memory_id)
-            if current_impact["confirmation_token"] != impact["confirmation_token"]:
+            if current_impact["confirmation_token"] != database_confirmation_token:
                 raise UserInputError("permanent erasure impact closure changed")
             exclusive_capsule_ids: list[str] = []
             shared_capsule_updates: list[tuple[int, int, str]] = []
@@ -1669,6 +1768,8 @@ def _stage_erasure(
                     connection.execute(
                         "DELETE FROM review_batches WHERE batch_id = ?", (batch_id,)
                     )
+                else:
+                    _redact_review_batch(connection, batch_id)
             for group_id in group_ids:
                 if connection.execute(
                     "SELECT 1 FROM review_group_members WHERE group_id = ? LIMIT 1",
@@ -1936,6 +2037,145 @@ def _erasure_proposal_ids(
     return tuple(row[0] for row in rows if isinstance(row[0], str))
 
 
+def _unified_proposal_closure(
+    connection: sqlite3.Connection,
+    *,
+    seed_proposal_ids: frozenset[str],
+    sensitive_ids: frozenset[str],
+    receipt_versions: frozenset[tuple[str, int]],
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        """
+        SELECT proposal_id, target_json, supporting_evidence_json,
+               opposing_evidence_json, dependencies_json,
+               near_proposal_ids_json, conflict_proposal_ids_json
+        FROM review_proposals ORDER BY proposal_id
+        """
+    ).fetchall()
+    parsed_rows: list[tuple[str, tuple[object, ...]]] = []
+    try:
+        for row in rows:
+            if not isinstance(row[0], str) or not all(
+                isinstance(value, str) for value in row[1:]
+            ):
+                raise TypeError
+            parsed_rows.append(
+                (row[0], tuple(json.loads(cast(str, value)) for value in row[1:]))
+            )
+    except (json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError("unified proposal erasure references are invalid") from error
+    affected = set(seed_proposal_ids) | {
+        proposal_id
+        for proposal_id, documents in parsed_rows
+        if any(
+            _json_references_erasure(
+                document,
+                sensitive_ids=sensitive_ids,
+                receipt_versions=receipt_versions,
+            )
+            for document in documents[:3]
+        )
+    }
+    changed = True
+    while changed:
+        changed = False
+        for proposal_id, documents in parsed_rows:
+            if proposal_id in affected:
+                continue
+            if any(_json_contains_exact(document, frozenset(affected)) for document in documents[3:]):
+                affected.add(proposal_id)
+                changed = True
+    return tuple(sorted(affected))
+
+
+def _json_references_erasure(
+    value: object,
+    *,
+    sensitive_ids: frozenset[str],
+    receipt_versions: frozenset[tuple[str, int]],
+) -> bool:
+    if isinstance(value, dict):
+        source_id = value.get("source_id")
+        source_version = value.get("source_version")
+        if (
+            isinstance(source_id, str)
+            and isinstance(source_version, int)
+            and (source_id, source_version) in receipt_versions
+        ):
+            return True
+        return any(
+            _json_references_erasure(
+                item,
+                sensitive_ids=sensitive_ids,
+                receipt_versions=receipt_versions,
+            )
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _json_references_erasure(
+                item,
+                sensitive_ids=sensitive_ids,
+                receipt_versions=receipt_versions,
+            )
+            for item in value
+        )
+    return isinstance(value, str) and value in sensitive_ids
+
+
+def _json_contains_exact(value: object, identifiers: frozenset[str]) -> bool:
+    if isinstance(value, dict):
+        return any(_json_contains_exact(item, identifiers) for item in value.values())
+    if isinstance(value, list):
+        return any(_json_contains_exact(item, identifiers) for item in value)
+    return isinstance(value, str) and value in identifiers
+
+
+def _redact_review_batch(connection: sqlite3.Connection, batch_id: str) -> None:
+    outcomes: list[dict[str, object]] = []
+    try:
+        for row in connection.execute(
+            """
+            SELECT outcome_json FROM review_batch_items
+            WHERE batch_id = ? ORDER BY proposal_id
+            """,
+            (batch_id,),
+        ).fetchall():
+            outcome = json.loads(row[0])
+            if not isinstance(outcome, dict):
+                raise TypeError
+            outcomes.append({str(key): value for key, value in outcome.items()})
+    except (json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError("shared review batch outcome is invalid") from error
+    failed_count = sum(outcome.get("status") == "failed" for outcome in outcomes)
+    status = (
+        "complete" if failed_count == 0
+        else "failed" if failed_count == len(outcomes)
+        else "partial"
+    )
+    connection.execute(
+        """
+        UPDATE review_batches SET status = ?, result_json = ?
+        WHERE batch_id = ?
+        """,
+        (
+            status,
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "status": status,
+                    "partial_success": 0 < failed_count < len(outcomes),
+                    "outcomes": outcomes,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            batch_id,
+        ),
+    )
+
+
 def _delete_review_proposals(
     connection: sqlite3.Connection,
     proposal_ids: tuple[str, ...],
@@ -1985,6 +2225,66 @@ def _impact_string_tuple(
     ):
         raise IntegrityError(f"permanent erasure {key} impact is invalid")
     return tuple(cast(list[str], value))
+
+
+def _erasure_sensitive_ids(impact: dict[str, object]) -> tuple[str, ...]:
+    identifiers: set[str] = set()
+    for key in (
+        "memory_ids",
+        "fully_erased_receipt_source_ids",
+        "experience_ids",
+        "digest_ids",
+        "proposal_ids",
+        "review_batch_ids",
+        "review_group_ids",
+        "recall_ids",
+        "lifecycle_event_ids",
+        "memory_event_ids",
+    ):
+        identifiers.update(_impact_string_tuple(impact, key))
+    legacy_source_impacts = impact.get("legacy_source_impacts")
+    if not isinstance(legacy_source_impacts, list):
+        raise IntegrityError("permanent erasure legacy source impact is invalid")
+    for item in legacy_source_impacts:
+        if not isinstance(item, dict):
+            raise IntegrityError("permanent erasure legacy source impact is invalid")
+        if item.get("action") == "erase-object":
+            source_id = item.get("source_id")
+            if not isinstance(source_id, str):
+                raise IntegrityError("permanent erasure legacy source impact is invalid")
+            identifiers.add(source_id)
+    source_impacts = impact.get("source_impacts")
+    if not isinstance(source_impacts, list):
+        raise IntegrityError("permanent erasure source impact is invalid")
+    for item in source_impacts:
+        if not isinstance(item, dict):
+            raise IntegrityError("permanent erasure source impact is invalid")
+        if item.get("action") == "erase-receipt":
+            source_id = item.get("source_id")
+            if not isinstance(source_id, str):
+                raise IntegrityError("permanent erasure source impact is invalid")
+            identifiers.add(source_id)
+    return tuple(sorted(identifiers))
+
+
+def _journal_redaction_hashes(
+    root: Path,
+    sensitive_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    journal_path = root / "store" / "journal" / "events.jsonl"
+    identifiers = frozenset(sensitive_ids)
+    hashes: list[str] = []
+    try:
+        if journal_path.is_file():
+            for line in journal_path.read_text(encoding="utf-8").splitlines():
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError
+                if _json_contains_exact(event, identifiers):
+                    hashes.append(_stable_hash(event))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError(f"cannot inspect event journal: {journal_path}") from error
+    return tuple(hashes)
 
 
 def _delete_for_values(
