@@ -115,7 +115,7 @@ class AskFromEvidencePackageTests(unittest.TestCase):
             self.assertIn("OPENAI_API_KEY", result.stderr)
             self.assertNotIn("generation configuration", result.stderr)
 
-    def test_reinitializing_a_legacy_library_persists_generation_defaults(self) -> None:
+    def test_reinitializing_a_v2_instance_persists_generation_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             library_root = Path(temporary_directory) / "My Knowledge"
             library_root.mkdir()

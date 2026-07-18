@@ -665,43 +665,32 @@ class LocalMemoryCore:
         database_path = self._root / MEMORY_DATABASE
         with writer_lock(self._root):
             recover_transactions(self._root)
-            if database_path.exists():
-                version = self._database_version(database_path)
-                if version == 1:
-                    migrated = self._migrate_v1_database(database_path)
-                    atomic_commit(self._root, [(database_path, migrated)])
-                    version = 2
-                if version == 2:
-                    migrated = self._migrate_v2_database(database_path)
-                    atomic_commit(self._root, [(database_path, migrated)])
-                    version = 3
-                if version == 3:
-                    migrated = self._migrate_v3_database(database_path)
-                    atomic_commit(self._root, [(database_path, migrated)])
-                    version = 4
-                if version == 4:
-                    migrated = self._migrate_v4_database(database_path)
-                    atomic_commit(self._root, [(database_path, migrated)])
-                    version = 5
-                if version == 5:
-                    migrated = self._migrate_v5_database(database_path)
-                    atomic_commit(self._root, [(database_path, migrated)])
-                self._validate_database(database_path)
-                return
-            database_content = self._new_database_content(database_path.parent)
-            atomic_commit(self._root, [(database_path, database_content)])
+            database_change = self._database_initialization_change(database_path)
+            if database_change is not None:
+                atomic_commit(self._root, [database_change])
 
-    def initialization_change(self) -> tuple[Path, bytes] | None:
-        """Prepare a clean V2 database without upgrading an existing schema."""
+    def commit_v2_initialization(
+        self,
+        *,
+        configuration_content: bytes | None,
+        git_ignore_content: bytes | None,
+    ) -> None:
+        """Atomically coordinate every durable file in V2 initialization."""
+        changes: list[tuple[Path, bytes]] = []
+        if configuration_content is not None:
+            changes.append((self._root / "myoutbrain.toml", configuration_content))
         database_path = self._root / MEMORY_DATABASE
-        if database_path.exists():
-            if not database_path.is_file():
-                raise ConfigurationConflict(
-                    f"expected a canonical database at: {database_path}"
-                )
-            self._validate_database(database_path)
-            return None
-        return database_path, self._new_database_content(database_path.parent)
+        database_change = self._database_initialization_change(database_path)
+        if database_change is not None:
+            changes.append(database_change)
+        if git_ignore_content is not None:
+            changes.append((self._root / ".gitignore", git_ignore_content))
+        if changes:
+            atomic_commit(
+                self._root,
+                changes,
+                fault_injections={0: "initialize-after-configuration"},
+            )
 
     def inspect_schema_version(self) -> int:
         database_path = self._root / MEMORY_DATABASE
@@ -711,6 +700,87 @@ class LocalMemoryCore:
             )
         self._validate_database(database_path)
         return MEMORY_SCHEMA_VERSION
+
+    def inspect_object_store(self) -> None:
+        object_store = self._root / "store" / "objects" / "sha256"
+        if not object_store.is_dir():
+            raise IntegrityError(
+                f"content-addressed object store is missing: {object_store}"
+            )
+        for object_path in object_store.rglob("*"):
+            if not object_path.is_file():
+                continue
+            digest = object_path.name
+            relative_parts = object_path.relative_to(object_store).parts
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or relative_parts != (digest[:2], digest[2:4], digest)
+            ):
+                raise IntegrityError(
+                    f"invalid content-addressed object path: {object_path}"
+                )
+            try:
+                actual_digest = hashlib.sha256(object_path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise IntegrityError(
+                    f"cannot read content-addressed object: {object_path}"
+                ) from error
+            if actual_digest != digest:
+                raise IntegrityError(
+                    f"content-addressed object hash mismatch: {object_path}"
+                )
+
+    def _database_initialization_change(
+        self,
+        database_path: Path,
+    ) -> tuple[Path, bytes] | None:
+        if not database_path.exists():
+            return database_path, self._new_database_content(database_path.parent)
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"expected a canonical database at: {database_path}"
+            )
+        version = self._database_version(database_path)
+        if version == MEMORY_SCHEMA_VERSION:
+            self._validate_database(database_path)
+            return None
+        return database_path, self._upgraded_database_content(database_path)
+
+    def _upgraded_database_content(self, database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        migrators = {
+            1: self._migrate_v1_database,
+            2: self._migrate_v2_database,
+            3: self._migrate_v3_database,
+            4: self._migrate_v4_database,
+            5: self._migrate_v5_database,
+        }
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-upgrade.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            version = self._database_version(temporary_path)
+            while version != MEMORY_SCHEMA_VERSION:
+                migrator = migrators.get(version)
+                if migrator is None:
+                    raise ConfigurationConflict(
+                        f"unsupported memory schema version {version}: {database_path}"
+                    )
+                temporary_path.write_bytes(migrator(temporary_path))
+                version = self._database_version(temporary_path)
+            self._validate_database(temporary_path)
+            return temporary_path.read_bytes()
+        except OSError as error:
+            raise IntegrityError("cannot stage the local memory database upgrade") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def capture_experience(
         self,

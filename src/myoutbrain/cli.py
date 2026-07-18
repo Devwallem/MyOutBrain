@@ -481,23 +481,22 @@ def _initialize(root: Path, output_format: str) -> int:
 
 
 def _instance_status(root: Path, output_format: str) -> int:
-    status = KnowledgeWorkflow(root).instance_status().to_data()
+    status = KnowledgeWorkflow(root).instance_status()
     if output_format == "json":
-        print(json.dumps(status, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(status.to_data(), ensure_ascii=False, sort_keys=True))
     else:
-        integrity = status["integrity"]
-        write = status["write"]
-        if not isinstance(integrity, dict) or not isinstance(write, dict):
-            raise IntegrityError("instance status response is invalid")
-        print(f"MyOutBrain V{status['instance_version']} schema {status['schema_version']}")
-        print(f"Canonical store: {integrity['canonical_store']}")
-        print(f"Object store: {integrity['object_store']}")
+        print(
+            f"MyOutBrain V2 canonical schema "
+            f"{status.canonical_schema_version or 'unavailable'}"
+        )
+        print(f"Canonical store: {status.canonical_store_integrity}")
+        print(f"Object store: {status.object_store_integrity}")
         print(
             "Writer: "
-            + ("available" if write["available"] else "locked")
-            + f" ({write['mode']})"
+            + ("available" if status.write_available else "locked")
+            + " (single-writer)"
         )
-        print(f"Integrity: {integrity['overall']}")
+        print(f"Integrity: {status.overall_integrity}")
     return 0
 
 

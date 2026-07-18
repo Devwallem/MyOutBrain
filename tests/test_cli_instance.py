@@ -28,7 +28,7 @@ class V2InstanceLifecycleTests(unittest.TestCase):
                 json.loads(status.stdout),
                 {
                     "instance_version": 2,
-                    "schema_version": 6,
+                    "canonical_schema_version": 6,
                     "write": {
                         "available": True,
                         "mode": "single-writer",
@@ -117,6 +117,20 @@ class V2InstanceLifecycleTests(unittest.TestCase):
                     "MYOUTBRAIN_FAULT_INJECTION": "initialize-after-configuration"
                 },
             )
+            interrupted_status = run_cli(
+                "status",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            configuration_remained = (instance_root / "myoutbrain.toml").exists()
+            database_remained = (
+                instance_root / "store" / "memory.sqlite3"
+            ).exists()
+            remaining_transactions = tuple(
+                (instance_root / "store" / "transactions").iterdir()
+            )
             recovered = run_cli("init", "--root", str(instance_root))
             status = run_cli(
                 "status",
@@ -127,10 +141,52 @@ class V2InstanceLifecycleTests(unittest.TestCase):
             )
 
             self.assertEqual(interrupted.returncode, 86)
+            self.assertEqual(interrupted_status.returncode, 3)
+            self.assertFalse(configuration_remained)
+            self.assertFalse(database_remained)
+            self.assertEqual(remaining_transactions, ())
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
             self.assertEqual(status.returncode, 0, status.stderr)
             self.assertEqual(json.loads(status.stdout)["integrity"]["overall"], "ok")
             self.assertEqual(json.loads(status.stdout)["instance_version"], 2)
+
+    def test_status_reports_a_corrupt_content_addressed_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            source = temporary_root / "Source.md"
+            source.write_text("Content-addressed evidence.\n", encoding="utf-8")
+            initialized = run_cli("init", "--root", str(instance_root))
+            captured = run_cli(
+                "capture",
+                str(source),
+                "--root",
+                str(instance_root),
+                "--sensitivity",
+                "local-only",
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            object_path = next(
+                path
+                for path in (instance_root / "store" / "objects" / "sha256").rglob("*")
+                if path.is_file()
+            )
+            object_path.write_bytes(b"corrupt")
+
+            status = run_cli(
+                "status",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(status.returncode, 0, status.stderr)
+            integrity = json.loads(status.stdout)["integrity"]
+            self.assertEqual(integrity["canonical_store"], "ok")
+            self.assertEqual(integrity["object_store"], "corrupt")
+            self.assertEqual(integrity["overall"], "degraded")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,6 @@ from myoutbrain.generation import (
 )
 from myoutbrain.embeddings import (
     DEFAULT_LOCAL_EMBEDDING_SPACE,
-    prepare_default_local_embedding_model,
 )
 from myoutbrain.candidates import (
     CandidateRecord,
@@ -91,7 +90,8 @@ INITIAL_DIRECTORIES = (
 )
 
 INSTANCE_VERSION = 2
-SCHEMA_VERSION = 1
+CONFIGURATION_SCHEMA_VERSION = 1
+SOURCE_RECORD_SCHEMA_VERSION = 1
 PERMANENT_STORAGE = ("vault", "store")
 REBUILDABLE_STORAGE = ("runtime",)
 DEFAULT_GENERATION_PROVIDER = "openai"
@@ -151,21 +151,37 @@ class GenerationContext:
 
 @dataclass(frozen=True)
 class InstanceStatus:
-    schema_version: int
+    canonical_schema_version: int | None
     write_available: bool
+    canonical_store_integrity: Literal["ok", "corrupt"]
+    object_store_integrity: Literal["ok", "corrupt", "unchecked"]
+
+    @property
+    def overall_integrity(self) -> Literal["ok", "degraded", "unchecked"]:
+        if (
+            self.canonical_store_integrity == "ok"
+            and self.object_store_integrity == "ok"
+        ):
+            return "ok"
+        if (
+            self.canonical_store_integrity == "corrupt"
+            or self.object_store_integrity == "corrupt"
+        ):
+            return "degraded"
+        return "unchecked"
 
     def to_data(self) -> dict[str, object]:
         return {
             "instance_version": INSTANCE_VERSION,
-            "schema_version": self.schema_version,
+            "canonical_schema_version": self.canonical_schema_version,
             "write": {
                 "available": self.write_available,
                 "mode": "single-writer",
             },
             "integrity": {
-                "canonical_store": "ok",
-                "object_store": "ok",
-                "overall": "ok",
+                "canonical_store": self.canonical_store_integrity,
+                "object_store": self.object_store_integrity,
+                "overall": self.overall_integrity,
             },
         }
 
@@ -221,7 +237,7 @@ class SourceRecord:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise TypeError("source record is not an object")
-            if data.get("schema_version") != SCHEMA_VERSION:
+            if data.get("schema_version") != SOURCE_RECORD_SCHEMA_VERSION:
                 raise ValueError("source record has an invalid schema version")
             if data.get("id") != expected_source_id:
                 raise ValueError("source record identity does not match its path")
@@ -276,7 +292,7 @@ class SourceRecord:
 
     def to_data(self) -> dict[str, object]:
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": SOURCE_RECORD_SCHEMA_VERSION,
             "id": self.source_id,
             "kind": "source",
             "state": "active",
@@ -293,7 +309,7 @@ def _render_initial_configuration() -> str:
     rebuildable = ", ".join(f'"{name}"' for name in REBUILDABLE_STORAGE)
     return (
         f"instance_version = {INSTANCE_VERSION}\n"
-        f"schema_version = {SCHEMA_VERSION}\n"
+        f"schema_version = {CONFIGURATION_SCHEMA_VERSION}\n"
         "single_writer = true\n\n"
         "[storage]\n"
         f"permanent = [{permanent}]\n"
@@ -316,6 +332,7 @@ def _render_default_generation_configuration() -> str:
 def _render_default_embedding_configuration() -> str:
     return (
         "[embedding]\n"
+        "enabled = false\n"
         f'provider = "{DEFAULT_LOCAL_EMBEDDING_SPACE.provider}"\n'
         f'model = "{DEFAULT_LOCAL_EMBEDDING_SPACE.model}"\n'
         f"dimensions = {DEFAULT_LOCAL_EMBEDDING_SPACE.dimensions}\n"
@@ -376,7 +393,7 @@ def _load_validated_configuration(path: Path) -> dict[str, object]:
             "existing workspace is not a V2 private instance; "
             "initialize a clean V2 instance instead"
         )
-    if configuration.get("schema_version") != SCHEMA_VERSION:
+    if configuration.get("schema_version") != CONFIGURATION_SCHEMA_VERSION:
         raise ConfigurationConflict("unsupported schema_version in existing configuration")
     if configuration.get("single_writer") is not True:
         raise ConfigurationConflict("existing configuration must enable single_writer")
@@ -514,30 +531,18 @@ class KnowledgeWorkflow:
             for relative_path in INITIAL_DIRECTORIES:
                 (root / relative_path).mkdir(parents=True, exist_ok=True)
             updated_git_ignore = _with_required_git_ignore_rules(existing_git_ignore)
-            changes: list[tuple[Path, bytes]] = []
+            configuration_content: bytes | None = None
             if not configuration.exists():
-                changes.append(
-                    (
-                        configuration,
-                        _render_initial_configuration().encode("utf-8"),
-                    )
-                )
+                configuration_content = _render_initial_configuration().encode("utf-8")
             elif migrated_configuration is not None:
-                changes.append(
-                    (configuration, migrated_configuration.encode("utf-8"))
-                )
-            database_change = LocalMemoryCore(root).initialization_change()
-            if database_change is not None:
-                changes.append(database_change)
+                configuration_content = migrated_configuration.encode("utf-8")
+            git_ignore_content: bytes | None = None
             if updated_git_ignore != existing_git_ignore:
-                changes.append((git_ignore, updated_git_ignore.encode("utf-8")))
-            if changes:
-                _atomic_commit(
-                    root,
-                    changes,
-                    fault_injections={0: "initialize-after-configuration"},
-                )
-        prepare_default_local_embedding_model()
+                git_ignore_content = updated_git_ignore.encode("utf-8")
+            LocalMemoryCore(root).commit_v2_initialization(
+                configuration_content=configuration_content,
+                git_ignore_content=git_ignore_content,
+            )
 
     def instance_status(self) -> InstanceStatus:
         configuration = self._root / "myoutbrain.toml"
@@ -546,20 +551,36 @@ class KnowledgeWorkflow:
                 f"MyOutBrain is not initialized at: {self._root}"
             )
         _load_validated_configuration(configuration)
-        object_store = self._root / "store" / "objects" / "sha256"
-        if not object_store.is_dir():
-            raise IntegrityError(f"content-addressed object store is missing: {object_store}")
         try:
             with _writer_lock(self._root):
                 _recover_transactions(self._root)
-                schema_version = LocalMemoryCore(self._root).inspect_schema_version()
+                if not configuration.is_file():
+                    raise ConfigurationConflict(
+                        f"MyOutBrain is not initialized at: {self._root}"
+                    )
             write_available = True
         except WriterLocked:
-            schema_version = LocalMemoryCore(self._root).inspect_schema_version()
             write_available = False
+        core = LocalMemoryCore(self._root)
+        try:
+            schema_version = core.inspect_schema_version()
+            canonical_store_integrity: Literal["ok", "corrupt"] = "ok"
+        except (ConfigurationConflict, IntegrityError):
+            schema_version = None
+            canonical_store_integrity = "corrupt"
+        if write_available:
+            try:
+                core.inspect_object_store()
+                object_store_integrity: Literal["ok", "corrupt", "unchecked"] = "ok"
+            except IntegrityError:
+                object_store_integrity = "corrupt"
+        else:
+            object_store_integrity = "unchecked"
         return InstanceStatus(
-            schema_version=schema_version,
+            canonical_schema_version=schema_version,
             write_available=write_available,
+            canonical_store_integrity=canonical_store_integrity,
+            object_store_integrity=object_store_integrity,
         )
 
     def capture(self, source_path: Path, sensitivity: Sensitivity) -> CaptureResult:
