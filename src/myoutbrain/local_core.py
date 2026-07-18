@@ -39,6 +39,20 @@ from myoutbrain.persistence import (
     writer_lock,
 )
 from myoutbrain.retrieval import lexical_terms
+from myoutbrain.unified_review import (
+    ReviewProposalInput,
+    ReviewProposalSubmission,
+    ReviewBatchRequest,
+    ReviewBatchResult,
+    ReviewExpirationResult,
+    ReviewQueue,
+    UNIFIED_REVIEW_SCHEMA,
+    read_review_queue,
+    register_source_memory_proposal,
+    stage_review_batch,
+    stage_review_expiration,
+    stage_review_proposal,
+)
 
 
 MEMORY_SCHEMA_VERSION = 8
@@ -395,7 +409,7 @@ CREATE TABLE deletion_markers (
     deleted_at TEXT NOT NULL,
     backup_exclusion_after TEXT NOT NULL
 );
-"""
+""" + UNIFIED_REVIEW_SCHEMA
 
 
 MemoryDisposition = Literal["buffered", "duplicate"]
@@ -1148,6 +1162,87 @@ class LocalMemoryCore:
                 fault_injections={0: "source-memory-approval-after-database"},
             )
         return approval
+
+    def submit_review_proposal(
+        self,
+        payload: ReviewProposalInput,
+        *,
+        idempotency_key: str,
+    ) -> ReviewProposalSubmission:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, submission = stage_review_proposal(
+                database_path,
+                payload,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return submission
+
+    def review_queue(self) -> ReviewQueue:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        self._validate_database(database_path)
+        return read_review_queue(database_path)
+
+    def decide_review_batch(
+        self,
+        request: ReviewBatchRequest,
+        *,
+        idempotency_key: str,
+        entrance: str,
+    ) -> ReviewBatchResult:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_review_batch(
+                database_path,
+                request,
+                idempotency_key=idempotency_key,
+                entrance=entrance,
+            )
+            atomic_commit(
+                self._root,
+                [(database_path, staged_database)],
+                fault_injections={0: "review-batch-after-database"},
+            )
+        return result
+
+    def expire_review_proposals(
+        self,
+        *,
+        as_of: str,
+        retention_days: int = 90,
+    ) -> ReviewExpirationResult:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_review_expiration(
+                database_path,
+                as_of=as_of,
+                retention_days=retention_days,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
 
     def _database_initialization_change(
         self,
@@ -2699,6 +2794,24 @@ class LocalMemoryCore:
                         request_hash,
                     ),
                 )
+                register_source_memory_proposal(
+                    connection,
+                    proposal_id=proposal_id,
+                    planned_memory_id=planned_memory_id,
+                    canonical_name=canonical_name,
+                    body=body,
+                    applicability_scope=applicability_scope,
+                    source={
+                        "source_id": source_id,
+                        "version": source_version,
+                        "content_hash": content_hash,
+                        "locator": locator,
+                        "observed_at": created_at,
+                        "applicability_scope": applicability_scope,
+                        "retention": "receipt",
+                    },
+                    created_at=created_at,
+                )
                 connection.commit()
             proposal = SourceMemoryProposal(
                 proposal_id=proposal_id,
@@ -3079,6 +3192,28 @@ class LocalMemoryCore:
                         applied_at,
                     ),
                 )
+                if connection.execute(
+                    "SELECT 1 FROM review_proposals WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone() is not None:
+                    connection.execute(
+                        """
+                        UPDATE review_proposals
+                        SET status = 'applied', updated_at = ?, last_error = NULL
+                        WHERE proposal_id = ? AND status = 'pending'
+                        """,
+                        (applied_at, proposal_id),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO review_materializations
+                            (proposal_id, artifact_kind, artifact_id, authorship,
+                             personal_cognition, final_content_hash, created_at)
+                        VALUES (?, 'canonical-memory', ?,
+                                'creator-approved-integration', 0, ?, ?)
+                        """,
+                        (proposal_id, memory_id, _stable_hash(body), applied_at),
+                    )
                 connection.commit()
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise IntegrityError("memory approval left a dangling reference")
@@ -3883,7 +4018,6 @@ class LocalMemoryCore:
                         FOREIGN KEY (source_id, source_version)
                             REFERENCES evidence_source_versions(source_id, version)
                     );
-                    PRAGMA user_version = 8;
                     """
                 )
                 fts_rows = connection.execute(
@@ -3923,6 +4057,56 @@ class LocalMemoryCore:
                         for row in fts_rows
                     ),
                 )
+                connection.executescript(UNIFIED_REVIEW_SCHEMA)
+                pending_source_rows = connection.execute(
+                    """
+                    SELECT detail.proposal_id, detail.planned_memory_id,
+                           detail.canonical_name, proposal.proposed_understanding,
+                           detail.applicability_scope, detail.source_id,
+                           detail.source_version, version.content_hash,
+                           version.locator, version.observed_at,
+                           version.applicability_scope, version.retention,
+                           proposal.created_at
+                    FROM source_memory_proposal_details AS detail
+                    JOIN integration_proposals AS proposal
+                      ON proposal.proposal_id = detail.proposal_id
+                    JOIN evidence_source_versions AS version
+                      ON version.source_id = detail.source_id
+                     AND version.version = detail.source_version
+                    WHERE proposal.status = 'pending'
+                    ORDER BY proposal.created_at, proposal.proposal_id
+                    """
+                ).fetchall()
+                for row in pending_source_rows:
+                    if (
+                        not all(
+                            isinstance(row[index], str)
+                            for index in (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12)
+                        )
+                        or not isinstance(row[6], int)
+                    ):
+                        raise IntegrityError(
+                            "cannot migrate an invalid source memory proposal"
+                        )
+                    register_source_memory_proposal(
+                        connection,
+                        proposal_id=row[0],
+                        planned_memory_id=row[1],
+                        canonical_name=row[2],
+                        body=row[3],
+                        applicability_scope=row[4],
+                        source={
+                            "source_id": row[5],
+                            "version": row[6],
+                            "content_hash": row[7],
+                            "locator": row[8],
+                            "observed_at": row[9],
+                            "applicability_scope": row[10],
+                            "retention": row[11],
+                        },
+                        created_at=row[12],
+                    )
+                connection.execute("PRAGMA user_version = 8")
                 connection.commit()
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:

@@ -60,6 +60,7 @@ from myoutbrain.v2_recall import (
     FixedAnswerabilityEngine,
     V2RecallRequest,
 )
+from myoutbrain.unified_review import load_review_batch, load_review_proposal
 
 
 EXIT_USER = 2
@@ -209,6 +210,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assess_recall_parser.add_argument("--root", type=Path, default=Path.cwd())
     assess_recall_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    review_propose_parser = subcommands.add_parser(
+        "review-propose",
+        help="Submit one complete proposal payload to the unified review queue",
+    )
+    review_propose_parser.add_argument("payload", type=Path)
+    review_propose_parser.add_argument("--idempotency-key", required=True)
+    review_propose_parser.add_argument("--root", type=Path, default=Path.cwd())
+    review_propose_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    review_list_parser = subcommands.add_parser(
+        "review-list",
+        help="List the client-neutral unified review queue",
+    )
+    review_list_parser.add_argument("--root", type=Path, default=Path.cwd())
+    review_list_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    review_batch_parser = subcommands.add_parser(
+        "review-batch",
+        help="Apply one immutable batch of unified review decisions",
+    )
+    review_batch_parser.add_argument("batch", type=Path)
+    review_batch_parser.add_argument("--idempotency-key", required=True)
+    review_batch_parser.add_argument("--entrance", required=True)
+    review_batch_parser.add_argument("--root", type=Path, default=Path.cwd())
+    review_batch_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    review_expire_parser = subcommands.add_parser(
+        "review-expire",
+        help="Compact routine proposals whose active review window has elapsed",
+    )
+    review_expire_parser.add_argument("--as-of", required=True)
+    review_expire_parser.add_argument("--retention-days", type=int, default=90)
+    review_expire_parser.add_argument("--root", type=Path, default=Path.cwd())
+    review_expire_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
@@ -764,6 +804,76 @@ def _assess_recall(
             f"Recall {recall_id} answerable: "
             f"{result['answerability']}"
         )
+    return 0
+
+
+def _review_propose(
+    root: Path,
+    payload_path: Path,
+    *,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    submission = LocalMemoryCore(root).submit_review_proposal(
+        load_review_proposal(payload_path),
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(submission.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Pending review proposal {submission.proposal.proposal_id}")
+    return 0
+
+
+def _review_list(root: Path, output_format: str) -> int:
+    queue = LocalMemoryCore(root).review_queue()
+    if output_format == "json":
+        print(json.dumps(queue.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        for proposal in queue.proposals:
+            print(
+                f"{proposal.payload.priority}: {proposal.proposal_id} "
+                f"[{proposal.payload.intent}/{proposal.payload.formation}] "
+                f"{proposal.payload.title}"
+            )
+    return 0
+
+
+def _review_batch(
+    root: Path,
+    batch_path: Path,
+    *,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = LocalMemoryCore(root).decide_review_batch(
+        load_review_batch(batch_path),
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Review batch {result.to_data()['batch_id']}: {result.to_data()['status']}")
+    return 0
+
+
+def _review_expire(
+    root: Path,
+    *,
+    as_of: str,
+    retention_days: int,
+    output_format: str,
+) -> int:
+    result = LocalMemoryCore(root).expire_review_proposals(
+        as_of=as_of,
+        retention_days=retention_days,
+    )
+    if output_format == "json":
+        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Expired {len(result.expired)} routine review proposal(s).")
     return 0
 
 
@@ -1389,6 +1499,30 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         if parsed_arguments.command == "recall-activity":
             return _recall_activity(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "review-propose":
+            return _review_propose(
+                parsed_arguments.root,
+                parsed_arguments.payload,
+                idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "review-list":
+            return _review_list(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "review-batch":
+            return _review_batch(
+                parsed_arguments.root,
+                parsed_arguments.batch,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "review-expire":
+            return _review_expire(
+                parsed_arguments.root,
+                as_of=parsed_arguments.as_of,
+                retention_days=parsed_arguments.retention_days,
+                output_format=parsed_arguments.format,
+            )
         if parsed_arguments.command == "capture":
             return _capture(
                 parsed_arguments.root,
