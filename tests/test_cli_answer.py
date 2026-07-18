@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import hashlib
 import json
@@ -13,6 +14,18 @@ from myoutbrain.public_search import search_public_sources
 from tests.cli_support import run_cli
 from tests.test_cli_ask import configure_fake_generation
 from tests.test_cli_memory_evolution import accept_new, propose, remember_evidence
+
+
+_PUBLIC_SEARCH_NOW = datetime.now(timezone.utc)
+_RECENTLY_RETRIEVED_AT = (_PUBLIC_SEARCH_NOW - timedelta(minutes=1)).isoformat()
+_RECENTLY_PUBLISHED_AT = (_PUBLIC_SEARCH_NOW - timedelta(days=1)).isoformat()
+_OLDER_CURRENT_PUBLISHED_AT = (
+    _PUBLIC_SEARCH_NOW - timedelta(days=16)
+).isoformat()
+_HISTORICAL_PUBLISHED_AT = (
+    _PUBLIC_SEARCH_NOW - timedelta(days=500)
+).isoformat()
+_STALE_PUBLISHED_AT = (_PUBLIC_SEARCH_NOW - timedelta(days=366)).isoformat()
 
 
 class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
@@ -185,8 +198,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": url,
                             "title": "Product Nova 2 release",
                             "content": "Product Nova 2 launches on 2026-08-01.",
-                            "published_at": "2026-07-16T09:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "official",
                             "fact_key": "nova-2-release-date",
                             "fact_value": "2026-08-01",
@@ -249,8 +262,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                         "source_id": web_source_id,
                         "url": url,
                         "title": "Product Nova 2 release",
-                        "published_at": "2026-07-16T09:00:00+00:00",
-                        "retrieved_at": "2026-07-17T09:00:00+00:00",
+                        "published_at": _RECENTLY_PUBLISHED_AT,
+                        "retrieved_at": _RECENTLY_RETRIEVED_AT,
                         "source_type": "official",
                         "fact_key": "nova-2-release-date",
                         "fact_value": "2026-08-01",
@@ -280,8 +293,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": url,
                             "title": "Partial history",
                             "content": "The archive confirms the project began in 2019.",
-                            "published_at": "2025-01-01T09:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _HISTORICAL_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "reference",
                             "fact_key": "project-start-year",
                             "fact_value": "2019",
@@ -358,8 +371,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertEqual(text_answer.returncode, 0, text_answer.stderr)
             self.assertIn("Public source: Partial history", text_answer.stdout)
             self.assertIn(url, text_answer.stdout)
-            self.assertIn("published 2025-01-01T09:00:00+00:00", text_answer.stdout)
-            self.assertIn("retrieved 2026-07-17T09:00:00+00:00", text_answer.stdout)
+            self.assertIn(f"published {_HISTORICAL_PUBLISHED_AT}", text_answer.stdout)
+            self.assertIn(f"retrieved {_RECENTLY_RETRIEVED_AT}", text_answer.stdout)
 
     def test_local_only_memory_never_reaches_cloud_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -437,8 +450,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": url,
                             "title": "Old schedule",
                             "content": "The launch was once planned for May.",
-                            "published_at": "2025-01-01T09:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _STALE_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "official",
                             "fact_key": "launch-date",
                             "fact_value": "may",
@@ -524,8 +537,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": first_url,
                             "title": "Nova schedule",
                             "content": "Nova launches on August 1.",
-                            "published_at": "2026-07-16T09:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "official",
                             "fact_key": "nova-launch-date",
                             "fact_value": "2026-08-01",
@@ -534,8 +547,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": second_url,
                             "title": "Nova calendar",
                             "content": "Nova launches on August 8.",
-                            "published_at": "2026-07-16T10:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "primary",
                             "fact_key": "nova-launch-date",
                             "fact_value": "2026-08-08",
@@ -644,8 +657,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                                     "url": url,
                                     "title": "Official Atlas review policy",
                                     "content": "Project Atlas is reviewed weekly.",
-                                    "published_at": "2026-07-01T09:00:00+00:00",
-                                    "retrieved_at": "2026-07-17T09:00:00+00:00",
+                                    "published_at": _OLDER_CURRENT_PUBLISHED_AT,
+                                    "retrieved_at": _RECENTLY_RETRIEVED_AT,
                                     "source_type": "official",
                                     "fact_key": "atlas-review-cadence",
                                     "fact_value": "weekly",
@@ -704,8 +717,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                                     "url": url,
                                     "title": "Official Nova release",
                                     "content": "Nova releases on August 1.",
-                                    "published_at": "2026-07-16T09:00:00+00:00",
-                                    "retrieved_at": "2026-07-17T09:00:00+00:00",
+                                    "published_at": _RECENTLY_PUBLISHED_AT,
+                                    "retrieved_at": _RECENTLY_RETRIEVED_AT,
                                     "source_type": "official",
                                     "fact_key": "nova-release-date",
                                     "fact_value": "2026-08-01",
@@ -733,8 +746,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
             self.assertIn(url, answered.stdout)
             self.assertIn("Companion inference: Nova releases", answered.stdout)
             self.assertIn("Evidence origin (public-evidence)", answered.stdout)
-            self.assertIn("published 2026-07-16T09:00:00+00:00", answered.stdout)
-            self.assertIn("retrieved 2026-07-17T09:00:00+00:00", answered.stdout)
+            self.assertIn(f"published {_RECENTLY_PUBLISHED_AT}", answered.stdout)
+            self.assertIn(f"retrieved {_RECENTLY_RETRIEVED_AT}", answered.stdout)
 
     def test_answer_update_inherits_the_strongest_cited_sensitivity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -845,8 +858,8 @@ class AnswerWithPublicResearchFallbackTests(unittest.TestCase):
                             "url": "https://rumor.example/unverified",
                             "title": "Unverified rumor",
                             "content": "A rumor claims the launch is tomorrow.",
-                            "published_at": "2026-07-17T08:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "blog",
                             "fact_key": "launch-date",
                             "fact_value": "tomorrow",

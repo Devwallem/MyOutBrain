@@ -42,11 +42,12 @@ from myoutbrain.v2_recall import (
     V2RecallRequest,
     V2RecallService,
 )
-from myoutbrain.v2_public_research import (
-    PublicAnswerabilityEngine,
-    PublicResearchProvider,
-    V2PublicResearchRequest,
-    V2PublicResearchService,
+from myoutbrain.v2_public_search import (
+    PublicSearchAnswerabilityEngine,
+    PublicSearchProvider,
+    PublicQuerySanitizer,
+    V2PublicSearchRequest,
+    V2PublicSearchService,
 )
 
 
@@ -312,14 +313,16 @@ class MemoryGateway:
             capability_answerability,
         )
 
-    def research_public_v2(
+    def search_public_v2(
         self,
-        request: V2PublicResearchRequest,
-        provider: PublicResearchProvider,
-        answerability_engine: PublicAnswerabilityEngine,
+        request: V2PublicSearchRequest,
+        sanitizer: PublicQuerySanitizer,
+        provider: PublicSearchProvider,
+        answerability_engine: PublicSearchAnswerabilityEngine,
     ) -> dict[str, object]:
-        return V2PublicResearchService(self._root).research(
+        return V2PublicSearchService(self._root).search(
             request,
+            sanitizer,
             provider,
             answerability_engine,
         )

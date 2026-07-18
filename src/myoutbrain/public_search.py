@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
 import hashlib
@@ -200,7 +200,12 @@ def _parse_source(value: object) -> PublicSource:
 def _is_current(source: PublicSource, time_sensitive: bool) -> bool:
     published_at = _parse_time(source.published_at)
     retrieved_at = _parse_time(source.retrieved_at)
-    return published_at <= retrieved_at and (
+    retrieval_age = datetime.now(timezone.utc) - retrieved_at
+    retrieved_now = (
+        published_at <= retrieved_at
+        and timedelta(days=-1) <= retrieval_age <= timedelta(days=1)
+    )
+    return retrieved_now and (
         not time_sensitive or retrieved_at - published_at <= timedelta(days=30)
     )
 

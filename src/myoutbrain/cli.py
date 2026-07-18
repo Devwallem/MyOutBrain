@@ -65,10 +65,12 @@ from myoutbrain.v2_recall import (
     FixedAnswerabilityEngine,
     V2RecallRequest,
 )
-from myoutbrain.v2_public_research import (
-    ConfiguredPublicResearchProvider,
-    FixedPublicAnswerabilityEngine,
-    V2PublicResearchRequest,
+from myoutbrain.v2_public_search import (
+    ConfiguredPublicQuerySanitizer,
+    ConfiguredPublicSearchProvider,
+    FixedPublicSearchAnswerabilityEngine,
+    PublicSearchAssessment,
+    V2PublicSearchRequest,
 )
 from myoutbrain.unified_review import load_review_batch, load_review_proposal
 
@@ -266,22 +268,21 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_reflection_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
-    research_public_parser = subcommands.add_parser(
-        "research-public",
+    search_public_parser = subcommands.add_parser(
+        "search-public",
         help="Continue an insufficient V2 recall with authorized public evidence",
     )
-    research_public_parser.add_argument("recall_id")
-    research_public_parser.add_argument("question")
-    research_public_parser.add_argument("--task", required=True)
-    research_public_parser.add_argument("--public-query", required=True)
-    research_public_parser.add_argument(
-        "--allow-public-research", action="store_true"
+    search_public_parser.add_argument("recall_id")
+    search_public_parser.add_argument("question")
+    search_public_parser.add_argument("--task", required=True)
+    search_public_parser.add_argument(
+        "--allow-public-search", action="store_true"
     )
-    research_public_parser.add_argument("--time-sensitive", action="store_true")
-    research_public_parser.add_argument(
+    search_public_parser.add_argument("--time-sensitive", action="store_true")
+    search_public_parser.add_argument(
         "--answerable", choices=("true", "false"), required=True
     )
-    research_public_parser.add_argument(
+    search_public_parser.add_argument(
         "--answerability-reason",
         choices=(
             "covered",
@@ -292,8 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         required=True,
     )
-    research_public_parser.add_argument("--root", type=Path, default=Path.cwd())
-    research_public_parser.add_argument(
+    search_public_parser.add_argument("--verified-fact", action="append", default=[])
+    search_public_parser.add_argument("--unresolved-gap", action="append", default=[])
+    search_public_parser.add_argument("--next-step", action="append", default=[])
+    search_public_parser.add_argument("--root", type=Path, default=Path.cwd())
+    search_public_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     review_propose_parser = subcommands.add_parser(
@@ -404,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_recall_options(recall_parser, default_format="text")
     answer_parser = subcommands.add_parser(
         "answer",
-        help="Answer from common knowledge with sanitized public-research fallback",
+        help="Answer from common knowledge with sanitized public-search fallback",
     )
     answer_parser.add_argument("question")
     answer_parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -891,33 +895,40 @@ def _assess_recall(
     return 0
 
 
-def _research_public(
+def _search_public(
     root: Path,
     recall_id: str,
     question: str,
     *,
     task: str,
-    public_query: str,
     allowed_for_task: bool,
     time_sensitive: bool,
     answerable: bool,
     answerability_reason: str,
+    verified_facts: Sequence[str],
+    unresolved_gaps: Sequence[str],
+    next_steps: Sequence[str],
     output_format: str,
 ) -> int:
-    result = MemoryGateway(root).research_public_v2(
-        V2PublicResearchRequest(
+    result = MemoryGateway(root).search_public_v2(
+        V2PublicSearchRequest(
             recall_id=recall_id,
             question=question,
             task=task,
-            public_query=public_query,
             allowed_for_task=allowed_for_task,
             time_sensitive=time_sensitive,
         ),
-        ConfiguredPublicResearchProvider(),
-        FixedPublicAnswerabilityEngine(
-            CapabilityAnswerability(
-                answerable=answerable,
-                reason=cast(AnswerabilityReason, answerability_reason),
+        ConfiguredPublicQuerySanitizer(),
+        ConfiguredPublicSearchProvider(),
+        FixedPublicSearchAnswerabilityEngine(
+            PublicSearchAssessment(
+                answerability=CapabilityAnswerability(
+                    answerable=answerable,
+                    reason=cast(AnswerabilityReason, answerability_reason),
+                ),
+                verified_facts=tuple(verified_facts),
+                unresolved_gaps=tuple(unresolved_gaps),
+                next_steps=tuple(next_steps),
             )
         ),
     )
@@ -934,8 +945,8 @@ def _research_public(
             print(f"关键未知：{gap}")
         for step in cast(list[object], result["next_steps"]):
             print(f"验证方向：{step}")
-    public_research = cast(dict[str, object], result["public_research"])
-    for source_value in cast(list[object], public_research["sources"]):
+    public_search = cast(dict[str, object], result["public_search"])
+    for source_value in cast(list[object], public_search["sources"]):
         source = cast(dict[str, object], source_value)
         print(
             f"公开来源：{source['title']} — {source['url']} "
@@ -1723,17 +1734,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 answerability_reason=parsed_arguments.answerability_reason,
                 output_format=parsed_arguments.format,
             )
-        if parsed_arguments.command == "research-public":
-            return _research_public(
+        if parsed_arguments.command == "search-public":
+            return _search_public(
                 parsed_arguments.root,
                 parsed_arguments.recall_id,
                 parsed_arguments.question,
                 task=parsed_arguments.task,
-                public_query=parsed_arguments.public_query,
-                allowed_for_task=parsed_arguments.allow_public_research,
+                allowed_for_task=parsed_arguments.allow_public_search,
                 time_sensitive=parsed_arguments.time_sensitive,
                 answerable=parsed_arguments.answerable == "true",
                 answerability_reason=parsed_arguments.answerability_reason,
+                verified_facts=parsed_arguments.verified_fact,
+                unresolved_gaps=parsed_arguments.unresolved_gap,
+                next_steps=parsed_arguments.next_step,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "recall-activity":

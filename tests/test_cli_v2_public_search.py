@@ -1,18 +1,33 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from myoutbrain.memory_gateway import MemoryGateway
 from myoutbrain.public_search import PublicSource
-from myoutbrain.v2_public_research import V2PublicResearchRequest
+from myoutbrain.v2_public_search import (
+    PublicSearchAssessment,
+    SanitizedPublicQuery,
+    V2PublicSearchRequest,
+)
 from myoutbrain.v2_recall import CapabilityAnswerability, RecallMaterial
 from tests.cli_support import run_cli
 
 
-class V2PublicResearchTests(unittest.TestCase):
+_PUBLIC_SEARCH_NOW = datetime.now(timezone.utc)
+_RECENTLY_RETRIEVED_AT = (_PUBLIC_SEARCH_NOW - timedelta(minutes=1)).isoformat()
+_RECENTLY_PUBLISHED_AT = (_PUBLIC_SEARCH_NOW - timedelta(days=1)).isoformat()
+_HISTORICAL_PUBLISHED_AT = (
+    _PUBLIC_SEARCH_NOW - timedelta(days=500)
+).isoformat()
+
+
+class V2PublicSearchTests(unittest.TestCase):
     def test_gateway_combines_recalled_memory_state_with_public_evidence(
         self,
     ) -> None:
@@ -63,7 +78,7 @@ class V2PublicResearchTests(unittest.TestCase):
                 "recall-memory",
                 question,
                 "--task",
-                "gateway-public-research",
+                "gateway-public-search",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -81,12 +96,22 @@ class V2PublicResearchTests(unittest.TestCase):
                 url="https://official.example/nova/release",
                 title="Official Nova release",
                 content="Nova releases on August 1, 2026.",
-                published_at="2026-07-16T09:00:00+00:00",
-                retrieved_at="2026-07-18T09:00:00+00:00",
+                published_at=_RECENTLY_PUBLISHED_AT,
+                retrieved_at=_RECENTLY_RETRIEVED_AT,
                 source_type="official",
                 fact_key="nova-release-date",
                 fact_value="2026-08-01",
             )
+
+            class InspectingSanitizer:
+                def __init__(self) -> None:
+                    self.question = ""
+
+                def sanitize(self, actual_question: str) -> SanitizedPublicQuery:
+                    self.question = actual_question
+                    return SanitizedPublicQuery.from_trusted_sanitizer(
+                        "Nova official current release date"
+                    )
 
             class InspectingProvider:
                 def __init__(self) -> None:
@@ -113,28 +138,35 @@ class V2PublicResearchTests(unittest.TestCase):
                     actual_question: str,
                     memories: tuple[RecallMaterial, ...],
                     public_sources: tuple[PublicSource, ...],
-                ) -> CapabilityAnswerability:
+                ) -> PublicSearchAssessment:
                     self.question = actual_question
                     self.memories = memories
                     self.public_sources = public_sources
-                    return CapabilityAnswerability(answerable=True, reason="covered")
+                    return PublicSearchAssessment(
+                        answerability=CapabilityAnswerability(
+                            answerable=True,
+                            reason="covered",
+                        )
+                    )
 
+            sanitizer = InspectingSanitizer()
             provider = InspectingProvider()
             engine = InspectingEngine()
-            result = MemoryGateway(instance_root).research_public_v2(
-                V2PublicResearchRequest(
+            result = MemoryGateway(instance_root).search_public_v2(
+                V2PublicSearchRequest(
                     recall_id=recall_id,
                     question=question,
-                    task="gateway-public-research",
-                    public_query="Nova official current release date",
+                    task="gateway-public-search",
                     allowed_for_task=True,
                     time_sensitive=True,
                 ),
+                sanitizer,
                 provider,
                 engine,
             )
 
             self.assertEqual(result["status"], "answered")
+            self.assertEqual(sanitizer.question, question)
             self.assertEqual(provider.query, "Nova official current release date")
             self.assertTrue(provider.assert_time_sensitive)
             self.assertEqual(engine.question, question)
@@ -142,7 +174,7 @@ class V2PublicResearchTests(unittest.TestCase):
             self.assertEqual(engine.memories[0].state, "current")
             self.assertEqual(engine.public_sources, (public_source,))
 
-    def test_answerable_internal_recall_never_enters_public_research(self) -> None:
+    def test_answerable_internal_recall_never_enters_public_search(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             instance_root = temporary_root / "MyOutBrain"
@@ -205,14 +237,12 @@ class V2PublicResearchTests(unittest.TestCase):
             search_request = temporary_root / "public-search-request.json"
 
             researched = run_cli(
-                "research-public",
+                "search-public",
                 package["recall_id"],
                 question,
                 "--task",
                 "internal-answer",
-                "--public-query",
-                "complete internal answer",
-                "--allow-public-research",
+                "--allow-public-search",
                 "--answerable",
                 "true",
                 "--answerability-reason",
@@ -232,7 +262,7 @@ class V2PublicResearchTests(unittest.TestCase):
             self.assertIn("only after internal answerability fails", researched.stderr)
             self.assertFalse(search_request.exists())
 
-    def test_internal_failure_does_not_authorize_public_research_for_the_task(
+    def test_internal_failure_does_not_authorize_public_search_for_the_task(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -260,13 +290,11 @@ class V2PublicResearchTests(unittest.TestCase):
             search_request = temporary_root / "public-search-request.json"
 
             researched = run_cli(
-                "research-public",
+                "search-public",
                 recall_id,
                 "What is Nova's current release date?",
                 "--task",
                 "nova-release",
-                "--public-query",
-                "Nova current release date",
                 "--answerable",
                 "false",
                 "--answerability-reason",
@@ -284,6 +312,60 @@ class V2PublicResearchTests(unittest.TestCase):
 
             self.assertEqual(researched.returncode, 2)
             self.assertIn("current task authorization", researched.stderr)
+            self.assertFalse(search_request.exists())
+
+    def test_authorized_public_search_fails_closed_without_a_trusted_sanitizer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            recalled = run_cli(
+                "recall-memory",
+                "For alice@example.com, when is Nova's current release?",
+                "--task",
+                "private-nova-release",
+                "--entrance",
+                "codex",
+                "--answerable",
+                "false",
+                "--answerability-reason",
+                "coverage-insufficient",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            recall_id = json.loads(recalled.stdout)["recall_id"]
+            search_request = temporary_root / "public-search-request.json"
+
+            with patch.dict(os.environ):
+                os.environ.pop("MYOUTBRAIN_FAKE_SANITIZED_QUERY", None)
+                researched = run_cli(
+                    "search-public",
+                    recall_id,
+                    "For alice@example.com, when is Nova's current release?",
+                    "--task",
+                    "private-nova-release",
+                    "--allow-public-search",
+                    "--answerable",
+                    "false",
+                    "--answerability-reason",
+                    "coverage-insufficient",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                    environment={
+                        "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_REQUEST_FILE": str(
+                            search_request
+                        )
+                    },
+                )
+
+            self.assertEqual(researched.returncode, 2)
+            self.assertIn("trusted local sanitizer", researched.stderr)
             self.assertFalse(search_request.exists())
 
     def test_authorized_public_evidence_reassesses_the_failed_recall_as_mixed(
@@ -366,8 +448,8 @@ class V2PublicResearchTests(unittest.TestCase):
                             "url": "https://official.example/nova/release",
                             "title": "Official Nova release",
                             "content": "Nova releases publicly on August 1, 2026.",
-                            "published_at": "2026-07-16T09:00:00+00:00",
-                            "retrieved_at": "2026-07-18T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "official",
                             "fact_key": "nova-release-date",
                             "fact_value": "2026-08-01",
@@ -377,14 +459,12 @@ class V2PublicResearchTests(unittest.TestCase):
             )
 
             researched = run_cli(
-                "research-public",
+                "search-public",
                 recall_package["recall_id"],
                 "For alice@example.com, when is Nova's current public release?",
                 "--task",
                 "private-nova-release",
-                "--public-query",
-                public_query,
-                "--allow-public-research",
+                "--allow-public-search",
                 "--time-sensitive",
                 "--answerable",
                 "true",
@@ -395,6 +475,7 @@ class V2PublicResearchTests(unittest.TestCase):
                 "--format",
                 "json",
                 environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": public_query,
                     "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_REQUEST_FILE": str(
                         search_request
                     ),
@@ -421,9 +502,9 @@ class V2PublicResearchTests(unittest.TestCase):
                     "evidence_disclosure": "on-request",
                 },
             )
-            self.assertEqual(result["public_research"]["query"], public_query)
+            self.assertEqual(result["public_search"]["query"], public_query)
             self.assertEqual(
-                result["public_research"]["sources"][0]["state"],
+                result["public_search"]["sources"][0]["state"],
                 "external-unintegrated",
             )
             sent_search = search_request.read_text(encoding="utf-8")
@@ -505,8 +586,8 @@ class V2PublicResearchTests(unittest.TestCase):
                             "url": "https://official.example/nova/release",
                             "title": "Official Nova release",
                             "content": "Nova releases on August 1, 2026.",
-                            "published_at": "2026-07-16T09:00:00+00:00",
-                            "retrieved_at": "2026-07-18T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "official",
                             "fact_key": "nova-release-date",
                             "fact_value": "2026-08-01",
@@ -515,8 +596,8 @@ class V2PublicResearchTests(unittest.TestCase):
                             "url": "https://primary.example/nova/calendar",
                             "title": "Nova public calendar",
                             "content": "Nova releases on August 8, 2026.",
-                            "published_at": "2026-07-16T10:00:00+00:00",
-                            "retrieved_at": "2026-07-18T09:00:00+00:00",
+                            "published_at": _RECENTLY_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "primary",
                             "fact_key": "nova-release-date",
                             "fact_value": "2026-08-08",
@@ -526,14 +607,12 @@ class V2PublicResearchTests(unittest.TestCase):
             )
 
             researched = run_cli(
-                "research-public",
+                "search-public",
                 recall_id,
                 "What is Nova's current release date?",
                 "--task",
                 "nova-conflict",
-                "--public-query",
-                "Nova official current release date",
-                "--allow-public-research",
+                "--allow-public-search",
                 "--time-sensitive",
                 "--answerable",
                 "true",
@@ -544,6 +623,9 @@ class V2PublicResearchTests(unittest.TestCase):
                 "--format",
                 "json",
                 environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": (
+                        "Nova official current release date"
+                    ),
                     "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": public_response
                 },
             )
@@ -559,17 +641,11 @@ class V2PublicResearchTests(unittest.TestCase):
                     "overridden_by_core": True,
                 },
             )
-            self.assertEqual(
-                result["verified_facts"],
-                [
-                    "Nova releases on August 1, 2026.",
-                    "Nova releases on August 8, 2026.",
-                ],
-            )
+            self.assertEqual(result["verified_facts"], [])
             self.assertEqual(len(result["unresolved_gaps"]), 1)
             self.assertEqual(len(result["next_steps"]), 1)
 
-    def test_public_research_that_remains_insufficient_presents_only_verified_facts_and_gaps(
+    def test_public_search_that_remains_insufficient_presents_only_verified_facts_and_gaps(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -600,8 +676,8 @@ class V2PublicResearchTests(unittest.TestCase):
                             "url": "https://reference.example/partial-history",
                             "title": "Partial architecture history",
                             "content": "The archive confirms the project began in 2019.",
-                            "published_at": "2025-01-01T09:00:00+00:00",
-                            "retrieved_at": "2026-07-17T09:00:00+00:00",
+                            "published_at": _HISTORICAL_PUBLISHED_AT,
+                            "retrieved_at": _RECENTLY_RETRIEVED_AT,
                             "source_type": "reference",
                             "fact_key": "project-start-year",
                             "fact_value": "2019",
@@ -611,23 +687,30 @@ class V2PublicResearchTests(unittest.TestCase):
             )
 
             researched = run_cli(
-                "research-public",
+                "search-public",
                 recall_id,
                 "Why did the project choose its final architecture?",
                 "--task",
                 "architecture-history",
-                "--public-query",
-                "project architecture history",
-                "--allow-public-research",
+                "--allow-public-search",
                 "--answerable",
                 "false",
                 "--answerability-reason",
                 "coverage-insufficient",
+                "--verified-fact",
+                "The archive confirms the project began in 2019.",
+                "--unresolved-gap",
+                "The source does not explain the architecture decision.",
+                "--next-step",
+                "Find the project's architecture decision record.",
                 "--root",
                 str(instance_root),
                 "--format",
                 "text",
                 environment={
+                    "MYOUTBRAIN_FAKE_SANITIZED_QUERY": (
+                        "project architecture history"
+                    ),
                     "MYOUTBRAIN_FAKE_PUBLIC_SEARCH_RESPONSE": public_response
                 },
             )

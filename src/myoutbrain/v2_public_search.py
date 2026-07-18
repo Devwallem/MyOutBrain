@@ -10,6 +10,7 @@ from myoutbrain.core_types import IntegrityError, UserInputError
 from myoutbrain.local_core import LocalMemoryCore, MEMORY_DATABASE
 from myoutbrain.persistence import recover_transactions, writer_lock
 from myoutbrain.public_search import (
+    PublicQueryUnavailable,
     PublicSource,
     public_sources_conflict,
     sanitized_public_query,
@@ -22,7 +23,34 @@ from myoutbrain.v2_recall import (
 )
 
 
-class PublicResearchProvider(Protocol):
+@dataclass(frozen=True)
+class SanitizedPublicQuery:
+    """A query credential produced by a trusted local sanitizer."""
+
+    value: str
+
+    @classmethod
+    def from_trusted_sanitizer(cls, value: str) -> SanitizedPublicQuery:
+        return cls(sanitized_public_query("", trusted_query=value))
+
+
+class PublicQuerySanitizer(Protocol):
+    def sanitize(self, question: str) -> SanitizedPublicQuery: ...
+
+
+class ConfiguredPublicQuerySanitizer:
+    def sanitize(self, question: str) -> SanitizedPublicQuery:
+        try:
+            return SanitizedPublicQuery.from_trusted_sanitizer(
+                sanitized_public_query(question)
+            )
+        except PublicQueryUnavailable as error:
+            raise UserInputError(
+                "trusted local sanitizer did not produce a public-safe query"
+            ) from error
+
+
+class PublicSearchProvider(Protocol):
     def search(
         self,
         query: str,
@@ -31,7 +59,7 @@ class PublicResearchProvider(Protocol):
     ) -> tuple[PublicSource, ...]: ...
 
 
-class ConfiguredPublicResearchProvider:
+class ConfiguredPublicSearchProvider:
     def search(
         self,
         query: str,
@@ -41,50 +69,70 @@ class ConfiguredPublicResearchProvider:
         return search_public_sources(query, time_sensitive=time_sensitive)
 
 
-class PublicAnswerabilityEngine(Protocol):
+@dataclass(frozen=True)
+class PublicSearchAssessment:
+    answerability: CapabilityAnswerability
+    verified_facts: tuple[str, ...] = ()
+    unresolved_gaps: tuple[str, ...] = ()
+    next_steps: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        self.answerability.validate()
+        for label, values in (
+            ("verified fact", self.verified_facts),
+            ("unresolved gap", self.unresolved_gaps),
+            ("next step", self.next_steps),
+        ):
+            if any(not value.strip() or len(value) > 2_000 for value in values):
+                raise UserInputError(
+                    f"public search {label} must contain 1 to 2000 characters"
+                )
+
+
+class PublicSearchAnswerabilityEngine(Protocol):
     def assess(
         self,
         question: str,
         memories: tuple[RecallMaterial, ...],
         public_sources: tuple[PublicSource, ...],
-    ) -> CapabilityAnswerability: ...
+    ) -> PublicSearchAssessment: ...
 
 
 @dataclass(frozen=True)
-class FixedPublicAnswerabilityEngine:
-    assessment: CapabilityAnswerability
+class FixedPublicSearchAnswerabilityEngine:
+    assessment: PublicSearchAssessment
 
     def assess(
         self,
         question: str,
         memories: tuple[RecallMaterial, ...],
         public_sources: tuple[PublicSource, ...],
-    ) -> CapabilityAnswerability:
+    ) -> PublicSearchAssessment:
         del question, memories, public_sources
         return self.assessment
 
 
 @dataclass(frozen=True)
-class V2PublicResearchRequest:
+class V2PublicSearchRequest:
     recall_id: str
     question: str
     task: str
-    public_query: str
     allowed_for_task: bool
     time_sensitive: bool
 
 
-class V2PublicResearchService:
+class V2PublicSearchService:
     """Continue one insufficient V2 recall with task-authorized public evidence."""
 
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    def research(
+    def search(
         self,
-        request: V2PublicResearchRequest,
-        provider: PublicResearchProvider,
-        answerability_engine: PublicAnswerabilityEngine,
+        request: V2PublicSearchRequest,
+        sanitizer: PublicQuerySanitizer,
+        provider: PublicSearchProvider,
+        answerability_engine: PublicSearchAnswerabilityEngine,
     ) -> dict[str, object]:
         recall_id = request.recall_id.strip()
         question = " ".join(request.question.strip().split())
@@ -92,10 +140,10 @@ class V2PublicResearchService:
         if not recall_id.startswith("rec_") or len(recall_id) > 200:
             raise UserInputError("recall id is invalid")
         if not task:
-            raise UserInputError("public research task must not be blank")
+            raise UserInputError("public search task must not be blank")
         if not question or len(question) > 2_000:
             raise UserInputError(
-                "public research question must contain 1 to 2000 characters"
+                "public search question must contain 1 to 2000 characters"
             )
         LocalMemoryCore(self._root).inspect_schema_version()
         try:
@@ -128,15 +176,13 @@ class V2PublicResearchService:
                     (recall_id,),
                 ).fetchall()
         except sqlite3.Error as error:
-            raise IntegrityError("cannot continue recall with public research") from error
-        if row is None:
-            raise UserInputError("recall id does not exist")
-        if cast(str, row[0]) != task or not request.allowed_for_task:
-            raise UserInputError("public research requires current task authorization")
-        if bool(row[1]):
-            raise UserInputError(
-                "public research is allowed only after internal answerability fails"
-            )
+            raise IntegrityError("cannot continue recall with public search") from error
+        _validate_recall_eligibility(
+            row,
+            task=task,
+            allowed_for_task=request.allowed_for_task,
+        )
+        assert row is not None
         unresolved_internal_conflict = bool(row[2])
         memories = tuple(
             RecallMaterial(
@@ -150,20 +196,18 @@ class V2PublicResearchService:
             )
             for material in material_rows
         )
-        public_query = sanitized_public_query(
-            "",
-            trusted_query=request.public_query,
-        )
+        public_query = sanitizer.sanitize(question).value
         public_sources = provider.search(
             public_query,
             time_sensitive=request.time_sensitive,
         )
-        answerability = answerability_engine.assess(
+        assessment = answerability_engine.assess(
             question,
             memories,
             public_sources,
         )
-        answerability.validate()
+        assessment.validate()
+        answerability = assessment.answerability
         overridden = False
         if not public_sources:
             overridden = (
@@ -174,7 +218,7 @@ class V2PublicResearchService:
                 answerable=False,
                 reason="coverage-insufficient",
             )
-        elif public_sources_conflict(public_sources):
+        elif unresolved_internal_conflict or public_sources_conflict(public_sources):
             overridden = (
                 answerability.answerable
                 or answerability.reason != "unresolved-conflict"
@@ -193,17 +237,11 @@ class V2PublicResearchService:
                         "SELECT task, answerable FROM recall_events WHERE recall_id = ?",
                         (recall_id,),
                     ).fetchone()
-                    if current is None:
-                        raise UserInputError("recall id does not exist")
-                    if cast(str, current[0]) != task:
-                        raise UserInputError(
-                            "public research requires current task authorization"
-                        )
-                    if bool(current[1]):
-                        raise UserInputError(
-                            "public research is allowed only after internal "
-                            "answerability fails"
-                        )
+                    _validate_recall_eligibility(
+                        current,
+                        task=task,
+                        allowed_for_task=request.allowed_for_task,
+                    )
                     connection.execute(
                         """
                         UPDATE recall_events
@@ -220,15 +258,32 @@ class V2PublicResearchService:
                     )
                     connection.commit()
         except sqlite3.Error as error:
-            raise IntegrityError("cannot continue recall with public research") from error
+            raise IntegrityError("cannot continue recall with public search") from error
         has_internal_evidence = bool(memories)
-        declaration_kind = "mixed" if has_internal_evidence else "public"
-        declaration_label = (
-            "综合你的 MyOutBrain 知识库与公开信息"
-            if has_internal_evidence
-            else "根据当前任务检索到的公开信息"
-        )
+        has_public_evidence = bool(public_sources)
+        if has_internal_evidence and has_public_evidence:
+            declaration_kind = "mixed"
+            declaration_label = "综合你的 MyOutBrain 知识库与公开信息"
+        elif has_public_evidence:
+            declaration_kind = "public"
+            declaration_label = "根据当前任务检索到的公开信息"
+        elif has_internal_evidence:
+            declaration_kind = "myoutbrain"
+            declaration_label = "根据你的 MyOutBrain 知识库；公开检索未找到可用证据"
+        else:
+            declaration_kind = "none"
+            declaration_label = "本地知识与公开检索均未找到可用证据"
         unknown = not answerability.answerable
+        verified_facts: list[str] = []
+        unresolved_gaps: list[str] = []
+        next_steps: list[str] = []
+        if unknown:
+            fallback_gap, fallback_step = _answerability_presentation(
+                answerability.reason
+            )
+            verified_facts = list(assessment.verified_facts)
+            unresolved_gaps = list(assessment.unresolved_gaps) or [fallback_gap]
+            next_steps = list(assessment.next_steps) or [fallback_step]
         return {
             "protocol_version": PROTOCOL_VERSION,
             "recall_id": recall_id,
@@ -243,7 +298,7 @@ class V2PublicResearchService:
                 "label": declaration_label,
                 "evidence_disclosure": "on-request",
             },
-            "public_research": {
+            "public_search": {
                 "performed": True,
                 "query": public_query,
                 "sources": [
@@ -251,31 +306,50 @@ class V2PublicResearchService:
                     for source in public_sources
                 ],
             },
-            "verified_facts": (
-                [source.content for source in public_sources] if unknown else []
-            ),
-            "unresolved_gaps": (
-                [_unresolved_gap(answerability.reason)] if unknown else []
-            ),
-            "next_steps": (
-                [_next_step(answerability.reason)] if unknown else []
-            ),
+            "verified_facts": verified_facts,
+            "unresolved_gaps": unresolved_gaps,
+            "next_steps": next_steps,
         }
 
 
-def _unresolved_gap(reason: str) -> str:
+def _answerability_presentation(reason: str) -> tuple[str, str]:
     return {
-        "coverage-insufficient": "Public evidence does not cover the requested conclusion.",
-        "freshness-insufficient": "Available evidence does not meet the required freshness.",
-        "missing-dependency": "A necessary supporting dependency is still missing.",
-        "unresolved-conflict": "The available evidence remains materially conflicted.",
-    }.get(reason, "The available evidence is insufficient.")
+        "coverage-insufficient": (
+            "Public evidence does not cover the requested conclusion.",
+            "Seek an authoritative source covering the missing scope.",
+        ),
+        "freshness-insufficient": (
+            "Available evidence does not meet the required freshness.",
+            "Verify the point with a current authoritative source.",
+        ),
+        "missing-dependency": (
+            "A necessary supporting dependency is still missing.",
+            "Obtain and verify the missing supporting evidence.",
+        ),
+        "unresolved-conflict": (
+            "The available evidence remains materially conflicted.",
+            "Resolve the conflicting claims with authoritative evidence.",
+        ),
+    }.get(
+        reason,
+        (
+            "The available evidence is insufficient.",
+            "Verify the unresolved point with an authoritative source.",
+        ),
+    )
 
 
-def _next_step(reason: str) -> str:
-    return {
-        "coverage-insufficient": "Seek an authoritative source covering the missing scope.",
-        "freshness-insufficient": "Verify the point with a current authoritative source.",
-        "missing-dependency": "Obtain and verify the missing supporting evidence.",
-        "unresolved-conflict": "Resolve the conflicting claims with authoritative evidence.",
-    }.get(reason, "Verify the unresolved point with an authoritative source.")
+def _validate_recall_eligibility(
+    row: tuple[object, ...] | None,
+    *,
+    task: str,
+    allowed_for_task: bool,
+) -> None:
+    if row is None:
+        raise UserInputError("recall id does not exist")
+    if cast(str, row[0]) != task or not allowed_for_task:
+        raise UserInputError("public search requires current task authorization")
+    if bool(row[1]):
+        raise UserInputError(
+            "public search is allowed only after internal answerability fails"
+        )
