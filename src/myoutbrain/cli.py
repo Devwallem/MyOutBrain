@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+from typing import cast
 
 from myoutbrain.answering import (
     AnswerRequest,
@@ -53,6 +54,12 @@ from myoutbrain.memory_gateway import (
     RecallRequest,
 )
 from myoutbrain.memory_governance import MemoryGovernanceService
+from myoutbrain.v2_recall import (
+    AnswerabilityReason,
+    CapabilityAnswerability,
+    V2RecallRequest,
+    V2RecallService,
+)
 
 
 EXIT_USER = 2
@@ -127,6 +134,55 @@ def build_parser() -> argparse.ArgumentParser:
     approve_source_memory_parser.add_argument("--entrance", required=True)
     approve_source_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
     approve_source_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    recall_memory_parser = subcommands.add_parser(
+        "recall-memory",
+        help="Recall a compact package from V2 canonical memory",
+    )
+    recall_memory_parser.add_argument("question")
+    recall_memory_parser.add_argument("--task", required=True)
+    recall_memory_parser.add_argument("--entrance", required=True)
+    recall_memory_parser.add_argument(
+        "--answerable", choices=("true", "false"), required=True
+    )
+    recall_memory_parser.add_argument(
+        "--answerability-reason",
+        choices=(
+            "covered",
+            "coverage-insufficient",
+            "freshness-insufficient",
+            "missing-dependency",
+            "unresolved-conflict",
+        ),
+        required=True,
+    )
+    recall_memory_parser.add_argument("--budget-bytes", type=int, default=16 * 1024)
+    recall_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    recall_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    expand_recall_evidence_parser = subcommands.add_parser(
+        "expand-recall-evidence",
+        help="Expand evidence for one memory from the same V2 recall",
+    )
+    expand_recall_evidence_parser.add_argument("recall_id")
+    expand_recall_evidence_parser.add_argument("memory_id")
+    expand_recall_evidence_parser.add_argument(
+        "--budget-bytes", type=int, required=True
+    )
+    expand_recall_evidence_parser.add_argument(
+        "--root", type=Path, default=Path.cwd()
+    )
+    expand_recall_evidence_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    recall_activity_parser = subcommands.add_parser(
+        "recall-activity",
+        help="Inspect compact V2 recall activity",
+    )
+    recall_activity_parser.add_argument("--root", type=Path, default=Path.cwd())
+    recall_activity_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
@@ -576,6 +632,76 @@ def _approve_source_memory(
             f"Approved {approval.proposal_id}; created canonical memory "
             f"{approval.memory_id} v1 in capsule {approval.capsule_id}."
         )
+    return 0
+
+
+def _recall_memory(
+    root: Path,
+    question: str,
+    *,
+    task: str,
+    entrance: str,
+    answerable: bool,
+    answerability_reason: str,
+    budget_bytes: int,
+    output_format: str,
+) -> int:
+    package = V2RecallService(root).recall(
+        V2RecallRequest(
+            question=question,
+            task=task,
+            entrance=entrance,
+            capability_answerability=CapabilityAnswerability(
+                answerable=answerable,
+                reason=cast(AnswerabilityReason, answerability_reason),
+            ),
+            budget_bytes=budget_bytes,
+        )
+    )
+    if output_format == "json":
+        print(json.dumps(package, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Recall {package['recall_id']}")
+        declaration = package["source_declaration"]
+        if isinstance(declaration, dict):
+            print(declaration["label"])
+        memories = package["memories"]
+        print(f"Selected {len(memories) if isinstance(memories, list) else 0} memories")
+    return 0
+
+
+def _recall_activity(root: Path, output_format: str) -> int:
+    activity = V2RecallService(root).activity()
+    if output_format == "json":
+        print(json.dumps(activity, ensure_ascii=False, sort_keys=True))
+    else:
+        events = activity["events"]
+        for event in events if isinstance(events, list) else []:
+            if isinstance(event, dict):
+                print(
+                    f"{event['occurred_at']} {event['recall_id']} "
+                    f"{event['entrance']} {event['task']}"
+                )
+    return 0
+
+
+def _expand_recall_evidence(
+    root: Path,
+    recall_id: str,
+    memory_id: str,
+    *,
+    budget_bytes: int,
+    output_format: str,
+) -> int:
+    expansion = V2RecallService(root).expand_evidence(
+        recall_id,
+        memory_id,
+        budget_bytes=budget_bytes,
+    )
+    if output_format == "json":
+        print(json.dumps(expansion, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Expanded evidence for {memory_id} in recall {recall_id}")
     return 0
 
 
@@ -1171,6 +1297,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 entrance=parsed_arguments.entrance,
                 output_format=parsed_arguments.format,
             )
+        if parsed_arguments.command == "recall-memory":
+            return _recall_memory(
+                parsed_arguments.root,
+                parsed_arguments.question,
+                task=parsed_arguments.task,
+                entrance=parsed_arguments.entrance,
+                answerable=parsed_arguments.answerable == "true",
+                answerability_reason=parsed_arguments.answerability_reason,
+                budget_bytes=parsed_arguments.budget_bytes,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "expand-recall-evidence":
+            return _expand_recall_evidence(
+                parsed_arguments.root,
+                parsed_arguments.recall_id,
+                parsed_arguments.memory_id,
+                budget_bytes=parsed_arguments.budget_bytes,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "recall-activity":
+            return _recall_activity(parsed_arguments.root, parsed_arguments.format)
         if parsed_arguments.command == "capture":
             return _capture(
                 parsed_arguments.root,

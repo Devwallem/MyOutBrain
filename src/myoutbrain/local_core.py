@@ -38,9 +38,10 @@ from myoutbrain.persistence import (
     recover_transactions,
     writer_lock,
 )
+from myoutbrain.retrieval import lexical_terms
 
 
-MEMORY_SCHEMA_VERSION = 7
+MEMORY_SCHEMA_VERSION = 8
 MEMORY_DATABASE = "store/memory.sqlite3"
 MEMORY_BODY_TARGET_BYTES = 4 * 1024
 MEMORY_BODY_HARD_LIMIT_BYTES = 8 * 1024
@@ -82,6 +83,23 @@ CREATE TABLE knowledge_capsules (
     structural_version INTEGER NOT NULL CHECK (structural_version >= 1),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE knowledge_partitions (
+    partition_id TEXT PRIMARY KEY,
+    parent_partition_id TEXT REFERENCES knowledge_partitions(partition_id),
+    node_kind TEXT NOT NULL CHECK (node_kind IN ('root', 'leaf')),
+    topic TEXT NOT NULL,
+    normalized_topic TEXT NOT NULL,
+    CHECK (
+        (node_kind = 'root' AND parent_partition_id IS NULL)
+        OR (node_kind = 'leaf' AND parent_partition_id IS NOT NULL)
+    )
+);
+
+CREATE TABLE capsule_partitions (
+    capsule_id TEXT PRIMARY KEY REFERENCES knowledge_capsules(capsule_id),
+    partition_id TEXT NOT NULL REFERENCES knowledge_partitions(partition_id)
 );
 
 CREATE TABLE experiences (
@@ -221,6 +239,16 @@ CREATE TABLE knowledge_dictionary (
         REFERENCES canonical_memory_versions(memory_id, version)
 );
 
+CREATE VIRTUAL TABLE canonical_memory_fts USING fts5(
+    memory_id UNINDEXED,
+    capsule_id UNINDEXED,
+    canonical_name,
+    body,
+    applicability_scope,
+    search_terms,
+    tokenize = 'unicode61'
+);
+
 CREATE TABLE source_memory_proposal_details (
     proposal_id TEXT PRIMARY KEY REFERENCES integration_proposals(proposal_id),
     proposal_version INTEGER NOT NULL CHECK (proposal_version = 1),
@@ -267,6 +295,50 @@ CREATE TABLE idempotent_writes (
     result_hash TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (operation, idempotency_key)
+);
+
+CREATE TABLE recall_events (
+    recall_id TEXT PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    entrance TEXT NOT NULL,
+    task TEXT NOT NULL,
+    paths_json TEXT NOT NULL,
+    budget_limit_bytes INTEGER NOT NULL CHECK (budget_limit_bytes > 0),
+    used_bytes INTEGER NOT NULL CHECK (used_bytes >= 0),
+    was_truncated INTEGER NOT NULL CHECK (was_truncated IN (0, 1)),
+    answerable INTEGER NOT NULL CHECK (answerable IN (0, 1)),
+    answerability_reason TEXT NOT NULL,
+    answerability_overridden INTEGER NOT NULL
+        CHECK (answerability_overridden IN (0, 1)),
+    cross_partition_hit INTEGER NOT NULL CHECK (cross_partition_hit IN (0, 1)),
+    ambiguity_detected INTEGER NOT NULL CHECK (ambiguity_detected IN (0, 1)),
+    missing_dependency INTEGER NOT NULL CHECK (missing_dependency IN (0, 1)),
+    unresolved_conflict INTEGER NOT NULL CHECK (unresolved_conflict IN (0, 1))
+);
+
+CREATE TABLE recall_event_items (
+    recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    version INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    candidate_paths_json TEXT NOT NULL,
+    PRIMARY KEY (recall_id, memory_id),
+    FOREIGN KEY (memory_id, version)
+        REFERENCES canonical_memory_versions(memory_id, version)
+);
+
+CREATE TABLE recall_evidence_expansions (
+    recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
+    memory_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version INTEGER NOT NULL,
+    expanded_bytes INTEGER NOT NULL CHECK (expanded_bytes >= 0),
+    was_truncated INTEGER NOT NULL CHECK (was_truncated IN (0, 1)),
+    PRIMARY KEY (recall_id, memory_id, source_id, source_version),
+    FOREIGN KEY (recall_id, memory_id)
+        REFERENCES recall_event_items(recall_id, memory_id),
+    FOREIGN KEY (source_id, source_version)
+        REFERENCES evidence_source_versions(source_id, version)
 );
 
 CREATE TABLE memory_events (
@@ -1102,6 +1174,7 @@ class LocalMemoryCore:
             4: self._migrate_v4_database,
             5: self._migrate_v5_database,
             6: self._migrate_v6_database,
+            7: self._migrate_v7_database,
         }
         try:
             with tempfile.NamedTemporaryFile(
@@ -2839,6 +2912,10 @@ class LocalMemoryCore:
                     capsule_id=capsule_id,
                     audit_event=audit_event,
                 )
+                partition_id = (
+                    "prt_"
+                    + hashlib.sha256(capsule_id.encode("utf-8")).hexdigest()[:32]
+                )
                 connection.execute(
                     """
                     INSERT INTO knowledge_capsules
@@ -2847,6 +2924,34 @@ class LocalMemoryCore:
                     VALUES (?, ?, ?, 1, 1, ?, ?)
                     """,
                     (capsule_id, applicability_scope, body_bytes, applied_at, applied_at),
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    VALUES ('prt_root', NULL, 'root', 'All knowledge', 'all knowledge')
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    VALUES (?, 'prt_root', 'leaf', ?, ?)
+                    """,
+                    (
+                        partition_id,
+                        applicability_scope,
+                        " ".join(applicability_scope.casefold().split()),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO capsule_partitions (capsule_id, partition_id)
+                    VALUES (?, ?)
+                    """,
+                    (capsule_id, partition_id),
                 )
                 connection.execute(
                     """
@@ -2894,6 +2999,28 @@ class LocalMemoryCore:
                         canonical_name,
                         " ".join(canonical_name.casefold().split()),
                         capsule_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_fts
+                        (memory_id, capsule_id, canonical_name, body,
+                         applicability_scope, search_terms)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        capsule_id,
+                        canonical_name,
+                        body,
+                        applicability_scope,
+                        " ".join(
+                            sorted(
+                                lexical_terms(
+                                    f"{canonical_name} {body} {applicability_scope}"
+                                )
+                            )
+                        ),
                     ),
                 )
                 updated = connection.execute(
@@ -3639,6 +3766,165 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v7_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.executescript(
+                    """
+                    CREATE TABLE knowledge_partitions (
+                        partition_id TEXT PRIMARY KEY,
+                        parent_partition_id TEXT
+                            REFERENCES knowledge_partitions(partition_id),
+                        node_kind TEXT NOT NULL
+                            CHECK (node_kind IN ('root', 'leaf')),
+                        topic TEXT NOT NULL,
+                        normalized_topic TEXT NOT NULL,
+                        CHECK (
+                            (node_kind = 'root' AND parent_partition_id IS NULL)
+                            OR (node_kind = 'leaf'
+                                AND parent_partition_id IS NOT NULL)
+                        )
+                    );
+                    CREATE TABLE capsule_partitions (
+                        capsule_id TEXT PRIMARY KEY
+                            REFERENCES knowledge_capsules(capsule_id),
+                        partition_id TEXT NOT NULL
+                            REFERENCES knowledge_partitions(partition_id)
+                    );
+                    INSERT INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    VALUES ('prt_root', NULL, 'root', 'All knowledge', 'all knowledge');
+                    INSERT INTO knowledge_partitions
+                        (partition_id, parent_partition_id, node_kind, topic,
+                         normalized_topic)
+                    SELECT 'prt_' || substr(capsule_id, 5, 32), 'prt_root', 'leaf',
+                           topic, lower(trim(topic))
+                    FROM knowledge_capsules;
+                    INSERT INTO capsule_partitions (capsule_id, partition_id)
+                    SELECT capsule_id, 'prt_' || substr(capsule_id, 5, 32)
+                    FROM knowledge_capsules;
+
+                    CREATE VIRTUAL TABLE canonical_memory_fts USING fts5(
+                        memory_id UNINDEXED,
+                        capsule_id UNINDEXED,
+                        canonical_name,
+                        body,
+                        applicability_scope,
+                        search_terms,
+                        tokenize = 'unicode61'
+                    );
+
+                    CREATE TABLE recall_events (
+                        recall_id TEXT PRIMARY KEY,
+                        occurred_at TEXT NOT NULL,
+                        entrance TEXT NOT NULL,
+                        task TEXT NOT NULL,
+                        paths_json TEXT NOT NULL,
+                        budget_limit_bytes INTEGER NOT NULL
+                            CHECK (budget_limit_bytes > 0),
+                        used_bytes INTEGER NOT NULL CHECK (used_bytes >= 0),
+                        was_truncated INTEGER NOT NULL
+                            CHECK (was_truncated IN (0, 1)),
+                        answerable INTEGER NOT NULL CHECK (answerable IN (0, 1)),
+                        answerability_reason TEXT NOT NULL,
+                        answerability_overridden INTEGER NOT NULL
+                            CHECK (answerability_overridden IN (0, 1)),
+                        cross_partition_hit INTEGER NOT NULL
+                            CHECK (cross_partition_hit IN (0, 1)),
+                        ambiguity_detected INTEGER NOT NULL
+                            CHECK (ambiguity_detected IN (0, 1)),
+                        missing_dependency INTEGER NOT NULL
+                            CHECK (missing_dependency IN (0, 1)),
+                        unresolved_conflict INTEGER NOT NULL
+                            CHECK (unresolved_conflict IN (0, 1))
+                    );
+                    CREATE TABLE recall_event_items (
+                        recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
+                        memory_id TEXT NOT NULL
+                            REFERENCES canonical_memories(memory_id),
+                        version INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        candidate_paths_json TEXT NOT NULL,
+                        PRIMARY KEY (recall_id, memory_id),
+                        FOREIGN KEY (memory_id, version)
+                            REFERENCES canonical_memory_versions(memory_id, version)
+                    );
+                    CREATE TABLE recall_evidence_expansions (
+                        recall_id TEXT NOT NULL REFERENCES recall_events(recall_id),
+                        memory_id TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        source_version INTEGER NOT NULL,
+                        expanded_bytes INTEGER NOT NULL CHECK (expanded_bytes >= 0),
+                        was_truncated INTEGER NOT NULL
+                            CHECK (was_truncated IN (0, 1)),
+                        PRIMARY KEY (
+                            recall_id, memory_id, source_id, source_version
+                        ),
+                        FOREIGN KEY (recall_id, memory_id)
+                            REFERENCES recall_event_items(recall_id, memory_id),
+                        FOREIGN KEY (source_id, source_version)
+                            REFERENCES evidence_source_versions(source_id, version)
+                    );
+                    PRAGMA user_version = 8;
+                    """
+                )
+                fts_rows = connection.execute(
+                    """
+                    SELECT dictionary.memory_id, dictionary.primary_capsule_id,
+                           dictionary.canonical_name, version.content,
+                           version.applicability_scope
+                    FROM knowledge_dictionary AS dictionary
+                    JOIN canonical_memory_versions AS version
+                      ON version.memory_id = dictionary.memory_id
+                     AND version.version = dictionary.current_version
+                    """
+                ).fetchall()
+                connection.executemany(
+                    """
+                    INSERT INTO canonical_memory_fts
+                        (memory_id, capsule_id, canonical_name, body,
+                         applicability_scope, search_terms)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            row[0],
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            " ".join(
+                                sorted(
+                                    lexical_terms(
+                                        f"{row[2]} {row[3]} {row[4]}"
+                                    )
+                                )
+                            ),
+                        )
+                        for row in fts_rows
+                    ),
+                )
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)

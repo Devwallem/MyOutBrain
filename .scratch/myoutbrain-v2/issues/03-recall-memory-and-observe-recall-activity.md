@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — 从来源批准第一条规范记忆.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 知识字典、分区树、局部 FTS 和受限全库 FTS 共同产生候选。
 - [ ] 第一阶段召回包遵守默认字节预算，只带证据状态和稳定引用。
