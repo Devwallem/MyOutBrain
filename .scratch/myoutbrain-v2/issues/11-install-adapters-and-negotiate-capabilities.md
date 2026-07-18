@@ -24,5 +24,5 @@ Codex、OpenCode 与 Claude Code 入口通过本地统一注册表发现同一�
 - 2026-07-18：新增传输中立的 V2.1 领域协议、可打包 JSON Schema、`gateway` CLI 与 MCP stdio `myoutbrain_gateway` 工具；相同请求在两种传输上返回同构成功或稳定错误响应，V2.0 客户端仍可读取。
 - 2026-07-18：`review.decide` 在本地核心边界验证完整提案效果、精确 `review_effect.<type>.v1` 能力、提案版本、幂等键和 `expected_version`；入口及 MCP 层均不查询 SQLite。
 - 2026-07-18：新增三种客户端的受管配置与通用无状态 Skill。本地实例注册表固定一个主实例；安装、重装、检查和卸载保持用户原配置，拒绝覆盖/删除未受管同名入口，卸载前后规范实例快照不变。
-- 2026-07-18：按公开 CLI/领域接缝 TDD；43 项相关及依赖回归通过，严格 `mypy` 覆盖 66 个源/测试文件通过。最终完整套件 209 项中 204 项通过；5 项失败均为固定起点已存在并由工单 01/02/03/07/08 记录的 `AnswerWithPublicResearchFallbackTests` 公共检索时效 fixture。
-- 2026-07-18：按 `code-review` 完成 Standards/Spec 双轴审查并修复全部实质发现：主实例发现、真实协议/能力协商检查、版本范围交集、Schema/解析器一致性、受管入口所有权和稳定错误信封去重；未实施工单 12/13/15 或计划调度。
+- 2026-07-18：按公开 CLI/领域接缝 TDD；44 项相关及依赖回归通过，严格 `mypy` 覆盖 66 个源/测试文件通过。最终完整套件 210 项中 205 项通过；5 项失败均为固定起点已存在并由工单 01/02/03/07/08 记录的 `AnswerWithPublicResearchFallbackTests` 公共检索时效 fixture。
+- 2026-07-18：按 `code-review` 完成 Standards/Spec 双轴审查并修复全部实质发现：主实例发现与并发 compare-and-set、真实协议/能力协商检查、版本范围交集、Schema/解析器一致性、受管入口所有权、客户端 profile 和稳定错误信封去重；未实施工单 12/13/15 或计划调度。

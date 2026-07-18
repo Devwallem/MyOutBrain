@@ -7,7 +7,13 @@ import tempfile
 from typing import cast
 import unittest
 
-from tests.cli_support import cli_invocation, PROJECT_ROOT, run_cli
+from tests.cli_support import (
+    cli_invocation,
+    PROJECT_ROOT,
+    run_cli,
+    start_cli,
+    wait_until_lock_is_held,
+)
 
 
 def write_request(path: Path, request: dict[str, object]) -> None:
@@ -680,6 +686,66 @@ class AgentAdapterProtocolTests(unittest.TestCase):
 
 
 class AgentAdapterInstallationTests(unittest.TestCase):
+    def test_concurrent_first_installs_cannot_claim_different_primary_instances(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            first_root = temporary_root / "First"
+            second_root = temporary_root / "Second"
+            registry_path = temporary_root / "instances.json"
+            ready_path = temporary_root / "registry-lock-ready"
+            for instance_root in (first_root, second_root):
+                self.assertEqual(
+                    run_cli("init", "--root", str(instance_root)).returncode,
+                    0,
+                )
+
+            first = start_cli(
+                "adapter",
+                "install",
+                "codex",
+                "--root",
+                str(first_root),
+                "--config",
+                str(temporary_root / "codex.toml"),
+                "--skills-dir",
+                str(temporary_root / "codex-skills"),
+                "--registry",
+                str(registry_path),
+                environment={
+                    "MYOUTBRAIN_FAULT_INJECTION": "hold-writer-lock",
+                    "MYOUTBRAIN_HOLD_SECONDS": "1",
+                    "MYOUTBRAIN_LOCK_READY_FILE": str(ready_path),
+                },
+            )
+            wait_until_lock_is_held(ready_path, first)
+
+            second = run_cli(
+                "adapter",
+                "install",
+                "opencode",
+                "--root",
+                str(second_root),
+                "--config",
+                str(temporary_root / "opencode.json"),
+                "--skills-dir",
+                str(temporary_root / "opencode-skills"),
+                "--registry",
+                str(registry_path),
+            )
+            first_stdout, first_stderr = first.communicate(timeout=5)
+
+            self.assertEqual(first.returncode, 0, first_stderr)
+            self.assertTrue(first_stdout)
+            self.assertEqual(second.returncode, 4, second.stderr)
+            self.assertFalse((temporary_root / "opencode.json").exists())
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                registry["primary_instance"],
+                str(first_root.resolve()),
+            )
+
     def test_three_clients_have_idempotent_replaceable_state_free_adapters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

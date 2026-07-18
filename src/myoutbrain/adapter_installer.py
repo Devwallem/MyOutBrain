@@ -12,6 +12,10 @@ from typing import Literal, cast
 from myoutbrain.core_types import ConfigurationConflict
 from myoutbrain.domain_protocol import execute_domain_request
 from myoutbrain.library import KnowledgeWorkflow
+from myoutbrain.persistence import (
+    hold_writer_lock_for_acceptance_test,
+    operation_lock,
+)
 
 AdapterClient = Literal["codex", "opencode", "claude-code"]
 ADAPTER_CLIENTS: tuple[AdapterClient, ...] = (
@@ -65,6 +69,20 @@ class AdapterPaths:
     skills: Path
 
 
+@dataclass(frozen=True)
+class ClientProfile:
+    name: AdapterClient
+    config_format: Literal["toml", "json"]
+    paths: AdapterPaths
+    json_container: str | None = None
+    json_entry_style: Literal["opencode", "claude-code"] | None = None
+
+    def require_json_container(self) -> str:
+        if self.json_container is None:
+            raise AssertionError(f"{self.name} does not use a JSON configuration")
+        return self.json_container
+
+
 class AdapterInstaller:
     def __init__(
         self,
@@ -75,7 +93,7 @@ class AdapterInstaller:
         skills_dir: Path | None = None,
         registry_path: Path | None = None,
     ) -> None:
-        self._client = client
+        self._profile = _client_profile(client)
         self._registry_path = (
             registry_path or Path.home() / ".myoutbrain" / "instances.json"
         ).resolve()
@@ -84,10 +102,9 @@ class AdapterInstaller:
             if instance_root is not None
             else _read_primary_instance(self._registry_path)
         )
-        defaults = _default_paths(client)
         self._paths = AdapterPaths(
-            config=(config_path or defaults.config).resolve(),
-            skills=(skills_dir or defaults.skills).resolve(),
+            config=(config_path or self._profile.paths.config).resolve(),
+            skills=(skills_dir or self._profile.paths.skills).resolve(),
         )
 
     def install(self) -> dict[str, object]:
@@ -113,7 +130,7 @@ class AdapterInstaller:
                     "maximum": dict(ADAPTER_MAXIMUM_PROTOCOL_VERSION),
                 },
                 "client": {
-                    "name": self._client,
+                    "name": self._profile.name,
                     "capabilities": list(ADAPTER_CAPABILITIES),
                 },
                 "operation": "instance.status",
@@ -165,7 +182,7 @@ class AdapterInstaller:
 
     def _result(self, status: str) -> dict[str, object]:
         return {
-            "client": self._client,
+            "client": self._profile.name,
             "status": status,
             "config": str(self._paths.config),
             "skill": str(self._skill_path),
@@ -174,17 +191,17 @@ class AdapterInstaller:
         }
 
     def _assert_config_installable(self) -> None:
-        if self._client == "codex":
+        if self._profile.config_format == "toml":
             self._installed_config()
             return
         entry = self._json_entry_if_present()
         if entry is not _MISSING and not _is_managed_json_entry(entry):
             raise ConfigurationConflict(
-                f"{self._client} already has an unmanaged myoutbrain MCP server"
+                f"{self._profile.name} already has an unmanaged myoutbrain MCP server"
             )
 
     def _assert_config_uninstallable(self) -> None:
-        if self._client == "codex":
+        if self._profile.config_format == "toml":
             content = _read_text_if_present(self._paths.config)
             unmanaged = _CODEX_BLOCK.sub("\n", content)
             if "[mcp_servers.myoutbrain]" in unmanaged:
@@ -195,7 +212,7 @@ class AdapterInstaller:
         entry = self._json_entry_if_present()
         if entry is not _MISSING and not _is_managed_json_entry(entry):
             raise ConfigurationConflict(
-                f"{self._client} has an unmanaged myoutbrain MCP server"
+                f"{self._profile.name} has an unmanaged myoutbrain MCP server"
             )
 
     def _assert_skill_installable(self) -> None:
@@ -217,7 +234,7 @@ class AdapterInstaller:
 
     def _json_entry_if_present(self) -> object:
         data = _read_json_object(self._paths.config)
-        container_name = _json_container_name(self._client)
+        container_name = self._profile.require_json_container()
         raw_container = data.get(container_name)
         if raw_container is None:
             return _MISSING
@@ -225,12 +242,12 @@ class AdapterInstaller:
             isinstance(key, str) for key in raw_container
         ):
             raise ConfigurationConflict(
-                f"{self._client} {container_name} configuration is invalid"
+                f"{self._profile.name} {container_name} configuration is invalid"
             )
         return raw_container.get("myoutbrain", _MISSING)
 
     def _installed_config(self) -> str:
-        if self._client == "codex":
+        if self._profile.config_format == "toml":
             existing = _read_text_if_present(self._paths.config)
             unmanaged = _CODEX_BLOCK.sub("\n", existing).rstrip()
             if "[mcp_servers.myoutbrain]" in unmanaged:
@@ -240,13 +257,13 @@ class AdapterInstaller:
             block = _codex_block(self._instance_root)
             return f"{unmanaged}\n\n{block}".lstrip("\n")
         data = _read_json_object(self._paths.config)
-        container_name = _json_container_name(self._client)
+        container_name = self._profile.require_json_container()
         raw_container = data.get(container_name, {})
         if not isinstance(raw_container, dict) or not all(
             isinstance(key, str) for key in raw_container
         ):
             raise ConfigurationConflict(
-                f"{self._client} {container_name} configuration is invalid"
+                f"{self._profile.name} {container_name} configuration is invalid"
             )
         container = cast(dict[str, object], raw_container)
         container["myoutbrain"] = self._json_mcp_entry()
@@ -254,10 +271,10 @@ class AdapterInstaller:
         return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     def _uninstalled_config(self) -> str:
-        if self._client == "codex":
+        if self._profile.config_format == "toml":
             return _CODEX_BLOCK.sub("\n", _read_text_if_present(self._paths.config)).lstrip("\n")
         data = _read_json_object(self._paths.config)
-        container_name = _json_container_name(self._client)
+        container_name = self._profile.require_json_container()
         raw_container = data.get(container_name)
         if isinstance(raw_container, dict):
             container = cast(dict[object, object], raw_container)
@@ -271,18 +288,18 @@ class AdapterInstaller:
     def _config_matches(self) -> bool:
         if not self._paths.config.is_file():
             return False
-        if self._client == "codex":
+        if self._profile.config_format == "toml":
             content = _read_text_if_present(self._paths.config)
             matches = _CODEX_BLOCK.findall(content)
             return len(matches) == 1 and _codex_block(self._instance_root).strip() in matches[0]
         data = _read_json_object(self._paths.config)
-        container_name = _json_container_name(self._client)
+        container_name = self._profile.require_json_container()
         container = data.get(container_name)
         return isinstance(container, dict) and container.get("myoutbrain") == self._json_mcp_entry()
 
     def _json_mcp_entry(self) -> dict[str, object]:
         arguments = _mcp_arguments(self._instance_root)
-        if self._client == "opencode":
+        if self._profile.json_entry_style == "opencode":
             return {
                 "type": "local",
                 "command": [sys.executable, *arguments],
@@ -300,24 +317,32 @@ class AdapterInstaller:
         _atomic_write_text(self._paths.config, content)
 
 
-def _default_paths(client: AdapterClient) -> AdapterPaths:
+def _client_profile(client: AdapterClient) -> ClientProfile:
     home = Path.home()
     if client == "codex":
         root = Path(os.environ.get("CODEX_HOME", home / ".codex"))
-        return AdapterPaths(root / "config.toml", root / "skills")
+        return ClientProfile(
+            name=client,
+            config_format="toml",
+            paths=AdapterPaths(root / "config.toml", root / "skills"),
+        )
     if client == "opencode":
         explicit = os.environ.get("OPENCODE_CONFIG")
         config = Path(explicit) if explicit else home / ".config" / "opencode" / "opencode.json"
-        return AdapterPaths(config, config.parent / "skills")
-    return AdapterPaths(home / ".claude.json", home / ".claude" / "skills")
-
-
-def _json_container_name(client: AdapterClient) -> str:
-    if client == "opencode":
-        return "mcp"
-    if client == "claude-code":
-        return "mcpServers"
-    raise AssertionError("Codex does not use a JSON adapter container")
+        return ClientProfile(
+            name=client,
+            config_format="json",
+            paths=AdapterPaths(config, config.parent / "skills"),
+            json_container="mcp",
+            json_entry_style="opencode",
+        )
+    return ClientProfile(
+        name=client,
+        config_format="json",
+        paths=AdapterPaths(home / ".claude.json", home / ".claude" / "skills"),
+        json_container="mcpServers",
+        json_entry_style="claude-code",
+    )
 
 
 def _is_managed_json_entry(entry: object) -> bool:
@@ -381,23 +406,26 @@ def _read_primary_instance(registry_path: Path) -> Path:
 
 
 def _claim_primary_instance(registry_path: Path, instance_root: Path) -> None:
-    if registry_path.is_file():
-        registered = _read_primary_instance(registry_path)
-        if registered != instance_root:
-            raise ConfigurationConflict(
-                "a different primary MyOutBrain instance is already registered"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with operation_lock(registry_path.parent, ".instances.lock"):
+        hold_writer_lock_for_acceptance_test()
+        if registry_path.is_file():
+            registered = _read_primary_instance(registry_path)
+            if registered != instance_root:
+                raise ConfigurationConflict(
+                    "a different primary MyOutBrain instance is already registered"
+                )
+            return
+        _atomic_write_text(
+            registry_path,
+            json.dumps(
+                {"primary_instance": str(instance_root), "schema_version": 1},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
             )
-        return
-    _atomic_write_text(
-        registry_path,
-        json.dumps(
-            {"primary_instance": str(instance_root), "schema_version": 1},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
+            + "\n",
         )
-        + "\n",
-    )
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
