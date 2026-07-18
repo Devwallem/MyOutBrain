@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 import uuid
 
 from myoutbrain.core_types import IntegrityError, UserInputError
@@ -38,6 +39,14 @@ class CapabilityAnswerability:
     reason: AnswerabilityReason
 
     def validate(self) -> None:
+        if self.reason not in {
+            "covered",
+            "coverage-insufficient",
+            "freshness-insufficient",
+            "missing-dependency",
+            "unresolved-conflict",
+        }:
+            raise UserInputError("answerability reason is invalid")
         if self.answerable != (self.reason == "covered"):
             raise UserInputError(
                 "answerable=true requires reason covered; "
@@ -50,8 +59,41 @@ class V2RecallRequest:
     question: str
     task: str
     entrance: str
-    capability_answerability: CapabilityAnswerability
     budget_bytes: int = DEFAULT_RECALL_BUDGET_BYTES
+
+
+@dataclass(frozen=True)
+class RecallMaterial:
+    memory_id: str
+    version: int
+    state: str
+    body: str
+    scope: str
+    has_evidence: bool
+    has_unresolved_conflict: bool
+
+
+class AnswerabilityEngine(Protocol):
+    def assess(
+        self,
+        question: str,
+        memories: tuple[RecallMaterial, ...],
+    ) -> CapabilityAnswerability: ...
+
+
+@dataclass(frozen=True)
+class FixedAnswerabilityEngine:
+    """Deterministic CLI/test adapter for a capability engine response."""
+
+    assessment: CapabilityAnswerability
+
+    def assess(
+        self,
+        question: str,
+        memories: tuple[RecallMaterial, ...],
+    ) -> CapabilityAnswerability:
+        del question, memories
+        return self.assessment
 
 
 @dataclass(frozen=True)
@@ -69,6 +111,17 @@ class _Candidate:
     @property
     def body_bytes(self) -> int:
         return len(self.body.encode("utf-8"))
+
+    @property
+    def payload_bytes(self) -> int:
+        return len(
+            json.dumps(
+                self.to_data(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
 
     def to_data(self) -> dict[str, object]:
         return {
@@ -94,11 +147,14 @@ class V2RecallService:
     def __init__(self, root: Path) -> None:
         self._root = root
 
-    def recall(self, request: V2RecallRequest) -> dict[str, object]:
+    def recall(
+        self,
+        request: V2RecallRequest,
+        answerability_engine: AnswerabilityEngine,
+    ) -> dict[str, object]:
         question = _required_text("recall question", request.question)
-        task = _required_text("recall task", request.task)
-        entrance = _required_text("recall entrance", request.entrance)
-        request.capability_answerability.validate()
+        task = _stable_identifier("recall task", request.task, maximum=128)
+        entrance = _stable_identifier("recall entrance", request.entrance, maximum=64)
         if not MINIMUM_RECALL_BUDGET_BYTES <= request.budget_bytes <= MAXIMUM_RECALL_BUDGET_BYTES:
             raise UserInputError(
                 "recall budget must be between 256 and 65536 bytes"
@@ -126,8 +182,24 @@ class V2RecallService:
                         connection,
                         selected_ids,
                     )
+                    capability_answerability = answerability_engine.assess(
+                        question,
+                        tuple(
+                            RecallMaterial(
+                                memory_id=candidate.memory_id,
+                                version=candidate.version,
+                                state=candidate.state,
+                                body=candidate.body,
+                                scope=candidate.scope,
+                                has_evidence=bool(candidate.evidence),
+                                has_unresolved_conflict=unresolved_conflict,
+                            )
+                            for candidate in selected
+                        ),
+                    )
+                    capability_answerability.validate()
                     answerable, reason, overridden = _enforce_answerability(
-                        request.capability_answerability,
+                        capability_answerability,
                         has_memories=bool(selected),
                         unresolved_conflict=unresolved_conflict,
                     )
@@ -220,15 +292,85 @@ class V2RecallService:
             },
         }
 
+    def assess_answerability(
+        self,
+        recall_id: str,
+        capability_answerability: CapabilityAnswerability,
+    ) -> dict[str, object]:
+        normalized_recall_id = _required_identifier("recall id", recall_id, "rec_")
+        capability_answerability.validate()
+        LocalMemoryCore(self._root).inspect_schema_version()
+        database_path = self._root / MEMORY_DATABASE
+        try:
+            with writer_lock(self._root):
+                recover_transactions(self._root)
+                with closing(sqlite3.connect(database_path)) as connection:
+                    selected_rows = connection.execute(
+                        "SELECT memory_id FROM recall_event_items WHERE recall_id = ?",
+                        (normalized_recall_id,),
+                    ).fetchall()
+                    event_exists = connection.execute(
+                        "SELECT 1 FROM recall_events WHERE recall_id = ?",
+                        (normalized_recall_id,),
+                    ).fetchone()
+                    if event_exists is None:
+                        raise UserInputError("recall id does not exist")
+                    selected_ids = tuple(cast(str, row[0]) for row in selected_rows)
+                    unresolved_conflict = _has_unresolved_conflict(
+                        connection,
+                        selected_ids,
+                    )
+                    answerable, reason, overridden = _enforce_answerability(
+                        capability_answerability,
+                        has_memories=bool(selected_ids),
+                        unresolved_conflict=unresolved_conflict,
+                    )
+                    connection.execute(
+                        """
+                        UPDATE recall_events
+                        SET answerable = ?, answerability_reason = ?,
+                            answerability_overridden = ?, unresolved_conflict = ?
+                        WHERE recall_id = ?
+                        """,
+                        (
+                            int(answerable),
+                            reason,
+                            int(overridden),
+                            int(unresolved_conflict),
+                            normalized_recall_id,
+                        ),
+                    )
+                    connection.commit()
+        except sqlite3.Error as error:
+            raise IntegrityError("cannot record recall answerability") from error
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "recall_id": normalized_recall_id,
+            "answerability": {
+                "answerable": answerable,
+                "reason": reason,
+                "overridden_by_core": overridden,
+            },
+        }
+
     def expand_evidence(
         self,
         recall_id: str,
         memory_id: str,
         *,
+        evidence_reference_ids: tuple[str, ...],
         budget_bytes: int,
     ) -> dict[str, object]:
         normalized_recall_id = _required_identifier("recall id", recall_id, "rec_")
         normalized_memory_id = _required_identifier("memory id", memory_id, "mem_")
+        normalized_reference_ids = tuple(
+            _required_identifier("evidence reference", reference_id, "evr_")
+            for reference_id in evidence_reference_ids
+        )
+        if not normalized_reference_ids:
+            raise UserInputError("at least one evidence reference is required")
+        if len(set(normalized_reference_ids)) != len(normalized_reference_ids):
+            raise UserInputError("evidence references must be unique")
         if not 1 <= budget_bytes <= MAXIMUM_RECALL_BUDGET_BYTES:
             raise UserInputError(
                 "evidence expansion budget must be between 1 and 65536 bytes"
@@ -270,7 +412,24 @@ class V2RecallService:
                         """,
                         (normalized_memory_id, memory_version),
                     ).fetchall()
-                    for row in rows:
+                    available_references = {
+                        _evidence_reference_id(
+                            normalized_memory_id,
+                            memory_version,
+                            cast(str, row[0]),
+                            cast(int, row[1]),
+                        ): row
+                        for row in rows
+                    }
+                    unknown_references = set(normalized_reference_ids).difference(
+                        available_references
+                    )
+                    if unknown_references:
+                        raise UserInputError(
+                            "evidence reference does not belong to the recalled memory"
+                        )
+                    for reference_id in normalized_reference_ids:
+                        row = available_references[reference_id]
                         source_id = cast(str, row[0])
                         source_version = cast(int, row[1])
                         locator = cast(str, row[4])
@@ -285,12 +444,7 @@ class V2RecallService:
                         truncated = truncated or source_truncated
                         evidence_items.append(
                             {
-                                "reference_id": _evidence_reference_id(
-                                    normalized_memory_id,
-                                    memory_version,
-                                    source_id,
-                                    source_version,
-                                ),
+                                "reference_id": reference_id,
                                 "memory_id": normalized_memory_id,
                                 "memory_version": memory_version,
                                 "source_id": source_id,
@@ -576,11 +730,11 @@ def _within_budget(
     used_bytes = 0
     truncated = False
     for candidate in candidates:
-        if used_bytes + candidate.body_bytes > limit_bytes:
+        if used_bytes + candidate.payload_bytes > limit_bytes:
             truncated = True
             continue
         selected.append(candidate)
-        used_bytes += candidate.body_bytes
+        used_bytes += candidate.payload_bytes
     return tuple(selected), used_bytes, truncated
 
 
@@ -660,6 +814,18 @@ def _required_identifier(label: str, value: str, prefix: str) -> str:
     normalized = value.strip()
     if not normalized.startswith(prefix) or len(normalized) > 200:
         raise UserInputError(f"{label} is invalid")
+    return normalized
+
+
+def _stable_identifier(label: str, value: str, *, maximum: int) -> str:
+    normalized = value.strip()
+    if (
+        len(normalized) > maximum
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", normalized) is None
+    ):
+        raise UserInputError(
+            f"{label} must be a stable identifier using letters, digits, '.', '_', ':', or '-'"
+        )
     return normalized
 
 

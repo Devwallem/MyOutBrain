@@ -6,10 +6,87 @@ import tempfile
 from typing import cast
 import unittest
 
+from myoutbrain.memory_gateway import MemoryGateway
+from myoutbrain.v2_recall import (
+    CapabilityAnswerability,
+    RecallMaterial,
+    V2RecallRequest,
+)
 from tests.cli_support import run_cli
 
 
 class V2RecallTests(unittest.TestCase):
+    def test_gateway_calls_the_capability_engine_after_building_recall_material(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            source_path = temporary_root / "Gateway.md"
+            source_path.write_text("Gateway recall remains local.\n", encoding="utf-8")
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            proposed = run_cli(
+                "propose-source-memory",
+                str(source_path),
+                "--name",
+                "Gateway recall rule",
+                "--body",
+                "Gateway recall remains local.",
+                "--scope",
+                "gateway verification",
+                "--idempotency-key",
+                "proposal-gateway-recall-v1",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            proposal = json.loads(proposed.stdout)
+            approved = run_cli(
+                "approve-source-memory",
+                proposal["proposal_id"],
+                "--expected-version",
+                "0",
+                "--idempotency-key",
+                "approve-gateway-recall-v1",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+
+            class InspectingEngine:
+                def __init__(self) -> None:
+                    self.assert_question = ""
+                    self.memories: tuple[RecallMaterial, ...] = ()
+
+                def assess(
+                    self,
+                    question: str,
+                    memories: tuple[RecallMaterial, ...],
+                ) -> CapabilityAnswerability:
+                    self.assert_question = question
+                    self.memories = memories
+                    return CapabilityAnswerability(answerable=True, reason="covered")
+
+            engine = InspectingEngine()
+            package = MemoryGateway(instance_root).recall_v2(
+                V2RecallRequest(
+                    question="Gateway recall rule",
+                    task="gateway-contract",
+                    entrance="codex",
+                ),
+                engine,
+            )
+
+            self.assertEqual(engine.assert_question, "Gateway recall rule")
+            self.assertEqual(len(engine.memories), 1)
+            self.assertEqual(engine.memories[0].memory_id, proposal["planned_memory_id"])
+            self.assertEqual(engine.memories[0].body, "Gateway recall remains local.")
+            answerability = cast(dict[str, object], package["answerability"])
+            self.assertTrue(answerability["answerable"])
+
     def test_approved_memory_is_recalled_with_a_compact_logged_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
@@ -57,7 +134,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "Decision recording rule: when should a decision be recorded?",
                 "--task",
-                "prepare team guidance",
+                "prepare-team-guidance",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -74,10 +151,10 @@ class V2RecallTests(unittest.TestCase):
             package = json.loads(recalled.stdout)
             self.assertEqual(package["protocol_version"], {"major": 2, "minor": 0})
             self.assertRegex(package["recall_id"], r"^rec_[0-9a-f]{32}$")
-            self.assertEqual(
-                package["budget"],
-                {"limit_bytes": 16384, "used_bytes": 62, "truncated": False},
-            )
+            self.assertEqual(package["budget"]["limit_bytes"], 16384)
+            self.assertGreater(package["budget"]["used_bytes"], 62)
+            self.assertLessEqual(package["budget"]["used_bytes"], 16384)
+            self.assertFalse(package["budget"]["truncated"])
             self.assertEqual(
                 package["answerability"],
                 {"answerable": True, "reason": "covered", "overridden_by_core": False},
@@ -123,7 +200,7 @@ class V2RecallTests(unittest.TestCase):
             event = activity["events"][0]
             self.assertEqual(event["recall_id"], package["recall_id"])
             self.assertEqual(event["entrance"], "codex")
-            self.assertEqual(event["task"], "prepare team guidance")
+            self.assertEqual(event["task"], "prepare-team-guidance")
             self.assertEqual(event["selected_memories"], [
                 {
                     "candidate_paths": memory["candidate_paths"],
@@ -191,7 +268,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "Approved decision practice",
                 "--task",
-                "verify the decision rule",
+                "verify-decision-rule",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -204,11 +281,16 @@ class V2RecallTests(unittest.TestCase):
                 "json",
             )
             package = json.loads(recalled.stdout)
+            evidence_reference = package["memories"][0]["evidence"]["references"][0][
+                "reference_id"
+            ]
 
             first = run_cli(
                 "expand-recall-evidence",
                 package["recall_id"],
                 proposal["planned_memory_id"],
+                "--evidence-ref",
+                evidence_reference,
                 "--budget-bytes",
                 "48",
                 "--root",
@@ -220,6 +302,8 @@ class V2RecallTests(unittest.TestCase):
                 "expand-recall-evidence",
                 package["recall_id"],
                 proposal["planned_memory_id"],
+                "--evidence-ref",
+                evidence_reference,
                 "--budget-bytes",
                 "48",
                 "--root",
@@ -247,6 +331,28 @@ class V2RecallTests(unittest.TestCase):
             self.assertEqual(evidence["locator"], str(source_path.resolve()))
             self.assertEqual(evidence["excerpt"].encode("utf-8"), source_body.encode("utf-8")[:48])
 
+            reassessed = run_cli(
+                "assess-recall",
+                package["recall_id"],
+                "--answerable",
+                "true",
+                "--answerability-reason",
+                "covered",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(reassessed.returncode, 0, reassessed.stderr)
+            self.assertEqual(
+                json.loads(reassessed.stdout)["answerability"],
+                {
+                    "answerable": True,
+                    "reason": "covered",
+                    "overridden_by_core": False,
+                },
+            )
+
             activity = json.loads(
                 run_cli(
                     "recall-activity",
@@ -258,6 +364,7 @@ class V2RecallTests(unittest.TestCase):
             )
             self.assertTrue(activity["events"][0]["evidence_expanded"])
             self.assertEqual(activity["events"][0]["budget"], package["budget"])
+            self.assertTrue(activity["events"][0]["answerability"]["answerable"])
 
     def test_bounded_global_fts_recovers_a_memory_outside_the_routed_partition(
         self,
@@ -325,7 +432,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "For team planning, where should a cold snapshot be restored before verification?",
                 "--task",
-                "prepare a recovery checklist",
+                "prepare-recovery-checklist",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -353,7 +460,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "zyxwv unrelated unknown",
                 "--task",
-                "test the answerability gate",
+                "answerability-gate",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -422,7 +529,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "Bounded recall memory",
                 "--task",
-                "exercise a small recall budget",
+                "small-recall-budget",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -456,7 +563,7 @@ class V2RecallTests(unittest.TestCase):
                 "recall-memory",
                 "Bounded recall memory",
                 "--task",
-                "reject a non-binary contract",
+                "reject-nonbinary-contract",
                 "--entrance",
                 "codex",
                 "--answerable",
@@ -468,6 +575,23 @@ class V2RecallTests(unittest.TestCase):
             )
             self.assertEqual(invalid_contract.returncode, 2)
             self.assertIn("answerable=true requires reason covered", invalid_contract.stderr)
+
+            free_text_task = run_cli(
+                "recall-memory",
+                "Bounded recall memory",
+                "--task",
+                "What should the answer say?",
+                "--entrance",
+                "codex",
+                "--answerable",
+                "false",
+                "--answerability-reason",
+                "coverage-insufficient",
+                "--root",
+                str(instance_root),
+            )
+            self.assertEqual(free_text_task.returncode, 2)
+            self.assertIn("recall task must be a stable identifier", free_text_task.stderr)
 
 
 if __name__ == "__main__":

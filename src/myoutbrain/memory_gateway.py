@@ -31,6 +31,12 @@ from myoutbrain.local_core import (
 )
 from myoutbrain.retrieval import lexical_terms
 from myoutbrain.semantic_index import SemanticRecallIndex
+from myoutbrain.v2_recall import (
+    AnswerabilityEngine,
+    CapabilityAnswerability,
+    V2RecallRequest,
+    V2RecallService,
+)
 
 
 class MemoryAccess(StrEnum):
@@ -207,6 +213,41 @@ class MemoryGateway:
             proposal_id,
             instruction,
         )
+
+    def recall_v2(
+        self,
+        request: V2RecallRequest,
+        answerability_engine: AnswerabilityEngine,
+    ) -> dict[str, object]:
+        return V2RecallService(self._root).recall(request, answerability_engine)
+
+    def expand_v2_evidence(
+        self,
+        recall_id: str,
+        memory_id: str,
+        *,
+        evidence_reference_ids: tuple[str, ...],
+        budget_bytes: int,
+    ) -> dict[str, object]:
+        return V2RecallService(self._root).expand_evidence(
+            recall_id,
+            memory_id,
+            evidence_reference_ids=evidence_reference_ids,
+            budget_bytes=budget_bytes,
+        )
+
+    def assess_v2_recall(
+        self,
+        recall_id: str,
+        capability_answerability: CapabilityAnswerability,
+    ) -> dict[str, object]:
+        return V2RecallService(self._root).assess_answerability(
+            recall_id,
+            capability_answerability,
+        )
+
+    def v2_recall_activity(self) -> dict[str, object]:
+        return V2RecallService(self._root).activity()
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()

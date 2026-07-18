@@ -57,8 +57,8 @@ from myoutbrain.memory_governance import MemoryGovernanceService
 from myoutbrain.v2_recall import (
     AnswerabilityReason,
     CapabilityAnswerability,
+    FixedAnswerabilityEngine,
     V2RecallRequest,
-    V2RecallService,
 )
 
 
@@ -169,6 +169,9 @@ def build_parser() -> argparse.ArgumentParser:
     expand_recall_evidence_parser.add_argument("recall_id")
     expand_recall_evidence_parser.add_argument("memory_id")
     expand_recall_evidence_parser.add_argument(
+        "--evidence-ref", action="append", required=True
+    )
+    expand_recall_evidence_parser.add_argument(
         "--budget-bytes", type=int, required=True
     )
     expand_recall_evidence_parser.add_argument(
@@ -183,6 +186,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recall_activity_parser.add_argument("--root", type=Path, default=Path.cwd())
     recall_activity_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    assess_recall_parser = subcommands.add_parser(
+        "assess-recall",
+        help="Record a capability engine's binary judgement for a V2 recall",
+    )
+    assess_recall_parser.add_argument("recall_id")
+    assess_recall_parser.add_argument(
+        "--answerable", choices=("true", "false"), required=True
+    )
+    assess_recall_parser.add_argument(
+        "--answerability-reason",
+        choices=(
+            "covered",
+            "coverage-insufficient",
+            "freshness-insufficient",
+            "missing-dependency",
+            "unresolved-conflict",
+        ),
+        required=True,
+    )
+    assess_recall_parser.add_argument("--root", type=Path, default=Path.cwd())
+    assess_recall_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     capture_parser = subcommands.add_parser("capture", help="Capture a Markdown source")
@@ -646,16 +672,18 @@ def _recall_memory(
     budget_bytes: int,
     output_format: str,
 ) -> int:
-    package = V2RecallService(root).recall(
+    package = MemoryGateway(root).recall_v2(
         V2RecallRequest(
             question=question,
             task=task,
             entrance=entrance,
-            capability_answerability=CapabilityAnswerability(
+            budget_bytes=budget_bytes,
+        ),
+        FixedAnswerabilityEngine(
+            CapabilityAnswerability(
                 answerable=answerable,
                 reason=cast(AnswerabilityReason, answerability_reason),
-            ),
-            budget_bytes=budget_bytes,
+            )
         )
     )
     if output_format == "json":
@@ -671,7 +699,7 @@ def _recall_memory(
 
 
 def _recall_activity(root: Path, output_format: str) -> int:
-    activity = V2RecallService(root).activity()
+    activity = MemoryGateway(root).v2_recall_activity()
     if output_format == "json":
         print(json.dumps(activity, ensure_ascii=False, sort_keys=True))
     else:
@@ -690,18 +718,45 @@ def _expand_recall_evidence(
     recall_id: str,
     memory_id: str,
     *,
+    evidence_reference_ids: tuple[str, ...],
     budget_bytes: int,
     output_format: str,
 ) -> int:
-    expansion = V2RecallService(root).expand_evidence(
+    expansion = MemoryGateway(root).expand_v2_evidence(
         recall_id,
         memory_id,
+        evidence_reference_ids=evidence_reference_ids,
         budget_bytes=budget_bytes,
     )
     if output_format == "json":
         print(json.dumps(expansion, ensure_ascii=False, sort_keys=True))
     else:
         print(f"Expanded evidence for {memory_id} in recall {recall_id}")
+    return 0
+
+
+def _assess_recall(
+    root: Path,
+    recall_id: str,
+    *,
+    answerable: bool,
+    answerability_reason: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).assess_v2_recall(
+        recall_id,
+        CapabilityAnswerability(
+            answerable=answerable,
+            reason=cast(AnswerabilityReason, answerability_reason),
+        ),
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"Recall {recall_id} answerable: "
+            f"{result['answerability']}"
+        )
     return 0
 
 
@@ -1313,7 +1368,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 parsed_arguments.recall_id,
                 parsed_arguments.memory_id,
+                evidence_reference_ids=tuple(parsed_arguments.evidence_ref),
                 budget_bytes=parsed_arguments.budget_bytes,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "assess-recall":
+            return _assess_recall(
+                parsed_arguments.root,
+                parsed_arguments.recall_id,
+                answerable=parsed_arguments.answerable == "true",
+                answerability_reason=parsed_arguments.answerability_reason,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "recall-activity":
