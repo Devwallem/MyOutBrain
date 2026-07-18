@@ -33,19 +33,21 @@ Treat Codex as a replaceable intelligent entrance. Keep identity, provenance, ap
 
 ## After a substantive task
 
-1. Create a temporary UTF-8 file containing only context actually visible in this task. Prefer the user's words, observed results, and concrete decisions over a speculative biography.
-2. Write one compact digest, a precise visible-context description, and at least one explicit context gap. State unavailable history plainly.
-3. Submit through the shared gateway:
+1. Check only for an explicit learning signal: a user correction, confirmed decision, reusable step, repeated failure plus resolution, or research question worth tracking. Message count, token count, task duration, ordinary completion and silence are not signals.
+2. If no learning signal exists, do not create a file, submit an input, or start reflection.
+3. If a signal exists, create a temporary UTF-8 JSON payload containing only the necessary excerpt, stable source identity/version/locator, SHA-256 source fingerprint, applicability scope, visible coverage and explicit blind spots. Do not copy the full conversation, codebase or tool output.
+4. Submit through the shared gateway:
 
    ```text
-   python -m myoutbrain codex-submit <visible-task-file> --root <instance> --occurred-at <ISO-8601-with-offset> --task-pointer <task> --digest "<compact memory>" --sensitivity local-only --visible-context "<what was visible>" --context-gap "<what was unavailable>" --format json
+   python -m myoutbrain submit-learning-signal <payload-json> --root <instance> --idempotency-key <stable-task-signal-key> --format json
    ```
 
-4. Delete the temporary file after a successful or failed submission. Do not maintain a separate Codex memory file.
-5. Use `cloud-allowed` only when the visible experience is explicitly safe for external processing. The default is `local-only`.
+5. Delete the temporary file after a successful or failed submission. Do not maintain a separate Codex memory file or directly invoke proposal writes.
+6. Use `cloud-allowed` only when the excerpt and reference are explicitly safe for external processing. The default is `local-only`.
 
 ## Review and continuity
 
 - Use `consolidate --task <task>` to prepare proposals and `review-memory` for natural approval, correction, rejection, or conflict preservation. Never approve on the user's behalf.
+- Use `$myoutbrain-reflector` only for explicit immediate reflection. Companion and Reflector coordinate solely through reflection input and proposal identities returned by the gateway.
 - Use `pending-consolidation-reviews` when returning to offline work.
 - Expect memory IDs and accepted knowledge to survive capability-engine replacement and deletion/rebuild of indexes or Obsidian views. If they do not, stop and report an integrity failure.

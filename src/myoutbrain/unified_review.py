@@ -629,6 +629,48 @@ def stage_review_proposal(
                     payload,
                     updated_at=created_at,
                 )
+                near_ids = tuple(
+                    related_id
+                    for related_id in payload.near_proposal_ids
+                    if related_id != duplicate.proposal_id
+                )
+                conflict_ids = tuple(
+                    related_id
+                    for related_id in payload.conflict_proposal_ids
+                    if related_id != duplicate.proposal_id
+                )
+                if near_ids or conflict_ids:
+                    relation_payload = replace(
+                        payload,
+                        near_proposal_ids=near_ids,
+                        conflict_proposal_ids=conflict_ids,
+                    )
+                    _validate_relation_targets(
+                        connection,
+                        duplicate.proposal_id,
+                        relation_payload,
+                    )
+                    _group_proposal_relations(
+                        connection,
+                        proposal_id=duplicate.proposal_id,
+                        near_proposal_ids=near_ids,
+                        conflict_proposal_ids=conflict_ids,
+                        created_at=created_at,
+                    )
+                    for related_id, relation_type in (
+                        tuple((related_id, "near") for related_id in near_ids)
+                        + tuple(
+                            (related_id, "conflict")
+                            for related_id in conflict_ids
+                        )
+                    ):
+                        _append_relation_to_existing_proposal(
+                            connection,
+                            proposal_id=duplicate.proposal_id,
+                            related_id=related_id,
+                            relation_type=relation_type,
+                            updated_at=created_at,
+                        )
                 connection.execute(
                     """
                     INSERT INTO review_proposal_submissions
@@ -638,8 +680,14 @@ def stage_review_proposal(
                     (normalized_key, request_hash, duplicate.proposal_id, created_at),
                 )
                 connection.commit()
+                refreshed = connection.execute(
+                    "SELECT * FROM review_proposals WHERE proposal_id = ?",
+                    (duplicate.proposal_id,),
+                ).fetchone()
+                if refreshed is None:
+                    raise IntegrityError("deduplicated review proposal disappeared")
                 return temporary_path.read_bytes(), ReviewProposalSubmission(
-                    proposal=duplicate,
+                    proposal=_proposal_from_row(refreshed),
                     deduplicated=True,
                 )
             terminal_row = connection.execute(
@@ -1890,20 +1938,55 @@ def _merge_duplicate_evidence(
         existing.payload.opposing_evidence,
         incoming.opposing_evidence,
     )
+    context_coverage = tuple(
+        dict.fromkeys(existing.payload.context_coverage + incoming.context_coverage)
+    )
+    blind_spots = tuple(
+        dict.fromkeys(existing.payload.blind_spots + incoming.blind_spots)
+    )
+    migration_restrictions = tuple(
+        dict.fromkeys(
+            existing.payload.migration_restrictions
+            + incoming.migration_restrictions
+        )
+    )
+    sensitivity = (
+        "local-only"
+        if "local-only" in (existing.payload.sensitivity, incoming.sensitivity)
+        else "cloud-allowed"
+    )
+    retention_order = {"receipt": 0, "excerpt": 1, "full": 2}
+    evidence_retention = max(
+        (existing.payload.evidence_retention, incoming.evidence_retention),
+        key=retention_order.__getitem__,
+    )
     if (
         supporting != existing.payload.supporting_evidence
         or opposing != existing.payload.opposing_evidence
+        or context_coverage != existing.payload.context_coverage
+        or blind_spots != existing.payload.blind_spots
+        or migration_restrictions != existing.payload.migration_restrictions
+        or sensitivity != existing.payload.sensitivity
+        or evidence_retention != existing.payload.evidence_retention
     ):
         connection.execute(
             """
             UPDATE review_proposals
             SET supporting_evidence_json = ?, opposing_evidence_json = ?,
+                context_coverage_json = ?, blind_spots_json = ?,
+                migration_restrictions_json = ?, sensitivity = ?,
+                evidence_retention = ?,
                 proposal_version = proposal_version + 1, updated_at = ?
             WHERE proposal_id = ?
             """,
             (
                 _json(list(supporting)),
                 _json(list(opposing)),
+                _json(list(context_coverage)),
+                _json(list(blind_spots)),
+                _json(list(migration_restrictions)),
+                sensitivity,
+                evidence_retention,
                 updated_at,
                 existing.proposal_id,
             ),

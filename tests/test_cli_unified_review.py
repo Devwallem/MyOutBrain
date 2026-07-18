@@ -308,6 +308,27 @@ class UnifiedReviewTests(unittest.TestCase):
                 ).stdout
             )["proposal"]
 
+            relational_duplicate_payload = {
+                **base_payload,
+                "supporting_evidence": [{"kind": "source", "source_id": "src_c"}],
+                "conflict_proposal_ids": [near["proposal_id"]],
+            }
+            payload_path.write_text(
+                json.dumps(relational_duplicate_payload), encoding="utf-8"
+            )
+            relational_duplicate = json.loads(
+                run_cli(
+                    "review-propose",
+                    str(payload_path),
+                    "--idempotency-key",
+                    "batch-rule-relational-duplicate",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )
+
             conflict_payload = {
                 **base_payload,
                 "content": "Every review item must fail when any independent item fails.",
@@ -347,6 +368,11 @@ class UnifiedReviewTests(unittest.TestCase):
                     {"kind": "source", "source_id": "src_b"},
                 ],
             )
+            self.assertTrue(relational_duplicate["deduplicated"])
+            self.assertIn(
+                near["proposal_id"],
+                relational_duplicate["proposal"]["conflict_proposal_ids"],
+            )
             self.assertEqual(len(queue["proposals"]), 3)
             self.assertNotEqual(near["proposal_id"], original["proposal_id"])
             self.assertNotEqual(conflict["proposal_id"], original["proposal_id"])
@@ -367,6 +393,10 @@ class UnifiedReviewTests(unittest.TestCase):
                     (
                         "conflict",
                         frozenset({original["proposal_id"], conflict["proposal_id"]}),
+                    ),
+                    (
+                        "conflict",
+                        frozenset({original["proposal_id"], near["proposal_id"]}),
                     ),
                 },
             )

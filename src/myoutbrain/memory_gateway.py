@@ -29,6 +29,11 @@ from myoutbrain.local_core import (
     LocalMemoryCore,
     RecallableMemory,
 )
+from myoutbrain.reflection import (
+    ImmediateReflectionRequest,
+    LearningSignalSubmission,
+    ReflectionAbandonmentRequest,
+)
 from myoutbrain.retrieval import lexical_terms
 from myoutbrain.semantic_index import SemanticRecallIndex
 from myoutbrain.v2_recall import (
@@ -188,6 +193,61 @@ class MemoryGateway:
             visible_context=submission.visible_context,
             context_gaps=submission.context_gaps,
         )
+
+    def submit_learning_signal(
+        self,
+        submission: LearningSignalSubmission,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        if submission.signal_kind is None:
+            return {"captured": False, "input": None}
+        return self._memory_core.submit_learning_signal(
+            submission,
+            idempotency_key=idempotency_key,
+        ).to_data()
+
+    def reflection_inputs(
+        self,
+        *,
+        limit: int = 20,
+        budget_bytes: int = 16 * 1024,
+    ) -> dict[str, object]:
+        inputs, truncated, used_bytes = self._memory_core.reflection_inputs(
+            limit=limit,
+            budget_bytes=budget_bytes,
+        )
+        return {
+            "inputs": [
+                reflection_input.to_data()
+                for reflection_input in inputs
+            ],
+            "budget_bytes": budget_bytes,
+            "used_bytes": used_bytes,
+            "truncated": truncated,
+        }
+
+    def reflect_now(
+        self,
+        request: ImmediateReflectionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.reflect_now(
+            request,
+            idempotency_key=idempotency_key,
+        ).to_data()
+
+    def abandon_reflection(
+        self,
+        request: ReflectionAbandonmentRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.abandon_reflection(
+            request,
+            idempotency_key=idempotency_key,
+        ).to_data()
 
     def propose_consolidation(
         self,

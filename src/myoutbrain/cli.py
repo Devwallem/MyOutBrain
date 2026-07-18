@@ -54,6 +54,11 @@ from myoutbrain.memory_gateway import (
     RecallRequest,
 )
 from myoutbrain.memory_governance import MemoryGovernanceService
+from myoutbrain.reflection import (
+    load_immediate_reflection,
+    load_learning_signal,
+    load_reflection_abandonment,
+)
 from myoutbrain.v2_recall import (
     AnswerabilityReason,
     CapabilityAnswerability,
@@ -210,6 +215,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assess_recall_parser.add_argument("--root", type=Path, default=Path.cwd())
     assess_recall_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    submit_learning_signal_parser = subcommands.add_parser(
+        "submit-learning-signal",
+        help="Submit an explicit task learning signal through the memory gateway",
+    )
+    submit_learning_signal_parser.add_argument("payload", type=Path)
+    submit_learning_signal_parser.add_argument("--idempotency-key", required=True)
+    submit_learning_signal_parser.add_argument(
+        "--root", type=Path, default=Path.cwd()
+    )
+    submit_learning_signal_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    reflection_inputs_parser = subcommands.add_parser(
+        "reflection-inputs",
+        help="List bounded temporary inputs available to the reflector",
+    )
+    reflection_inputs_parser.add_argument("--limit", type=int, default=20)
+    reflection_inputs_parser.add_argument(
+        "--budget-bytes", type=int, default=16 * 1024
+    )
+    reflection_inputs_parser.add_argument("--root", type=Path, default=Path.cwd())
+    reflection_inputs_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    reflect_now_parser = subcommands.add_parser(
+        "reflect-now",
+        help="Immediately turn bounded reflection inputs into grouped review",
+    )
+    reflect_now_parser.add_argument("payload", type=Path)
+    reflect_now_parser.add_argument("--idempotency-key", required=True)
+    reflect_now_parser.add_argument("--root", type=Path, default=Path.cwd())
+    reflect_now_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    abandon_reflection_parser = subcommands.add_parser(
+        "abandon-reflection",
+        help="Explicitly abandon and clean bounded reflection inputs",
+    )
+    abandon_reflection_parser.add_argument("payload", type=Path)
+    abandon_reflection_parser.add_argument("--idempotency-key", required=True)
+    abandon_reflection_parser.add_argument("--root", type=Path, default=Path.cwd())
+    abandon_reflection_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     review_propose_parser = subcommands.add_parser(
@@ -823,6 +872,94 @@ def _review_propose(
     else:
         print(f"Pending review proposal {submission.proposal.proposal_id}")
     return 0
+
+
+def _submit_learning_signal(
+    root: Path,
+    payload_path: Path,
+    *,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    payload = _load_json_payload(payload_path, "learning signal")
+    result = MemoryGateway(root).submit_learning_signal(
+        load_learning_signal(payload),
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print("No learning signal captured.")
+    return 0
+
+
+def _reflection_inputs(
+    root: Path,
+    *,
+    limit: int,
+    budget_bytes: int,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).reflection_inputs(
+        limit=limit,
+        budget_bytes=budget_bytes,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        inputs = result["inputs"]
+        print(f"{len(inputs) if isinstance(inputs, list) else 0} reflection input(s).")
+    return 0
+
+
+def _reflect_now(
+    root: Path,
+    payload_path: Path,
+    *,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    payload = _load_json_payload(payload_path, "immediate reflection")
+    result = MemoryGateway(root).reflect_now(
+        load_immediate_reflection(payload),
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        candidate_ids = result["candidate_proposal_ids"]
+        candidate_count = len(candidate_ids) if isinstance(candidate_ids, dict) else 0
+        print(
+            f"Reflection {result['run_id']} completed with "
+            f"{candidate_count} candidate(s)."
+        )
+    return 0
+
+
+def _abandon_reflection(
+    root: Path,
+    payload_path: Path,
+    *,
+    idempotency_key: str,
+    output_format: str,
+) -> int:
+    payload = _load_json_payload(payload_path, "reflection abandonment")
+    result = MemoryGateway(root).abandon_reflection(
+        load_reflection_abandonment(payload),
+        idempotency_key=idempotency_key,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Reflection {result['run_id']} abandoned.")
+    return 0
+
+
+def _load_json_payload(path: Path, description: str) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UserInputError(f"cannot read {description} payload: {path}") from error
 
 
 def _review_list(root: Path, output_format: str) -> int:
@@ -1499,6 +1636,34 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
         if parsed_arguments.command == "recall-activity":
             return _recall_activity(parsed_arguments.root, parsed_arguments.format)
+        if parsed_arguments.command == "submit-learning-signal":
+            return _submit_learning_signal(
+                parsed_arguments.root,
+                parsed_arguments.payload,
+                idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "reflection-inputs":
+            return _reflection_inputs(
+                parsed_arguments.root,
+                limit=parsed_arguments.limit,
+                budget_bytes=parsed_arguments.budget_bytes,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "reflect-now":
+            return _reflect_now(
+                parsed_arguments.root,
+                parsed_arguments.payload,
+                idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "abandon-reflection":
+            return _abandon_reflection(
+                parsed_arguments.root,
+                parsed_arguments.payload,
+                idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
         if parsed_arguments.command == "review-propose":
             return _review_propose(
                 parsed_arguments.root,

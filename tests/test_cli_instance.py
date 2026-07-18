@@ -28,7 +28,7 @@ class V2InstanceLifecycleTests(unittest.TestCase):
                 json.loads(status.stdout),
                 {
                     "instance_version": 2,
-                    "canonical_schema_version": 8,
+                    "canonical_schema_version": 9,
                     "write": {
                         "available": True,
                         "mode": "single-writer",

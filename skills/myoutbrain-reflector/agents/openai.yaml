@@ -1,0 +1,4 @@
+interface:
+  display_name: "MyOutBrain Reflector"
+  short_description: "Turn learning signals into grouped review proposals"
+  default_prompt: "Use $myoutbrain-reflector to reflect on pending learning signals now."

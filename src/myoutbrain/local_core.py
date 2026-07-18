@@ -39,6 +39,19 @@ from myoutbrain.persistence import (
     writer_lock,
 )
 from myoutbrain.retrieval import lexical_terms
+from myoutbrain.reflection import (
+    ImmediateReflectionRequest,
+    ImmediateReflectionResult,
+    LearningSignalCapture,
+    LearningSignalSubmission,
+    REFLECTION_SCHEMA,
+    ReflectionInput,
+    ReflectionAbandonmentRequest,
+    read_reflection_inputs,
+    stage_immediate_reflection,
+    stage_reflection_abandonment,
+    stage_learning_signal,
+)
 from myoutbrain.unified_review import (
     ReviewProposalInput,
     ReviewProposalSubmission,
@@ -55,7 +68,7 @@ from myoutbrain.unified_review import (
 )
 
 
-MEMORY_SCHEMA_VERSION = 8
+MEMORY_SCHEMA_VERSION = 9
 MEMORY_DATABASE = "store/memory.sqlite3"
 MEMORY_BODY_TARGET_BYTES = 4 * 1024
 MEMORY_BODY_HARD_LIMIT_BYTES = 8 * 1024
@@ -409,7 +422,7 @@ CREATE TABLE deletion_markers (
     deleted_at TEXT NOT NULL,
     backup_exclusion_after TEXT NOT NULL
 );
-""" + UNIFIED_REVIEW_SCHEMA
+""" + UNIFIED_REVIEW_SCHEMA + REFLECTION_SCHEMA
 
 
 MemoryDisposition = Literal["buffered", "duplicate"]
@@ -1185,6 +1198,92 @@ class LocalMemoryCore:
             atomic_commit(self._root, [(database_path, staged_database)])
         return submission
 
+    def submit_learning_signal(
+        self,
+        submission: LearningSignalSubmission,
+        *,
+        idempotency_key: str,
+    ) -> LearningSignalCapture:
+        if submission.signal_kind is None:
+            return LearningSignalCapture(False, None)
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, capture = stage_learning_signal(
+                database_path,
+                submission,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return capture
+
+    def reflection_inputs(
+        self,
+        *,
+        limit: int,
+        budget_bytes: int,
+    ) -> tuple[tuple[ReflectionInput, ...], bool, int]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        self._validate_database(database_path)
+        return read_reflection_inputs(
+            database_path,
+            limit=limit,
+            budget_bytes=budget_bytes,
+        )
+
+    def reflect_now(
+        self,
+        request: ImmediateReflectionRequest,
+        *,
+        idempotency_key: str,
+    ) -> ImmediateReflectionResult:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_immediate_reflection(
+                database_path,
+                request,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def abandon_reflection(
+        self,
+        request: ReflectionAbandonmentRequest,
+        *,
+        idempotency_key: str,
+    ) -> ImmediateReflectionResult:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_reflection_abandonment(
+                database_path,
+                request,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
     def review_queue(self) -> ReviewQueue:
         database_path = self._root / MEMORY_DATABASE
         if not database_path.is_file():
@@ -1270,6 +1369,7 @@ class LocalMemoryCore:
             5: self._migrate_v5_database,
             6: self._migrate_v6_database,
             7: self._migrate_v7_database,
+            8: self._migrate_v8_database,
         }
         try:
             with tempfile.NamedTemporaryFile(
@@ -3901,6 +4001,30 @@ class LocalMemoryCore:
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot initialize the local memory database") from error
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _migrate_v8_database(database_path: Path) -> bytes:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=database_path.parent,
+                prefix=".memory-migrate.",
+                suffix=".sqlite3",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(database_path.read_bytes())
+            with closing(sqlite3.connect(temporary_path)) as connection:
+                connection.executescript(REFLECTION_SCHEMA)
+                connection.execute("PRAGMA user_version = 9")
+                connection.commit()
+            return temporary_path.read_bytes()
+        except (OSError, sqlite3.Error) as error:
+            raise IntegrityError("cannot migrate the local memory database") from error
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
