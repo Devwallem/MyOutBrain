@@ -52,6 +52,7 @@ from myoutbrain.v2_public_search import (
     V2PublicSearchRequest,
     V2PublicSearchService,
 )
+from myoutbrain.v2_memory_lifecycle import V2MemoryLifecycleService
 
 
 class MemoryAccess(StrEnum):
@@ -290,6 +291,110 @@ class MemoryGateway:
         answerability_engine: AnswerabilityEngine,
     ) -> dict[str, object]:
         return V2RecallService(self._root).recall(request, answerability_engine)
+
+    def historicize_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).historicize(
+            memory_id,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def revise_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        body: str,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).revise(
+            memory_id,
+            body=body,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def supersede_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        replacement_memory_id: str,
+        replacement_version: int,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).supersede(
+            memory_id,
+            replacement_memory_id=replacement_memory_id,
+            replacement_version=replacement_version,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def deactivate_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).deactivate(
+            memory_id,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def restore_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).restore(
+            memory_id,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def erase_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        confirmation: str | None,
+        entrance: str,
+    ) -> dict[str, object]:
+        return V2MemoryLifecycleService(self._root).erase(
+            memory_id,
+            confirmation=confirmation,
+            entrance=entrance,
+        )
 
     def expand_v2_evidence(
         self,

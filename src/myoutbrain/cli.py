@@ -163,6 +163,73 @@ def build_parser() -> argparse.ArgumentParser:
     rename_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
+    historicize_memory_parser = subcommands.add_parser(
+        "historicize-memory",
+        help="Explicitly mark current V2 memory as historically trusted",
+    )
+    historicize_memory_parser.add_argument("memory_id")
+    historicize_memory_parser.add_argument("--reason", required=True)
+    historicize_memory_parser.add_argument("--expected-version", type=int, required=True)
+    historicize_memory_parser.add_argument("--idempotency-key", required=True)
+    historicize_memory_parser.add_argument("--entrance", required=True)
+    historicize_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    historicize_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    revise_memory_parser = subcommands.add_parser(
+        "revise-memory",
+        help="Revise V2 memory under its stable identity while retaining history",
+    )
+    revise_memory_parser.add_argument("memory_id")
+    revise_memory_parser.add_argument("--body", required=True)
+    revise_memory_parser.add_argument("--reason", required=True)
+    revise_memory_parser.add_argument("--expected-version", type=int, required=True)
+    revise_memory_parser.add_argument("--idempotency-key", required=True)
+    revise_memory_parser.add_argument("--entrance", required=True)
+    revise_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    revise_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    supersede_memory_parser = subcommands.add_parser(
+        "supersede-memory",
+        help="Explicitly replace one V2 memory with another approved version",
+    )
+    supersede_memory_parser.add_argument("memory_id")
+    supersede_memory_parser.add_argument("--replacement-memory-id", required=True)
+    supersede_memory_parser.add_argument("--replacement-version", type=int, required=True)
+    supersede_memory_parser.add_argument("--reason", required=True)
+    supersede_memory_parser.add_argument("--expected-version", type=int, required=True)
+    supersede_memory_parser.add_argument("--idempotency-key", required=True)
+    supersede_memory_parser.add_argument("--entrance", required=True)
+    supersede_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    supersede_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    for command, help_text in (
+        ("deactivate-memory", "Reversibly remove V2 memory from ordinary recall"),
+        ("restore-memory", "Restore inactive V2 memory to its previous live state"),
+    ):
+        availability_parser = subcommands.add_parser(command, help=help_text)
+        availability_parser.add_argument("memory_id")
+        availability_parser.add_argument("--reason", required=True)
+        availability_parser.add_argument("--expected-version", type=int, required=True)
+        availability_parser.add_argument("--idempotency-key", required=True)
+        availability_parser.add_argument("--entrance", required=True)
+        availability_parser.add_argument("--root", type=Path, default=Path.cwd())
+        availability_parser.add_argument(
+            "--format", choices=("json", "text"), default="text"
+        )
+    erase_memory_parser = subcommands.add_parser(
+        "erase-memory",
+        help="Preview or explicitly confirm permanent V2 memory erasure",
+    )
+    erase_memory_parser.add_argument("memory_id")
+    erase_memory_parser.add_argument("--confirm")
+    erase_memory_parser.add_argument("--entrance", default="local-cli")
+    erase_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    erase_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
     recall_memory_parser = subcommands.add_parser(
         "recall-memory",
         help="Recall a compact package from V2 canonical memory",
@@ -829,6 +896,142 @@ def _rename_memory(
         print(f"Renamed {result.memory_id} to {result.canonical_name}.")
         if result.aliases:
             print(f"Aliases: {', '.join(result.aliases)}")
+    return 0
+
+
+def _historicize_memory(
+    root: Path,
+    memory_id: str,
+    *,
+    reason: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).historicize_v2_memory(
+        memory_id,
+        reason=reason,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Historicized {memory_id}: {reason}")
+    return 0
+
+
+def _revise_memory(
+    root: Path,
+    memory_id: str,
+    *,
+    body: str,
+    reason: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).revise_v2_memory(
+        memory_id,
+        body=body,
+        reason=reason,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        current_version = cast(dict[str, object], result["current_version"])
+        print(f"Revised {memory_id} to version {current_version['version']}")
+    return 0
+
+
+def _supersede_memory(
+    root: Path,
+    memory_id: str,
+    *,
+    replacement_memory_id: str,
+    replacement_version: int,
+    reason: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).supersede_v2_memory(
+        memory_id,
+        replacement_memory_id=replacement_memory_id,
+        replacement_version=replacement_version,
+        reason=reason,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Superseded {memory_id} with {replacement_memory_id}")
+    return 0
+
+
+def _change_memory_availability(
+    root: Path,
+    memory_id: str,
+    *,
+    restore: bool,
+    reason: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    gateway = MemoryGateway(root)
+    if restore:
+        result = gateway.restore_v2_memory(
+            memory_id,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+    else:
+        result = gateway.deactivate_v2_memory(
+            memory_id,
+            reason=reason,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{result['from_state']} -> {result['to_state']}: {memory_id}")
+    return 0
+
+
+def _erase_memory(
+    root: Path,
+    memory_id: str,
+    *,
+    confirmation: str | None,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).erase_v2_memory(
+        memory_id,
+        confirmation=confirmation,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Permanent erasure: {result['disposition']}")
+        if result["disposition"] == "preview":
+            print(f"Confirmation token: {result['confirmation_token']}")
     return 0
 
 
@@ -1756,6 +1959,58 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 name=parsed_arguments.name,
                 expected_version=parsed_arguments.expected_version,
                 idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "historicize-memory":
+            return _historicize_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                reason=parsed_arguments.reason,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "revise-memory":
+            return _revise_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                body=parsed_arguments.body,
+                reason=parsed_arguments.reason,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "supersede-memory":
+            return _supersede_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                replacement_memory_id=parsed_arguments.replacement_memory_id,
+                replacement_version=parsed_arguments.replacement_version,
+                reason=parsed_arguments.reason,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command in ("deactivate-memory", "restore-memory"):
+            return _change_memory_availability(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                restore=parsed_arguments.command == "restore-memory",
+                reason=parsed_arguments.reason,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "erase-memory":
+            return _erase_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                confirmation=parsed_arguments.confirm,
                 entrance=parsed_arguments.entrance,
                 output_format=parsed_arguments.format,
             )

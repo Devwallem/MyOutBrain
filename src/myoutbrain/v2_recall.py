@@ -676,7 +676,8 @@ def _load_candidates(
               ON capsule_partition.capsule_id = dictionary.primary_capsule_id
             JOIN knowledge_partitions AS partition
               ON partition.partition_id = capsule_partition.partition_id
-            WHERE dictionary.memory_id = ? AND memory.state = 'active'
+            WHERE dictionary.memory_id = ?
+              AND memory.state IN ('current', 'historical-trusted')
             """,
             (memory_id,),
         ).fetchone()
@@ -715,7 +716,7 @@ def _load_candidates(
             _Candidate(
                 memory_id=cast(str, row[0]),
                 version=cast(int, row[1]),
-                state="current",
+                state=cast(str, row[2]),
                 canonical_name=cast(str, row[3]),
                 body=cast(str, row[4]),
                 scope=cast(str, row[5]),

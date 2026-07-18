@@ -1669,7 +1669,7 @@ def _materialize_canonical_memory(
         INSERT INTO canonical_memories
             (memory_id, content, current_version, sensitivity, state,
              created_at, updated_at)
-        VALUES (?, '', 1, ?, 'active', ?, ?)
+        VALUES (?, '', 1, ?, 'current', ?, ?)
         """,
         (memory_id, proposal.payload.sensitivity, materialized_at, materialized_at),
     )

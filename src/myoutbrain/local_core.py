@@ -156,7 +156,10 @@ CREATE TABLE canonical_memories (
     content TEXT NOT NULL,
     current_version INTEGER NOT NULL,
     sensitivity TEXT NOT NULL CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
-    state TEXT NOT NULL CHECK (state IN ('active', 'inactive')),
+    state TEXT NOT NULL
+        CHECK (state IN ('current', 'historical-trusted', 'superseded', 'inactive')),
+    previous_live_state TEXT
+        CHECK (previous_live_state IN ('current', 'historical-trusted', 'superseded')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -202,6 +205,23 @@ CREATE TABLE canonical_memory_version_evidence (
     FOREIGN KEY (source_id, source_version)
         REFERENCES evidence_source_versions(source_id, version),
     PRIMARY KEY (memory_id, version, source_id, source_version, relationship)
+);
+
+CREATE TABLE canonical_memory_dependencies (
+    memory_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    depends_on_memory_id TEXT NOT NULL,
+    depends_on_version INTEGER NOT NULL,
+    relationship TEXT NOT NULL CHECK (relationship IN ('depends-on', 'supersedes')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (memory_id, version)
+        REFERENCES canonical_memory_versions(memory_id, version),
+    FOREIGN KEY (depends_on_memory_id, depends_on_version)
+        REFERENCES canonical_memory_versions(memory_id, version),
+    CHECK (memory_id <> depends_on_memory_id),
+    PRIMARY KEY (
+        memory_id, version, depends_on_memory_id, depends_on_version, relationship
+    )
 );
 
 CREATE TABLE canonical_memory_relations (
@@ -343,6 +363,18 @@ CREATE TABLE audit_events (
     result_hash TEXT NOT NULL
 );
 
+CREATE TABLE canonical_memory_lifecycle_events (
+    event_id TEXT PRIMARY KEY REFERENCES audit_events(event_id),
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    from_state TEXT NOT NULL
+        CHECK (from_state IN ('current', 'historical-trusted', 'superseded', 'inactive')),
+    to_state TEXT NOT NULL
+        CHECK (to_state IN ('current', 'historical-trusted', 'superseded', 'inactive')),
+    reason TEXT NOT NULL,
+    previous_live_state TEXT
+        CHECK (previous_live_state IN ('current', 'historical-trusted', 'superseded'))
+);
+
 CREATE TABLE idempotent_writes (
     operation TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -459,7 +491,9 @@ IntegrationAction = Literal["new", "supplement", "revise", "conflict"]
 AppliedIntegrationAction = Literal[
     "created", "supplemented", "revised", "conflicted", "rejected"
 ]
-MemoryLifecycleAction = Literal["deactivated", "reactivated"]
+MemoryLifecycleAction = Literal[
+    "historicized", "superseded", "deactivated", "restored", "reactivated"
+]
 
 
 @dataclass(frozen=True)
@@ -1130,7 +1164,7 @@ class MemoryStorageReport:
 @dataclass(frozen=True)
 class CanonicalMemoryAudit:
     memory_id: str
-    state: Literal["active", "inactive"]
+    state: Literal["current", "historical-trusted", "superseded", "inactive"]
     confirmation_status: Literal["confirmed", "conflicted"]
     current_version: int
     current_content: str
@@ -2571,7 +2605,7 @@ class LocalMemoryCore:
                         LEFT JOIN canonical_memory_version_sources AS source
                           ON source.memory_id = c.memory_id
                          AND source.version = c.current_version
-                        WHERE c.state = 'active'
+                        WHERE c.state IN ('current', 'historical-trusted')
                         GROUP BY c.memory_id, c.content, c.updated_at, c.sensitivity
                         """
                     ).fetchall()
@@ -2699,7 +2733,7 @@ class LocalMemoryCore:
                         FROM canonical_memories AS c
                         LEFT JOIN canonical_memory_sources AS source
                           ON source.memory_id = c.memory_id
-                        WHERE c.state = 'active'
+                        WHERE c.state IN ('current', 'historical-trusted')
                         GROUP BY c.memory_id, c.content, c.sensitivity
                         ORDER BY c.memory_id
                         """
@@ -3046,7 +3080,7 @@ class LocalMemoryCore:
             raise ConfigurationConflict(
                 f"MyOutBrain memory core is not initialized at: {self._root}"
             )
-        target_state = "active" if active else "inactive"
+        target_state = "current" if active else "inactive"
         action: MemoryLifecycleAction = "reactivated" if active else "deactivated"
         occurred_at = datetime.now(timezone.utc).isoformat()
         with writer_lock(self._root):
@@ -4374,7 +4408,7 @@ class LocalMemoryCore:
                     INSERT INTO canonical_memories
                         (memory_id, content, current_version, sensitivity, state,
                          created_at, updated_at)
-                    VALUES (?, '', 1, 'local-only', 'active', ?, ?)
+                    VALUES (?, '', 1, 'local-only', 'current', ?, ?)
                     """,
                     (memory_id, applied_at, applied_at),
                 )
@@ -4945,7 +4979,7 @@ class LocalMemoryCore:
                         """
                         SELECT content, current_version, sensitivity
                         FROM canonical_memories
-                        WHERE memory_id = ? AND state = 'active'
+                        WHERE memory_id = ? AND state = 'current'
                         """,
                         (canonical_memory_id,),
                     ).fetchone()
@@ -4955,7 +4989,7 @@ class LocalMemoryCore:
                             INSERT INTO canonical_memories
                                 (memory_id, content, current_version, sensitivity,
                                  state, created_at, updated_at)
-                            VALUES (?, ?, 1, ?, 'active', ?, ?)
+                            VALUES (?, ?, 1, ?, 'current', ?, ?)
                             """,
                             (
                                 canonical_memory_id,
@@ -5281,6 +5315,74 @@ class LocalMemoryCore:
                 )
                 connection.execute("PRAGMA user_version = 9")
                 connection.commit()
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.executescript(
+                    """
+                    CREATE TABLE canonical_memories_v9 (
+                        memory_id TEXT PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        current_version INTEGER NOT NULL,
+                        sensitivity TEXT NOT NULL
+                            CHECK (sensitivity IN ('local-only', 'cloud-allowed')),
+                        state TEXT NOT NULL
+                            CHECK (state IN (
+                                'current', 'historical-trusted',
+                                'superseded', 'inactive'
+                            )),
+                        previous_live_state TEXT
+                            CHECK (previous_live_state IN (
+                                'current', 'historical-trusted', 'superseded'
+                            )),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO canonical_memories_v9
+                        (memory_id, content, current_version, sensitivity, state,
+                         previous_live_state, created_at, updated_at)
+                    SELECT memory_id, content, current_version, sensitivity,
+                           CASE state WHEN 'active' THEN 'current' ELSE state END,
+                           NULL, created_at, updated_at
+                    FROM canonical_memories;
+                    DROP TABLE canonical_memories;
+                    ALTER TABLE canonical_memories_v9 RENAME TO canonical_memories;
+                    CREATE TABLE IF NOT EXISTS canonical_memory_dependencies (
+                        memory_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        depends_on_memory_id TEXT NOT NULL,
+                        depends_on_version INTEGER NOT NULL,
+                        relationship TEXT NOT NULL
+                            CHECK (relationship IN ('depends-on', 'supersedes')),
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (memory_id, version)
+                            REFERENCES canonical_memory_versions(memory_id, version),
+                        FOREIGN KEY (depends_on_memory_id, depends_on_version)
+                            REFERENCES canonical_memory_versions(memory_id, version),
+                        CHECK (memory_id <> depends_on_memory_id),
+                        PRIMARY KEY (
+                            memory_id, version, depends_on_memory_id,
+                            depends_on_version, relationship
+                        )
+                    );
+                    CREATE TABLE IF NOT EXISTS canonical_memory_lifecycle_events (
+                        event_id TEXT PRIMARY KEY REFERENCES audit_events(event_id),
+                        memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+                        from_state TEXT NOT NULL CHECK (from_state IN (
+                            'current', 'historical-trusted', 'superseded', 'inactive'
+                        )),
+                        to_state TEXT NOT NULL CHECK (to_state IN (
+                            'current', 'historical-trusted', 'superseded', 'inactive'
+                        )),
+                        reason TEXT NOT NULL,
+                        previous_live_state TEXT CHECK (previous_live_state IN (
+                            'current', 'historical-trusted', 'superseded'
+                        ))
+                    );
+                    PRAGMA user_version = 9;
+                    """
+                )
+                connection.commit()
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise IntegrityError("memory lifecycle migration broke references")
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot migrate the local memory database") from error
@@ -6123,10 +6225,21 @@ def _canonical_memory_audit(
         """,
         (memory_id,),
     ).fetchall()
+    v2_lifecycle_rows = connection.execute(
+        """
+        SELECT audit.event_type, audit.occurred_at, lifecycle.reason
+        FROM canonical_memory_lifecycle_events AS lifecycle
+        JOIN audit_events AS audit ON audit.event_id = lifecycle.event_id
+        WHERE lifecycle.memory_id = ?
+        ORDER BY audit.occurred_at, audit.event_id
+        """,
+        (memory_id,),
+    ).fetchall()
     if (
         current is None
         or not isinstance(current[0], int)
-        or current[1] not in ("active", "inactive")
+        or current[1]
+        not in ("current", "historical-trusted", "superseded", "inactive")
     ):
         raise UserInputError(f"canonical memory does not exist: {memory_id}")
     versions = tuple(
@@ -6170,6 +6283,27 @@ def _canonical_memory_audit(
                 reason=reason,
             )
         )
+    for event_type, occurred_at, reason in v2_lifecycle_rows:
+        action_by_type: dict[str, MemoryLifecycleAction] = {
+            "memory.historicized": "historicized",
+            "memory.superseded": "superseded",
+            "memory.deactivated": "deactivated",
+            "memory.restored": "restored",
+        }
+        if (
+            event_type not in action_by_type
+            or not isinstance(occurred_at, str)
+            or not isinstance(reason, str)
+        ):
+            raise IntegrityError("canonical memory lifecycle audit is invalid")
+        lifecycle_events.append(
+            MemoryLifecycleEvent(
+                action=action_by_type[event_type],
+                occurred_at=occurred_at,
+                reason=reason,
+            )
+        )
+    lifecycle_events.sort(key=lambda event: event.occurred_at)
     current_version = current[0]
     current_content = next(
         (
