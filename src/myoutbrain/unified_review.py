@@ -37,6 +37,11 @@ AVAILABLE_DECISIONS: tuple[ReviewDecisionKind, ...] = (
     "defer",
 )
 
+CONFLICT_AVAILABLE_DECISIONS: tuple[ReviewDecisionKind, ...] = ("reject", "defer")
+CONFLICT_APPROVAL_UNAVAILABLE_REASON = (
+    "conflict approval materialization is deferred to issue 09"
+)
+CONFLICT_APPROVAL_ERROR = "conflict_approval_materialization_deferred_to_issue_09"
 UNIFIED_REVIEW_SCHEMA = """
 
 CREATE TABLE IF NOT EXISTS review_proposals (
@@ -380,22 +385,30 @@ class ReviewProposal:
     deferred_until: str | None = None
     retry_count: int = 0
     last_error: str | None = None
+    available_decisions: tuple[ReviewDecisionKind, ...] = AVAILABLE_DECISIONS
+    approval_unavailable_reason: str | None = None
 
     def to_data(self) -> dict[str, object]:
-        return {
+        payload_data = self.payload.to_data()
+        if self.approval_unavailable_reason is not None:
+            payload_data["approval_effect"] = None
+        data: dict[str, object] = {
             "schema_version": REVIEW_PAYLOAD_SCHEMA_VERSION,
             "proposal_id": self.proposal_id,
             "proposal_version": self.proposal_version,
             "group_id": self.group_id,
             "status": self.status,
-            **self.payload.to_data(),
-            "available_decisions": list(AVAILABLE_DECISIONS),
+            **payload_data,
+            "available_decisions": list(self.available_decisions),
             "created_at": self.created_at,
             "deferred_until": self.deferred_until,
             "retry_count": self.retry_count,
             "last_error": self.last_error,
         }
 
+        if self.approval_unavailable_reason is not None:
+            data["approval_unavailable_reason"] = self.approval_unavailable_reason
+        return data
 
 @dataclass(frozen=True)
 class ReviewProposalSubmission:
@@ -794,7 +807,18 @@ def register_source_memory_proposal(
     applicability_scope: str,
     source: dict[str, object],
     created_at: str,
+    suggested_action: Literal["new", "supplement", "revise", "conflict"] = "new",
+    target_memory_id: str | None = None,
+    target_version: int = 0,
+    near_proposal_ids: tuple[str, ...] = (),
+    conflict_proposal_ids: tuple[str, ...] = (),
 ) -> None:
+    approval_effect_type = (
+        "create_source_backed_canonical_memory"
+        if suggested_action == "new"
+        else "revise_canonical_memory"
+    )
+    effective_target_id = planned_memory_id if suggested_action == "new" else target_memory_id
     payload = ReviewProposalInput.from_data(
         {
             "title": canonical_name,
@@ -804,21 +828,21 @@ def register_source_memory_proposal(
             "priority": "routine",
             "applicability_scope": applicability_scope,
             "approval_effect": {
-                "type": "create_source_backed_canonical_memory",
+                "type": approval_effect_type,
                 "canonical_name": canonical_name,
                 "personal_cognition": False,
             },
             "target": {
-                "memory_id": planned_memory_id,
-                "expected_version": 0,
+                "memory_id": effective_target_id,
+                "expected_version": target_version,
             },
             "supporting_evidence": [{"kind": "source", **source}],
             "opposing_evidence": [],
             "dependencies": [],
             "context_coverage": ["submitted local source"],
             "blind_spots": [],
-            "near_proposal_ids": [],
-            "conflict_proposal_ids": [],
+            "near_proposal_ids": list(near_proposal_ids),
+            "conflict_proposal_ids": list(conflict_proposal_ids),
             "sensitivity": "local-only",
             "evidence_retention": "receipt",
             "migration_restrictions": [],
@@ -834,6 +858,7 @@ def register_source_memory_proposal(
             "formation": payload.formation,
         }
     )
+    _validate_relation_targets(connection, proposal_id, payload)
     _insert_proposal(
         connection,
         proposal_id=proposal_id,
@@ -841,6 +866,45 @@ def register_source_memory_proposal(
         exact_fingerprint=exact_fingerprint,
         created_at=created_at,
     )
+    _group_proposal_relations(
+        connection,
+        proposal_id=proposal_id,
+        near_proposal_ids=payload.near_proposal_ids,
+        conflict_proposal_ids=payload.conflict_proposal_ids,
+        created_at=created_at,
+    )
+
+def merge_review_proposal_supporting_evidence(
+    connection: sqlite3.Connection,
+    *,
+    proposal_id: str,
+    evidence: dict[str, object],
+    updated_at: str,
+) -> int:
+    row = connection.execute(
+        "SELECT * FROM review_proposals WHERE proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    if row is None:
+        raise UserInputError(f"review proposal does not exist: {proposal_id}")
+    proposal = _proposal_from_row(row)
+    if proposal.status not in ("pending", "deferred"):
+        raise UserInputError(
+            f"review proposal is not pending: {proposal_id} ({proposal.status})"
+        )
+    incoming = replace(
+        proposal.payload,
+        supporting_evidence=(evidence,),
+        opposing_evidence=(),
+    )
+    merged = _merge_duplicate_evidence(
+        connection,
+        proposal,
+        incoming,
+        updated_at=updated_at,
+    )
+    return merged.proposal_version
+
 
 
 def stage_review_batch(
@@ -1159,6 +1223,22 @@ def stage_review_expiration(
         temporary_path.unlink(missing_ok=True)
 
 
+def _is_nonapprovable_source_conflict(
+    connection: sqlite3.Connection,
+    proposal_id: str,
+) -> bool:
+    return connection.execute(
+        """
+        SELECT 1
+        FROM source_memory_proposal_details AS detail
+        JOIN integration_proposals AS proposal
+          ON proposal.proposal_id = detail.proposal_id
+        WHERE detail.proposal_id = ? AND proposal.suggested_action = 'conflict'
+        """,
+        (proposal_id,),
+    ).fetchone() is not None
+
+
 def _apply_review_decision(
     connection: sqlite3.Connection,
     proposal: ReviewProposal,
@@ -1223,6 +1303,15 @@ def _apply_review_decision(
             "final_content": proposal.payload.content,
             "defer_until": decision.defer_until,
         }
+    if _is_nonapprovable_source_conflict(connection, proposal.proposal_id):
+        return _record_failed_decision(
+            connection,
+            proposal,
+            base,
+            decision="approve",
+            error=CONFLICT_APPROVAL_ERROR,
+            failed_at=decided_at,
+        )
     personal_cognition = proposal.payload.approval_effect.personal_cognition
     if _target_version_conflicts(connection, proposal):
         return _record_failed_decision(
@@ -1616,6 +1705,19 @@ def _materialize_canonical_memory(
     )
     connection.execute(
         """
+        INSERT INTO memory_names
+            (memory_id, name, normalized_name, name_kind, created_at)
+        VALUES (?, ?, ?, 'canonical', ?)
+        """,
+        (
+            memory_id,
+            canonical_name.strip(),
+            " ".join(canonical_name.casefold().split()),
+            materialized_at,
+        ),
+    )
+    connection.execute(
+        """
         INSERT INTO canonical_memory_review_provenance
             (memory_id, version, proposal_id)
         VALUES (?, 1, ?)
@@ -1806,6 +1908,22 @@ def _materialize_canonical_revision(
             expected_version,
         ),
     )
+    normalized_name = " ".join(canonical_name.casefold().split())
+    connection.execute(
+        "UPDATE memory_names SET name_kind = 'alias' WHERE memory_id = ?",
+        (target_memory_id,),
+    )
+    connection.execute(
+        """
+        INSERT INTO memory_names
+            (memory_id, name, normalized_name, name_kind, created_at)
+        VALUES (?, ?, ?, 'canonical', ?)
+        ON CONFLICT(memory_id, normalized_name) DO UPDATE SET
+            name = excluded.name,
+            name_kind = 'canonical'
+        """,
+        (target_memory_id, canonical_name.strip(), normalized_name, materialized_at),
+    )
     connection.execute(
         """
         UPDATE knowledge_capsules
@@ -1915,10 +2033,36 @@ def read_review_queue(database_path: Path) -> ReviewQueue:
             groups = tuple(
                 _review_group_from_row(connection, row) for row in group_rows
             )
+            conflict_ids = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT detail.proposal_id
+                    FROM source_memory_proposal_details AS detail
+                    JOIN integration_proposals AS proposal
+                      ON proposal.proposal_id = detail.proposal_id
+                    JOIN review_proposals AS review
+                      ON review.proposal_id = detail.proposal_id
+                    WHERE proposal.suggested_action = 'conflict'
+                      AND review.status IN ('pending', 'deferred')
+                    """
+                ).fetchall()
+                if isinstance(row[0], str)
+            }
+            proposals = tuple(
+                replace(
+                    _proposal_from_row(row),
+                    available_decisions=CONFLICT_AVAILABLE_DECISIONS,
+                    approval_unavailable_reason=CONFLICT_APPROVAL_UNAVAILABLE_REASON,
+                )
+                if row[0] in conflict_ids
+                else _proposal_from_row(row)
+                for row in rows
+            )
     except sqlite3.Error as error:
         raise IntegrityError("cannot read unified review queue") from error
     return ReviewQueue(
-        proposals=tuple(_proposal_from_row(row) for row in rows),
+        proposals=proposals,
         groups=groups,
     )
 

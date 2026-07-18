@@ -45,6 +45,7 @@ from myoutbrain.local_core import (
     IntegrationProposal,
     LocalMemoryCore,
     MemoryDeletionImpact,
+    SourceMemoryProposal,
 )
 from myoutbrain.memory_gateway import (
     ExperienceSubmission,
@@ -147,6 +148,19 @@ def build_parser() -> argparse.ArgumentParser:
     approve_source_memory_parser.add_argument("--entrance", required=True)
     approve_source_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
     approve_source_memory_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    rename_memory_parser = subcommands.add_parser(
+        "rename-memory",
+        help="Rename one V2 memory while retaining direct aliases",
+    )
+    rename_memory_parser.add_argument("memory_id")
+    rename_memory_parser.add_argument("--name", required=True)
+    rename_memory_parser.add_argument("--expected-version", type=int, required=True)
+    rename_memory_parser.add_argument("--idempotency-key", required=True)
+    rename_memory_parser.add_argument("--entrance", required=True)
+    rename_memory_parser.add_argument("--root", type=Path, default=Path.cwd())
+    rename_memory_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     recall_memory_parser = subcommands.add_parser(
@@ -747,7 +761,7 @@ def _propose_source_memory(
     idempotency_key: str,
     output_format: str,
 ) -> int:
-    proposal = LocalMemoryCore(root).propose_source_memory(
+    submission = MemoryGateway(root).propose_v2_source_memory(
         source,
         source_id=source_id,
         canonical_name=name,
@@ -756,11 +770,14 @@ def _propose_source_memory(
         idempotency_key=idempotency_key,
     )
     if output_format == "json":
-        print(json.dumps(proposal.to_data(), ensure_ascii=False, sort_keys=True))
+        print(json.dumps(submission.to_data(), ensure_ascii=False, sort_keys=True))
+    elif isinstance(submission, SourceMemoryProposal):
+        print(f"Pending integration proposal {submission.proposal_id}")
+        print(f"Source: {submission.source.source_id} v{submission.source.version}")
+        print(f"Approval effect: create canonical memory {submission.planned_memory_id}")
     else:
-        print(f"Pending integration proposal {proposal.proposal_id}")
-        print(f"Source: {proposal.source.source_id} v{proposal.source.version}")
-        print(f"Approval effect: create canonical memory {proposal.planned_memory_id}")
+        print(f"Canonical memory {submission.memory_id} is unchanged.")
+        print(f"Source: {submission.source.source_id} v{submission.source.version}")
     return 0
 
 
@@ -786,6 +803,32 @@ def _approve_source_memory(
             f"Approved {approval.proposal_id}; created canonical memory "
             f"{approval.memory_id} v1 in capsule {approval.capsule_id}."
         )
+    return 0
+
+
+def _rename_memory(
+    root: Path,
+    memory_id: str,
+    *,
+    name: str,
+    expected_version: int,
+    idempotency_key: str,
+    entrance: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).rename_v2_memory(
+        memory_id,
+        canonical_name=name,
+        expected_version=expected_version,
+        idempotency_key=idempotency_key,
+        entrance=entrance,
+    )
+    if output_format == "json":
+        print(json.dumps(result.to_data(), ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Renamed {result.memory_id} to {result.canonical_name}.")
+        if result.aliases:
+            print(f"Aliases: {', '.join(result.aliases)}")
     return 0
 
 
@@ -1701,6 +1744,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _approve_source_memory(
                 parsed_arguments.root,
                 parsed_arguments.proposal_id,
+                expected_version=parsed_arguments.expected_version,
+                idempotency_key=parsed_arguments.idempotency_key,
+                entrance=parsed_arguments.entrance,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "rename-memory":
+            return _rename_memory(
+                parsed_arguments.root,
+                parsed_arguments.memory_id,
+                name=parsed_arguments.name,
                 expected_version=parsed_arguments.expected_version,
                 idempotency_key=parsed_arguments.idempotency_key,
                 entrance=parsed_arguments.entrance,

@@ -27,7 +27,10 @@ from myoutbrain.local_core import (
     IntegrationProposal,
     IntegrationReviewResult,
     LocalMemoryCore,
+    MemoryRenameResult,
     RecallableMemory,
+    SourceMemoryProposal,
+    SourceMemoryReuse,
 )
 from myoutbrain.reflection import (
     ImmediateReflectionRequest,
@@ -329,6 +332,42 @@ class MemoryGateway:
 
     def v2_recall_activity(self) -> dict[str, object]:
         return V2RecallService(self._root).activity()
+
+    def rename_v2_memory(
+        self,
+        memory_id: str,
+        *,
+        canonical_name: str,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> MemoryRenameResult:
+        return self._memory_core.rename_memory(
+            memory_id,
+            canonical_name=canonical_name,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
+
+    def propose_v2_source_memory(
+        self,
+        source_path: Path,
+        *,
+        source_id: str | None,
+        canonical_name: str,
+        body: str,
+        applicability_scope: str,
+        idempotency_key: str,
+    ) -> SourceMemoryProposal | SourceMemoryReuse:
+        return self._memory_core.propose_source_memory(
+            source_path,
+            source_id=source_id,
+            canonical_name=canonical_name,
+            body=body,
+            applicability_scope=applicability_scope,
+            idempotency_key=idempotency_key,
+        )
 
     def recall(self, request: RecallRequest) -> MemoryEvidencePackage:
         query = request.query.strip()

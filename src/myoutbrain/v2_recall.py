@@ -105,6 +105,8 @@ class _Candidate:
     body: str
     scope: str
     capsule_id: str
+    partition_id: str
+    partition_summary: str
     candidate_paths: tuple[str, ...]
     evidence: tuple[dict[str, object], ...]
 
@@ -132,6 +134,10 @@ class _Candidate:
             "body": self.body,
             "body_bytes": self.body_bytes,
             "scope": self.scope,
+            "partition": {
+                "partition_id": self.partition_id,
+                "summary": self.partition_summary,
+            },
             "candidate_paths": list(self.candidate_paths),
             "evidence": {
                 "status": "available" if self.evidence else "missing",
@@ -567,15 +573,24 @@ def _candidate_paths(
     dictionary_rows = connection.execute(
         """
         SELECT memory_id, normalized_name
-        FROM knowledge_dictionary
-        ORDER BY memory_id
+        FROM memory_names
+        ORDER BY normalized_name, memory_id
         """
     ).fetchall()
-    exact_names: list[str] = []
+    matched_name_targets: dict[str, set[str]] = {}
     for memory_id, normalized_name in dictionary_rows:
-        if question == memory_id or cast(str, normalized_name) in normalized_question:
-            paths.setdefault(cast(str, memory_id), set()).add("dictionary")
-            exact_names.append(cast(str, normalized_name))
+        normalized_memory_id = cast(str, memory_id)
+        normalized_dictionary_name = cast(str, normalized_name)
+        if (
+            question == normalized_memory_id
+            or normalized_dictionary_name in normalized_question
+        ):
+            paths.setdefault(normalized_memory_id, set()).add("dictionary")
+            if normalized_dictionary_name in normalized_question:
+                matched_name_targets.setdefault(
+                    normalized_dictionary_name,
+                    set(),
+                ).add(normalized_memory_id)
 
     terms = lexical_terms(question)
     partition_rows = connection.execute(
@@ -633,7 +648,8 @@ def _candidate_paths(
         ).fetchall()
         for (memory_id,) in global_rows:
             paths.setdefault(cast(str, memory_id), set()).add("global-fts")
-    return paths, routed_capsules, len(exact_names) > 1
+    ambiguity = any(len(memory_ids) > 1 for memory_ids in matched_name_targets.values())
+    return paths, routed_capsules, ambiguity
 
 
 def _load_candidates(
@@ -647,14 +663,19 @@ def _load_candidates(
         row = connection.execute(
             """
             SELECT dictionary.memory_id, dictionary.current_version,
-                   memory.state, dictionary.canonical_name, version.content,
-                   version.applicability_scope, dictionary.primary_capsule_id
+                    memory.state, dictionary.canonical_name, version.content,
+                    version.applicability_scope, dictionary.primary_capsule_id,
+                    partition.partition_id, partition.topic
             FROM knowledge_dictionary AS dictionary
             JOIN canonical_memories AS memory
               ON memory.memory_id = dictionary.memory_id
             JOIN canonical_memory_versions AS version
-              ON version.memory_id = dictionary.memory_id
-             AND version.version = dictionary.current_version
+               ON version.memory_id = dictionary.memory_id
+              AND version.version = dictionary.current_version
+            JOIN capsule_partitions AS capsule_partition
+              ON capsule_partition.capsule_id = dictionary.primary_capsule_id
+            JOIN knowledge_partitions AS partition
+              ON partition.partition_id = capsule_partition.partition_id
             WHERE dictionary.memory_id = ? AND memory.state = 'active'
             """,
             (memory_id,),
@@ -699,6 +720,8 @@ def _load_candidates(
                 body=cast(str, row[4]),
                 scope=cast(str, row[5]),
                 capsule_id=cast(str, row[6]),
+                partition_id=cast(str, row[7]),
+                partition_summary=cast(str, row[8]),
                 candidate_paths=tuple(
                     path for path in RECALL_PATHS if path in memory_paths
                 ),
