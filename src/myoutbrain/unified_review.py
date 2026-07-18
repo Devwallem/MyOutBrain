@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -19,9 +19,23 @@ from myoutbrain.core_types import IntegrityError, UserInputError
 ReviewIntent = Literal["derive", "integrate", "archive", "research"]
 ProposalFormation = Literal["explicit", "derived", "hypothesis"]
 ProposalPriority = Literal["blocking", "priority", "routine"]
+ReviewDecisionKind = Literal["approve", "approve-edited", "reject", "defer"]
+ApprovalEffectType = Literal[
+    "create_derived_memory",
+    "create_canonical_memory",
+    "create_source_backed_canonical_memory",
+    "revise_canonical_memory",
+    "create_human_archive",
+    "create_research_thread",
+]
 
 REVIEW_PAYLOAD_SCHEMA_VERSION = 1
-AVAILABLE_DECISIONS = ("approve", "approve-edited", "reject", "defer")
+AVAILABLE_DECISIONS: tuple[ReviewDecisionKind, ...] = (
+    "approve",
+    "approve-edited",
+    "reject",
+    "defer",
+)
 
 UNIFIED_REVIEW_SCHEMA = """
 
@@ -155,7 +169,118 @@ CREATE TABLE IF NOT EXISTS review_expirations (
     supporting_evidence_json TEXT NOT NULL,
     expired_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS review_proposal_recurrences (
+    proposal_id TEXT PRIMARY KEY REFERENCES review_proposals(proposal_id),
+    occurrence_count INTEGER NOT NULL CHECK (occurrence_count >= 1),
+    last_seen_at TEXT NOT NULL,
+    last_had_new_evidence INTEGER NOT NULL CHECK (last_had_new_evidence IN (0, 1))
+);
 """
+
+
+@dataclass(frozen=True)
+class ApprovalEffect:
+    effect_type: ApprovalEffectType
+    canonical_name: str | None
+    personal_cognition: bool
+
+    @classmethod
+    def from_data(
+        cls,
+        data: object,
+        *,
+        intent: ReviewIntent,
+        formation: ProposalFormation,
+    ) -> ApprovalEffect:
+        if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
+            raise UserInputError("review proposal approval_effect must be a JSON object")
+        effect = cast(dict[str, object], data)
+        effect_type = effect.get("type")
+        allowed_effects: dict[ReviewIntent, set[str]] = {
+            "derive": {"create_derived_memory"},
+            "integrate": {
+                "create_canonical_memory",
+                "create_source_backed_canonical_memory",
+                "revise_canonical_memory",
+            },
+            "archive": {"create_human_archive"},
+            "research": {"create_research_thread"},
+        }
+        if not isinstance(effect_type, str) or effect_type not in allowed_effects[intent]:
+            raise UserInputError(
+                f"review proposal approval effect does not match {intent} intent"
+            )
+        personal_cognition = effect.get("personal_cognition")
+        if not isinstance(personal_cognition, bool):
+            raise UserInputError(
+                "review proposal approval_effect.personal_cognition must be boolean"
+            )
+        canonical_name = effect.get("canonical_name")
+        if canonical_name is not None and (
+            not isinstance(canonical_name, str)
+            or not canonical_name.strip()
+            or len(canonical_name) > 500
+        ):
+            raise UserInputError(
+                "review proposal approval_effect.canonical_name must contain "
+                "1 to 500 characters or be null"
+            )
+        if intent in ("derive", "integrate") and canonical_name is None:
+            raise UserInputError(
+                "canonical-memory approval effect requires canonical_name"
+            )
+        if formation == "hypothesis" and intent != "research":
+            raise UserInputError(
+                "hypothesis proposal must use research intent before verification"
+            )
+        if personal_cognition and (intent != "integrate" or formation != "explicit"):
+            raise UserInputError(
+                "personal cognition approval effect requires explicit integration"
+            )
+        return cls(
+            effect_type=cast(ApprovalEffectType, effect_type),
+            canonical_name=(
+                canonical_name.strip() if isinstance(canonical_name, str) else None
+            ),
+            personal_cognition=personal_cognition,
+        )
+
+    def to_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "type": self.effect_type,
+            "personal_cognition": self.personal_cognition,
+        }
+        if self.canonical_name is not None:
+            data["canonical_name"] = self.canonical_name
+        return data
+
+
+@dataclass(frozen=True)
+class ProposalTarget:
+    memory_id: str | None
+    expected_version: int
+
+    @classmethod
+    def from_data(cls, data: object) -> ProposalTarget:
+        if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
+            raise UserInputError("review proposal target must be a JSON object")
+        target = cast(dict[str, object], data)
+        memory_id = target.get("memory_id")
+        if memory_id is not None and not isinstance(memory_id, str):
+            raise UserInputError("review proposal target.memory_id must be text or null")
+        expected_version = target.get("expected_version")
+        if not isinstance(expected_version, int) or expected_version < 0:
+            raise UserInputError(
+                "review proposal target.expected_version must be a non-negative integer"
+            )
+        return cls(memory_id=memory_id, expected_version=expected_version)
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            "memory_id": self.memory_id,
+            "expected_version": self.expected_version,
+        }
 
 
 @dataclass(frozen=True)
@@ -166,8 +291,8 @@ class ReviewProposalInput:
     formation: ProposalFormation
     priority: ProposalPriority
     applicability_scope: str
-    approval_effect: dict[str, object]
-    target: dict[str, object]
+    approval_effect: ApprovalEffect
+    target: ProposalTarget
     supporting_evidence: tuple[dict[str, object], ...]
     opposing_evidence: tuple[dict[str, object], ...]
     dependencies: tuple[str, ...]
@@ -189,52 +314,22 @@ class ReviewProposalInput:
         priority = _choice(payload, "priority", ("blocking", "priority", "routine"))
         sensitivity = _choice(payload, "sensitivity", ("local-only", "cloud-allowed"))
         retention = _choice(payload, "evidence_retention", ("full", "excerpt", "receipt"))
-        approval_effect = _object(payload, "approval_effect")
-        personal_cognition = approval_effect.get("personal_cognition")
-        if not isinstance(personal_cognition, bool):
-            raise UserInputError(
-                "review proposal approval_effect.personal_cognition must be boolean"
-            )
-        effect_type = approval_effect.get("type")
-        allowed_effects = {
-            "derive": {"create_derived_memory"},
-            "integrate": {
-                "create_canonical_memory",
-                "create_source_backed_canonical_memory",
-                "revise_canonical_memory",
-            },
-            "archive": {"create_human_archive"},
-            "research": {"create_research_thread"},
-        }
-        if effect_type not in allowed_effects[intent]:
-            raise UserInputError(
-                f"review proposal approval effect does not match {intent} intent"
-            )
-        if formation == "hypothesis" and intent != "research":
-            raise UserInputError(
-                "hypothesis proposal must use research intent before verification"
-            )
-        if personal_cognition and (intent != "integrate" or formation != "explicit"):
-            raise UserInputError(
-                "personal cognition approval effect requires explicit integration"
-            )
-        target = _object(payload, "target")
-        target_memory_id = target.get("memory_id")
-        if target_memory_id is not None and not isinstance(target_memory_id, str):
-            raise UserInputError("review proposal target.memory_id must be text or null")
-        expected_version = target.get("expected_version")
-        if not isinstance(expected_version, int) or expected_version < 0:
-            raise UserInputError(
-                "review proposal target.expected_version must be a non-negative integer"
-            )
+        normalized_intent = cast(ReviewIntent, intent)
+        normalized_formation = cast(ProposalFormation, formation)
+        approval_effect = ApprovalEffect.from_data(
+            payload.get("approval_effect"),
+            intent=normalized_intent,
+            formation=normalized_formation,
+        )
+        target = ProposalTarget.from_data(payload.get("target"))
         supporting_evidence = _object_list(payload, "supporting_evidence")
         if not supporting_evidence:
             raise UserInputError("review proposal requires supporting evidence")
         return cls(
             title=_text(payload, "title"),
             content=_text(payload, "content"),
-            intent=cast(ReviewIntent, intent),
-            formation=cast(ProposalFormation, formation),
+            intent=normalized_intent,
+            formation=normalized_formation,
             priority=cast(ProposalPriority, priority),
             applicability_scope=_text(payload, "applicability_scope"),
             approval_effect=approval_effect,
@@ -259,8 +354,8 @@ class ReviewProposalInput:
             "formation": self.formation,
             "priority": self.priority,
             "applicability_scope": self.applicability_scope,
-            "approval_effect": self.approval_effect,
-            "target": self.target,
+            "approval_effect": self.approval_effect.to_data(),
+            "target": self.target.to_data(),
             "supporting_evidence": list(self.supporting_evidence),
             "opposing_evidence": list(self.opposing_evidence),
             "dependencies": list(self.dependencies),
@@ -350,7 +445,7 @@ class ReviewGroup:
 class ReviewDecision:
     proposal_id: str
     proposal_version: int
-    decision: Literal["approve", "reject", "defer"]
+    decision: ReviewDecisionKind
     edited_content: str | None
     reason: str | None
     defer_until: str | None
@@ -367,7 +462,7 @@ class ReviewDecision:
             raise UserInputError(
                 "review batch proposal_version must be a positive integer"
             )
-        decision = _choice(item, "decision", ("approve", "reject", "defer"))
+        decision = _choice(item, "decision", AVAILABLE_DECISIONS)
         edited_content = _optional_text(item, "edited_content")
         reason = _optional_text(item, "reason")
         defer_until = _optional_text(item, "defer_until")
@@ -376,14 +471,16 @@ class ReviewDecision:
             raise UserInputError(
                 "review batch confirm_personal_cognition must be boolean"
             )
-        if decision != "approve" and edited_content is not None:
+        if decision in ("reject", "defer") and edited_content is not None:
             raise UserInputError("only approval may include edited_content")
+        if decision == "approve-edited" and edited_content is None:
+            raise UserInputError("approve-edited decision requires edited_content")
         if decision == "defer" and defer_until is None:
             raise UserInputError("deferred review decision requires defer_until")
         return cls(
             proposal_id=proposal_id,
             proposal_version=proposal_version,
-            decision=cast(Literal["approve", "reject", "defer"], decision),
+            decision=cast(ReviewDecisionKind, decision),
             edited_content=edited_content,
             reason=reason,
             defer_until=defer_until,
@@ -443,12 +540,14 @@ class ReviewBatchResult:
 class ReviewExpirationResult:
     retention_days: int
     as_of: str
+    reactivated: tuple[str, ...]
     expired: tuple[dict[str, object], ...]
 
     def to_data(self) -> dict[str, object]:
         return {
             "retention_days": self.retention_days,
             "as_of": self.as_of,
+            "reactivated": list(self.reactivated),
             "expired": list(self.expired),
         }
 
@@ -506,8 +605,8 @@ def stage_review_proposal(
                 {
                     "content": " ".join(payload.content.casefold().split()),
                     "scope": " ".join(payload.applicability_scope.casefold().split()),
-                    "approval_effect": payload.approval_effect,
-                    "target": payload.target,
+                    "approval_effect": payload.approval_effect.to_data(),
+                    "target": payload.target.to_data(),
                     "intent": payload.intent,
                     "formation": payload.formation,
                 }
@@ -541,6 +640,58 @@ def stage_review_proposal(
                 connection.commit()
                 return temporary_path.read_bytes(), ReviewProposalSubmission(
                     proposal=duplicate,
+                    deduplicated=True,
+                )
+            terminal_row = connection.execute(
+                """
+                SELECT * FROM review_proposals
+                WHERE exact_fingerprint = ?
+                  AND status IN ('rejected', 'expired')
+                ORDER BY updated_at DESC, proposal_id
+                LIMIT 1
+                """,
+                (exact_fingerprint,),
+            ).fetchone()
+            if terminal_row is not None:
+                terminal_proposal, had_new_evidence = _restore_terminal_duplicate(
+                    connection,
+                    terminal_row,
+                    payload,
+                    updated_at=created_at,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_proposal_recurrences
+                        (proposal_id, occurrence_count, last_seen_at,
+                         last_had_new_evidence)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(proposal_id) DO UPDATE SET
+                        occurrence_count = occurrence_count + 1,
+                        last_seen_at = excluded.last_seen_at,
+                        last_had_new_evidence = excluded.last_had_new_evidence
+                    """,
+                    (
+                        terminal_proposal.proposal_id,
+                        created_at,
+                        int(had_new_evidence),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO review_proposal_submissions
+                        (idempotency_key, request_hash, proposal_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_key,
+                        request_hash,
+                        terminal_proposal.proposal_id,
+                        created_at,
+                    ),
+                )
+                connection.commit()
+                return temporary_path.read_bytes(), ReviewProposalSubmission(
+                    proposal=terminal_proposal,
                     deduplicated=True,
                 )
             proposal_id = f"prp_{uuid.uuid4().hex}"
@@ -629,8 +780,8 @@ def register_source_memory_proposal(
         {
             "content": " ".join(body.casefold().split()),
             "scope": " ".join(applicability_scope.casefold().split()),
-            "approval_effect": payload.approval_effect,
-            "target": payload.target,
+            "approval_effect": payload.approval_effect.to_data(),
+            "target": payload.target.to_data(),
             "intent": payload.intent,
             "formation": payload.formation,
         }
@@ -856,6 +1007,40 @@ def stage_review_expiration(
     try:
         with closing(sqlite3.connect(temporary_path)) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            deferred_rows = connection.execute(
+                """
+                SELECT proposal_id, deferred_until
+                FROM review_proposals
+                WHERE status = 'deferred' AND deferred_until IS NOT NULL
+                ORDER BY deferred_until, proposal_id
+                """
+            ).fetchall()
+            reactivated: list[str] = []
+            for proposal_id, deferred_until in deferred_rows:
+                if not isinstance(proposal_id, str) or not isinstance(
+                    deferred_until, str
+                ):
+                    raise IntegrityError("deferred review proposal is invalid")
+                try:
+                    review_time = datetime.fromisoformat(deferred_until)
+                except ValueError as error:
+                    raise IntegrityError(
+                        "deferred review proposal time is invalid"
+                    ) from error
+                if review_time.tzinfo is None:
+                    raise IntegrityError(
+                        "deferred review proposal time has no timezone"
+                    )
+                if review_time <= as_of_time:
+                    connection.execute(
+                        """
+                        UPDATE review_proposals
+                        SET status = 'pending', deferred_until = NULL, updated_at = ?
+                        WHERE proposal_id = ? AND status = 'deferred'
+                        """,
+                        (normalized_as_of, proposal_id),
+                    )
+                    reactivated.append(proposal_id)
             rows = connection.execute(
                 """
                 SELECT proposal_id, title, formation, supporting_evidence_json,
@@ -869,6 +1054,8 @@ def stage_review_expiration(
             for row in rows:
                 if not all(isinstance(row[index], str) for index in range(6)):
                     raise IntegrityError("routine review proposal is invalid")
+                if row[0] in reactivated:
+                    continue
                 try:
                     created_at = datetime.fromisoformat(row[5])
                     supporting_evidence = json.loads(row[3])
@@ -915,6 +1102,7 @@ def stage_review_expiration(
         return temporary_path.read_bytes(), ReviewExpirationResult(
             retention_days=retention_days,
             as_of=normalized_as_of,
+            reactivated=tuple(reactivated),
             expired=tuple(expired),
         )
     except sqlite3.Error as error:
@@ -987,7 +1175,7 @@ def _apply_review_decision(
             "final_content": proposal.payload.content,
             "defer_until": decision.defer_until,
         }
-    personal_cognition = proposal.payload.approval_effect.get("personal_cognition")
+    personal_cognition = proposal.payload.approval_effect.personal_cognition
     if _target_version_conflicts(connection, proposal):
         return _record_failed_decision(
             connection,
@@ -1078,7 +1266,41 @@ def _decision_dependency_groups(
             grouped[root] = []
             group_order.append(root)
         grouped[root].append(decision)
-    return tuple(tuple(grouped[root]) for root in group_order)
+    return tuple(
+        _topologically_ordered_decisions(tuple(grouped[root]), proposals)
+        for root in group_order
+    )
+
+
+def _topologically_ordered_decisions(
+    decisions: tuple[ReviewDecision, ...],
+    proposals: dict[str, ReviewProposal],
+) -> tuple[ReviewDecision, ...]:
+    remaining = list(decisions)
+    remaining_ids = {decision.proposal_id for decision in remaining}
+    ordered: list[ReviewDecision] = []
+    while remaining:
+        ready = next(
+            (
+                decision
+                for decision in remaining
+                if not (
+                    set(proposals[decision.proposal_id].payload.dependencies)
+                    & remaining_ids
+                )
+            ),
+            None,
+        )
+        if ready is None:
+            return decisions
+        ordered.append(ready)
+        remaining.remove(ready)
+        remaining_ids.remove(ready.proposal_id)
+    return tuple(ordered)
+
+
+def _is_approval(decision: ReviewDecisionKind) -> bool:
+    return decision in ("approve", "approve-edited")
 
 
 def _dependency_precondition_error(
@@ -1088,12 +1310,12 @@ def _dependency_precondition_error(
 ) -> str | None:
     group_decisions = {decision.proposal_id: decision for decision in group}
     for decision in group:
-        if decision.decision != "approve":
+        if not _is_approval(decision.decision):
             continue
         for dependency_id in proposals[decision.proposal_id].payload.dependencies:
             dependency_decision = group_decisions.get(dependency_id)
             if dependency_decision is not None:
-                if dependency_decision.decision != "approve":
+                if not _is_approval(dependency_decision.decision):
                     return f"dependency_not_approved:{dependency_id}"
                 continue
             row = connection.execute(
@@ -1139,9 +1361,9 @@ def _target_version_conflicts(
 ) -> bool:
     if proposal.payload.intent not in ("derive", "integrate"):
         return False
-    target_memory_id = proposal.payload.target.get("memory_id")
-    expected_version = proposal.payload.target.get("expected_version")
-    effect_type = proposal.payload.approval_effect.get("type")
+    target_memory_id = proposal.payload.target.memory_id
+    expected_version = proposal.payload.target.expected_version
+    effect_type = proposal.payload.approval_effect.effect_type
     if effect_type == "revise_canonical_memory":
         if not isinstance(target_memory_id, str) or not isinstance(expected_version, int):
             return True
@@ -1170,7 +1392,7 @@ def _materialize_proposal(
     entrance: str,
     materialized_at: str,
 ) -> dict[str, object]:
-    personal_cognition = proposal.payload.approval_effect["personal_cognition"] is True
+    personal_cognition = proposal.payload.approval_effect.personal_cognition
     if proposal.payload.intent in ("derive", "integrate"):
         materialization = _materialize_canonical_memory(
             connection,
@@ -1263,10 +1485,10 @@ def _materialize_canonical_memory(
     materialized_at: str,
 ) -> dict[str, object]:
     effect = proposal.payload.approval_effect
-    canonical_name = effect.get("canonical_name")
-    if not isinstance(canonical_name, str) or not canonical_name.strip():
+    canonical_name = effect.canonical_name
+    if canonical_name is None:
         raise UserInputError("canonical-memory approval effect requires canonical_name")
-    if effect.get("type") == "revise_canonical_memory":
+    if effect.effect_type == "revise_canonical_memory":
         return _materialize_canonical_revision(
             connection,
             proposal,
@@ -1274,8 +1496,8 @@ def _materialize_canonical_memory(
             entrance=entrance,
             materialized_at=materialized_at,
         )
-    target_memory_id = proposal.payload.target.get("memory_id")
-    expected_version = proposal.payload.target.get("expected_version")
+    target_memory_id = proposal.payload.target.memory_id
+    expected_version = proposal.payload.target.expected_version
     if target_memory_id is not None and not isinstance(target_memory_id, str):
         raise UserInputError("canonical-memory target must be text or null")
     if expected_version != 0:
@@ -1352,7 +1574,7 @@ def _materialize_canonical_memory(
         """,
         (memory_id, proposal.proposal_id),
     )
-    if effect.get("type") == "create_source_backed_canonical_memory":
+    if effect.effect_type == "create_source_backed_canonical_memory":
         updated = connection.execute(
             """
             UPDATE integration_proposals
@@ -1398,10 +1620,10 @@ def _materialize_canonical_memory(
                 """,
                 (memory_id, source_id, source_version),
             )
-    personal_cognition = proposal.payload.approval_effect["personal_cognition"] is True
+    personal_cognition = proposal.payload.approval_effect.personal_cognition
     if personal_cognition:
         authorship = "creator-personal-cognition"
-    elif proposal.payload.intent == "derive":
+    elif proposal.payload.formation == "derived":
         authorship = "system-derived"
     else:
         authorship = "creator-approved-integration"
@@ -1447,9 +1669,9 @@ def _materialize_canonical_revision(
     entrance: str,
     materialized_at: str,
 ) -> dict[str, object]:
-    target_memory_id = proposal.payload.target.get("memory_id")
-    expected_version = proposal.payload.target.get("expected_version")
-    canonical_name = proposal.payload.approval_effect.get("canonical_name")
+    target_memory_id = proposal.payload.target.memory_id
+    expected_version = proposal.payload.target.expected_version
+    canonical_name = proposal.payload.approval_effect.canonical_name
     if (
         not isinstance(target_memory_id, str)
         or not isinstance(expected_version, int)
@@ -1572,12 +1794,13 @@ def _materialize_canonical_revision(
                 """,
                 (target_memory_id, new_version, source_id, source_version),
             )
-    personal_cognition = proposal.payload.approval_effect["personal_cognition"] is True
-    authorship = (
-        "creator-personal-cognition"
-        if personal_cognition
-        else "creator-approved-integration"
-    )
+    personal_cognition = proposal.payload.approval_effect.personal_cognition
+    if personal_cognition:
+        authorship = "creator-personal-cognition"
+    elif proposal.payload.formation == "derived":
+        authorship = "system-derived"
+    else:
+        authorship = "creator-approved-integration"
     result_hash = _stable_hash(
         {
             "proposal_id": proposal.proposal_id,
@@ -1693,6 +1916,109 @@ def _merge_duplicate_evidence(
             raise IntegrityError("deduplicated review proposal disappeared")
         return _proposal_from_row(row)
     return existing
+
+
+def _restore_terminal_duplicate(
+    connection: sqlite3.Connection,
+    row: tuple[object, ...],
+    incoming: ReviewProposalInput,
+    *,
+    updated_at: str,
+) -> tuple[ReviewProposal, bool]:
+    if (
+        len(row) < 30
+        or not isinstance(row[0], str)
+        or not isinstance(row[23], str)
+    ):
+        raise IntegrityError("terminal review proposal is invalid")
+    proposal_id = row[0]
+    try:
+        existing_supporting = tuple(
+            cast(list[dict[str, object]], json.loads(cast(str, row[12])))
+        )
+        existing_opposing = tuple(
+            cast(list[dict[str, object]], json.loads(cast(str, row[13])))
+        )
+        existing_near = tuple(cast(list[str], json.loads(cast(str, row[17]))))
+        existing_conflicts = tuple(cast(list[str], json.loads(cast(str, row[18]))))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise IntegrityError("terminal review proposal payload is invalid") from error
+    supporting = _merged_objects(existing_supporting, incoming.supporting_evidence)
+    opposing = _merged_objects(existing_opposing, incoming.opposing_evidence)
+    had_new_evidence = (
+        supporting != existing_supporting or opposing != existing_opposing
+    )
+    if not had_new_evidence:
+        if row[23] == "expired":
+            raise UserInputError(
+                "expired review proposal requires materially new evidence to restore"
+            )
+        return _proposal_from_row(row), False
+    near_ids = tuple(dict.fromkeys((*existing_near, *incoming.near_proposal_ids)))
+    conflict_ids = tuple(
+        dict.fromkeys((*existing_conflicts, *incoming.conflict_proposal_ids))
+    )
+    restored_payload = replace(
+        incoming,
+        near_proposal_ids=near_ids,
+        conflict_proposal_ids=conflict_ids,
+    )
+    _validate_relation_targets(connection, proposal_id, restored_payload)
+    connection.execute(
+        """
+        UPDATE review_proposals
+        SET proposal_version = proposal_version + 1,
+            title = ?, content = ?, intent = ?, formation = ?, priority = ?,
+            applicability_scope = ?, approval_effect_json = ?, target_json = ?,
+            supporting_evidence_json = ?, opposing_evidence_json = ?,
+            dependencies_json = ?, context_coverage_json = ?, blind_spots_json = ?,
+            near_proposal_ids_json = ?, conflict_proposal_ids_json = ?,
+            sensitivity = ?, evidence_retention = ?, migration_restrictions_json = ?,
+            status = 'pending', updated_at = ?, deferred_until = NULL,
+            expired_at = NULL, last_error = NULL
+        WHERE proposal_id = ? AND status IN ('rejected', 'expired')
+        """,
+        (
+            incoming.title,
+            incoming.content,
+            incoming.intent,
+            incoming.formation,
+            incoming.priority,
+            incoming.applicability_scope,
+            _json(incoming.approval_effect.to_data()),
+            _json(incoming.target.to_data()),
+            _json(list(supporting)),
+            _json(list(opposing)),
+            _json(list(incoming.dependencies)),
+            _json(list(incoming.context_coverage)),
+            _json(list(incoming.blind_spots)),
+            _json(list(near_ids)),
+            _json(list(conflict_ids)),
+            incoming.sensitivity,
+            incoming.evidence_retention,
+            _json(list(incoming.migration_restrictions)),
+            updated_at,
+            proposal_id,
+        ),
+    )
+    connection.execute(
+        "DELETE FROM review_expirations WHERE proposal_id = ?",
+        (proposal_id,),
+    )
+    _group_proposal_relations(
+        connection,
+        proposal_id=proposal_id,
+        near_proposal_ids=near_ids,
+        conflict_proposal_ids=conflict_ids,
+        created_at=updated_at,
+    )
+    restored_row = connection.execute(
+        "SELECT * FROM review_proposals WHERE proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    if restored_row is None:
+        raise IntegrityError("restored review proposal disappeared")
+    return _proposal_from_row(restored_row), True
 
 
 def _merged_objects(
@@ -1932,8 +2258,8 @@ def _insert_proposal(
             payload.formation,
             payload.priority,
             payload.applicability_scope,
-            _json(payload.approval_effect),
-            _json(payload.target),
+            _json(payload.approval_effect.to_data()),
+            _json(payload.target.to_data()),
             _json(list(payload.supporting_evidence)),
             _json(list(payload.opposing_evidence)),
             _json(list(payload.dependencies)),

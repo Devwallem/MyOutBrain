@@ -397,7 +397,7 @@ class UnifiedReviewTests(unittest.TestCase):
                     payload_path,
                     proposal_payload(
                         intent="integrate",
-                        formation="explicit",
+                        formation="derived",
                         priority="priority",
                         title="Integrated review rule",
                         content="Apply dependent decisions atomically.",
@@ -440,7 +440,11 @@ class UnifiedReviewTests(unittest.TestCase):
                             {
                                 "proposal_id": proposal["proposal_id"],
                                 "proposal_version": proposal["proposal_version"],
-                                "decision": "approve",
+                                "decision": (
+                                    "approve-edited"
+                                    if proposal["intent"] == "derive"
+                                    else "approve"
+                                ),
                                 "edited_content": (
                                     "Keep every review failure safely retryable."
                                     if proposal["intent"] == "derive"
@@ -504,6 +508,10 @@ class UnifiedReviewTests(unittest.TestCase):
             )
             self.assertEqual(
                 result["outcomes"][0]["materialization"]["authorship"],
+                "system-derived",
+            )
+            self.assertEqual(
+                result["outcomes"][1]["materialization"]["authorship"],
                 "system-derived",
             )
             listed = json.loads(
@@ -692,6 +700,142 @@ class UnifiedReviewTests(unittest.TestCase):
             self.assertEqual(
                 outcome["materialization"]["authorship"],
                 "creator-personal-cognition",
+            )
+
+    def test_rejected_proposal_reopens_only_for_materially_new_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            payload_path = temporary_root / "proposal.json"
+            batch_path = temporary_root / "batch.json"
+            run_cli("init", "--root", str(instance_root))
+            payload = proposal_payload(
+                intent="research",
+                formation="hypothesis",
+                priority="routine",
+                title="Rejected research idea",
+                content="Investigate whether this grouping needs another index.",
+                effect_type="create_research_thread",
+            )
+            proposal = submit_proposal(
+                instance_root,
+                payload_path,
+                payload,
+                "rejected-recurrence-original",
+            )
+            batch_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "bat_reject_recurrence",
+                        "decisions": [
+                            {
+                                "proposal_id": proposal["proposal_id"],
+                                "proposal_version": proposal["proposal_version"],
+                                "decision": "reject",
+                                "edited_content": None,
+                                "reason": "No supporting need yet.",
+                                "defer_until": None,
+                                "confirm_personal_cognition": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rejected = run_cli(
+                "review-batch",
+                str(batch_path),
+                "--idempotency-key",
+                "reject-recurrence",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(rejected.returncode, 0, rejected.stderr)
+
+            repeated = submit_proposal(
+                instance_root,
+                payload_path,
+                payload,
+                "rejected-recurrence-same-evidence",
+            )
+            self.assertEqual(repeated["proposal_id"], proposal["proposal_id"])
+            self.assertEqual(repeated["status"], "rejected")
+            self.assertEqual(
+                json.loads(
+                    run_cli(
+                        "review-list",
+                        "--root",
+                        str(instance_root),
+                        "--format",
+                        "json",
+                    ).stdout
+                )["proposals"],
+                [],
+            )
+
+            payload["supporting_evidence"] = [
+                *cast(list[dict[str, object]], payload["supporting_evidence"]),
+                {"kind": "source", "source_id": "src_materially_new"},
+            ]
+            payload["dependencies"] = ["prp_missing_dependency"]
+            payload_path.write_text(json.dumps(payload), encoding="utf-8")
+            invalid_restore = run_cli(
+                "review-propose",
+                str(payload_path),
+                "--idempotency-key",
+                "rejected-recurrence-invalid-relation",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertNotEqual(invalid_restore.returncode, 0)
+            self.assertIn(
+                "related review proposal does not exist: prp_missing_dependency",
+                invalid_restore.stderr,
+            )
+
+            related = submit_proposal(
+                instance_root,
+                payload_path,
+                proposal_payload(
+                    intent="research",
+                    formation="hypothesis",
+                    priority="routine",
+                    title="Related grouping research",
+                    content="Investigate a related grouping projection.",
+                    effect_type="create_research_thread",
+                ),
+                "rejected-recurrence-related",
+            )
+            payload["dependencies"] = []
+            payload["near_proposal_ids"] = [related["proposal_id"]]
+            reopened = submit_proposal(
+                instance_root,
+                payload_path,
+                payload,
+                "rejected-recurrence-new-evidence",
+            )
+            self.assertEqual(reopened["proposal_id"], proposal["proposal_id"])
+            self.assertEqual(reopened["proposal_version"], 2)
+            self.assertEqual(reopened["status"], "pending")
+            queue = json.loads(
+                run_cli(
+                    "review-list",
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )
+            self.assertEqual(len(queue["groups"]), 1)
+            self.assertEqual(
+                set(queue["groups"][0]["proposal_ids"]),
+                {proposal["proposal_id"], related["proposal_id"]},
             )
 
     def test_independent_item_succeeds_while_dependency_group_fails_atomically(self) -> None:
@@ -1026,6 +1170,62 @@ class UnifiedReviewTests(unittest.TestCase):
                     proposals["deferred"]["proposal_id"],
                 },
             )
+            restored_payload = proposal_payload(
+                intent="research",
+                formation="hypothesis",
+                priority="routine",
+                title="Routine proposal",
+                content="Generated body for the routine proposal.",
+                effect_type="create_research_thread",
+            )
+            restored_payload["supporting_evidence"] = [
+                *cast(
+                    list[dict[str, object]],
+                    restored_payload["supporting_evidence"],
+                ),
+                {"kind": "source", "source_id": "src_after_expiration"},
+            ]
+            restored = submit_proposal(
+                instance_root,
+                payload_path,
+                restored_payload,
+                "restore-expired-routine",
+            )
+            self.assertEqual(
+                restored["proposal_id"], proposals["routine"]["proposal_id"]
+            )
+            self.assertEqual(restored["proposal_version"], 2)
+            self.assertEqual(restored["status"], "pending")
+
+            due = run_cli(
+                "review-expire",
+                "--as-of",
+                "2027-01-02T00:00:00+00:00",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(due.returncode, 0, due.stderr)
+            due_result = json.loads(due.stdout)
+            self.assertEqual(
+                due_result["reactivated"],
+                [proposals["deferred"]["proposal_id"]],
+            )
+            reactivated = next(
+                proposal
+                for proposal in json.loads(
+                    run_cli(
+                        "review-list",
+                        "--root",
+                        str(instance_root),
+                        "--format",
+                        "json",
+                    ).stdout
+                )["proposals"]
+                if proposal["proposal_id"] == proposals["deferred"]["proposal_id"]
+            )
+            self.assertEqual(reactivated["status"], "pending")
 
     def test_source_memory_can_be_approved_through_the_unified_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1365,6 +1565,100 @@ class UnifiedReviewTests(unittest.TestCase):
                     "Review the current version and preserve the prior version.",
                 ],
             )
+
+            prerequisite_payload = proposal_payload(
+                intent="integrate",
+                formation="explicit",
+                priority="priority",
+                title="Review revision rule",
+                content="Apply the prerequisite revision first.",
+                effect_type="revise_canonical_memory",
+            )
+            prerequisite_payload["target"] = {
+                "memory_id": memory_id,
+                "expected_version": 2,
+            }
+            prerequisite = submit_proposal(
+                instance_root,
+                payload_path,
+                prerequisite_payload,
+                "ordered-prerequisite",
+            )
+            dependent_payload = proposal_payload(
+                intent="integrate",
+                formation="explicit",
+                priority="priority",
+                title="Review revision rule",
+                content="Apply this only after the prerequisite revision.",
+                effect_type="revise_canonical_memory",
+                dependencies=[str(prerequisite["proposal_id"])],
+            )
+            dependent_payload["target"] = {
+                "memory_id": memory_id,
+                "expected_version": 3,
+            }
+            dependent = submit_proposal(
+                instance_root,
+                payload_path,
+                dependent_payload,
+                "ordered-dependent",
+            )
+            batch_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "bat_reverse_dependency_order",
+                        "decisions": [
+                            {
+                                "proposal_id": dependent["proposal_id"],
+                                "proposal_version": dependent["proposal_version"],
+                                "decision": "approve",
+                                "edited_content": None,
+                                "reason": None,
+                                "defer_until": None,
+                                "confirm_personal_cognition": False,
+                            },
+                            {
+                                "proposal_id": prerequisite["proposal_id"],
+                                "proposal_version": prerequisite["proposal_version"],
+                                "decision": "approve",
+                                "edited_content": None,
+                                "reason": None,
+                                "defer_until": None,
+                                "confirm_personal_cognition": False,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ordered = run_cli(
+                "review-batch",
+                str(batch_path),
+                "--idempotency-key",
+                "reverse-dependency-order",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            self.assertEqual(ordered.returncode, 0, ordered.stderr)
+            self.assertEqual(
+                [outcome["status"] for outcome in json.loads(ordered.stdout)["outcomes"]],
+                ["applied", "applied"],
+            )
+            final_explanation = json.loads(
+                run_cli(
+                    "why-memory",
+                    memory_id,
+                    "--root",
+                    str(instance_root),
+                    "--format",
+                    "json",
+                ).stdout
+            )
+            self.assertEqual(final_explanation["current_version"], 4)
 
 
 if __name__ == "__main__":
