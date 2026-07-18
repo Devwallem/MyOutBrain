@@ -1315,6 +1315,14 @@ class LocalMemoryCore:
             hold_writer_lock_for_acceptance_test()
             recover_transactions(self._root)
             self._validate_database(database_path)
+            if normalized_source_id is not None and self._has_deletion_marker(
+                database_path,
+                subject_kind="source",
+                subject_id=normalized_source_id,
+            ):
+                raise UserInputError(
+                    "permanently erased source cannot be silently restored"
+                )
             existing = self._source_memory_proposal_for_key(
                 database_path,
                 normalized_key,
@@ -2585,7 +2593,7 @@ class LocalMemoryCore:
                     ).fetchall()
                     canonical_rows = connection.execute(
                         """
-                        SELECT c.memory_id, c.content, c.updated_at,
+                        SELECT c.memory_id, c.content, c.updated_at, c.state,
                                CASE
                                    WHEN c.sensitivity = 'local-only'
                                      OR EXISTS (
@@ -2606,7 +2614,8 @@ class LocalMemoryCore:
                           ON source.memory_id = c.memory_id
                          AND source.version = c.current_version
                         WHERE c.state IN ('current', 'historical-trusted')
-                        GROUP BY c.memory_id, c.content, c.updated_at, c.sensitivity
+                        GROUP BY c.memory_id, c.content, c.updated_at, c.state,
+                                 c.sensitivity
                         """
                     ).fetchall()
                     relation_rows = connection.execute(
@@ -2651,7 +2660,11 @@ class LocalMemoryCore:
             RecallableMemory(
                 memory_id=memory_id,
                 content=content,
-                memory_state=MemoryState.CANONICAL,
+                memory_state=(
+                    MemoryState.HISTORICAL_TRUSTED
+                    if lifecycle_state == "historical-trusted"
+                    else MemoryState.CANONICAL
+                ),
                 source_ids=(
                     tuple(source_ids.split(",")) if source_ids is not None else ()
                 ),
@@ -2672,7 +2685,14 @@ class LocalMemoryCore:
                     if memory_id in (first_memory_id, second_memory_id)
                 ),
             )
-            for memory_id, content, updated_at, sensitivity, source_ids in canonical_rows
+            for (
+                memory_id,
+                content,
+                updated_at,
+                lifecycle_state,
+                sensitivity,
+                source_ids,
+            ) in canonical_rows
         )
         return canonical + buffered
 
@@ -3080,7 +3100,6 @@ class LocalMemoryCore:
             raise ConfigurationConflict(
                 f"MyOutBrain memory core is not initialized at: {self._root}"
             )
-        target_state = "current" if active else "inactive"
         action: MemoryLifecycleAction = "reactivated" if active else "deactivated"
         occurred_at = datetime.now(timezone.utc).isoformat()
         with writer_lock(self._root):
@@ -3089,16 +3108,59 @@ class LocalMemoryCore:
             try:
                 with closing(sqlite3.connect(database_path)) as connection:
                     row = connection.execute(
-                        "SELECT state FROM canonical_memories WHERE memory_id = ?",
+                        """
+                        SELECT current_version, state, previous_live_state
+                        FROM canonical_memories WHERE memory_id = ?
+                        """,
                         (normalized_memory_id,),
                     ).fetchone()
+                    dependencies_complete = (
+                        row is None
+                        or not isinstance(row[0], int)
+                        or _canonical_dependencies_complete(
+                            connection,
+                            normalized_memory_id,
+                            row[0],
+                        )
+                    )
             except sqlite3.Error as error:
                 raise IntegrityError("cannot inspect canonical memory state") from error
             if row is None:
                 raise UserInputError(
                     f"canonical memory does not exist: {normalized_memory_id}"
                 )
-            if row[0] == target_state:
+            if (
+                not isinstance(row[0], int)
+                or not isinstance(row[1], str)
+                or (row[2] is not None and not isinstance(row[2], str))
+            ):
+                raise IntegrityError("canonical memory lifecycle state is invalid")
+            if active:
+                if row[1] != "inactive" or row[2] not in (
+                    "current",
+                    "historical-trusted",
+                    "superseded",
+                ):
+                    raise UserInputError(
+                        "memory restoration requires an inactive memory with a previous live state"
+                    )
+                if not dependencies_complete:
+                    raise UserInputError("inactive memory dependencies are incomplete")
+                target_state = row[2]
+                previous_live_state: str | None = None
+            else:
+                if row[1] == "inactive":
+                    return CanonicalMemoryStateChange(
+                        memory_id=normalized_memory_id,
+                        action=action,
+                        occurred_at=occurred_at,
+                        reason=normalized_reason,
+                    )
+                if row[1] not in ("current", "historical-trusted", "superseded"):
+                    raise IntegrityError("canonical memory lifecycle state is invalid")
+                target_state = "inactive"
+                previous_live_state = row[1]
+            if row[1] == target_state:
                 return CanonicalMemoryStateChange(
                     memory_id=normalized_memory_id,
                     action=action,
@@ -3120,6 +3182,7 @@ class LocalMemoryCore:
                 event_type=f"memory.{action}",
                 occurred_at=occurred_at,
                 payload=payload,
+                previous_live_state=previous_live_state,
             )
             atomic_commit(
                 self._root,
@@ -4307,6 +4370,17 @@ class LocalMemoryCore:
                     raise UserInputError(
                         "first-memory approval expected_version conflict: memory already exists"
                     )
+                if connection.execute(
+                    """
+                    SELECT 1 FROM deletion_markers
+                    WHERE subject_kind = 'canonical-memory'
+                      AND subject_fingerprint = ?
+                    """,
+                    (_deletion_fingerprint(memory_id),),
+                ).fetchone() is not None:
+                    raise UserInputError(
+                        "permanently erased memory cannot be silently restored"
+                    )
                 capsule_id = f"cap_{uuid.uuid4().hex}"
                 event_id = f"aud_{uuid.uuid4().hex}"
                 result_hash = _stable_hash(
@@ -4728,6 +4802,7 @@ class LocalMemoryCore:
         event_type: str,
         occurred_at: str,
         payload: dict[str, str],
+        previous_live_state: str | None,
     ) -> bytes:
         temporary_path: Path | None = None
         try:
@@ -4745,10 +4820,10 @@ class LocalMemoryCore:
                 updated = connection.execute(
                     """
                     UPDATE canonical_memories
-                    SET state = ?, updated_at = ?
+                    SET state = ?, previous_live_state = ?, updated_at = ?
                     WHERE memory_id = ?
                     """,
-                    (state, occurred_at, memory_id),
+                    (state, previous_live_state, occurred_at, memory_id),
                 )
                 if updated.rowcount != 1:
                     raise sqlite3.IntegrityError("canonical memory state was not updated")
@@ -4975,6 +5050,17 @@ class LocalMemoryCore:
                     "rejected" if review.decision == "rejected" else "accepted"
                 )
                 if canonical_memory_id is not None and canonical_content is not None:
+                    if connection.execute(
+                        """
+                        SELECT 1 FROM deletion_markers
+                        WHERE subject_kind = 'canonical-memory'
+                          AND subject_fingerprint = ?
+                        """,
+                        (_deletion_fingerprint(canonical_memory_id),),
+                    ).fetchone() is not None:
+                        raise UserInputError(
+                            "permanently erased memory cannot be silently restored"
+                        )
                     existing = connection.execute(
                         """
                         SELECT content, current_version, sensitivity
@@ -5341,7 +5427,8 @@ class LocalMemoryCore:
                          previous_live_state, created_at, updated_at)
                     SELECT memory_id, content, current_version, sensitivity,
                            CASE state WHEN 'active' THEN 'current' ELSE state END,
-                           NULL, created_at, updated_at
+                           CASE WHEN state = 'inactive' THEN 'current' ELSE NULL END,
+                           created_at, updated_at
                     FROM canonical_memories;
                     DROP TABLE canonical_memories;
                     ALTER TABLE canonical_memories_v9 RENAME TO canonical_memories;
@@ -6738,6 +6825,40 @@ def _validated_time(value: str) -> str:
 
 def _deletion_fingerprint(subject_id: str) -> str:
     return "sha256:" + hashlib.sha256(subject_id.encode("utf-8")).hexdigest()
+
+
+def _canonical_dependencies_complete(
+    connection: sqlite3.Connection,
+    memory_id: str,
+    version: int,
+) -> bool:
+    missing_evidence = connection.execute(
+        """
+        SELECT 1
+        FROM canonical_memory_version_evidence AS evidence
+        LEFT JOIN evidence_source_versions AS source
+          ON source.source_id = evidence.source_id
+         AND source.version = evidence.source_version
+        WHERE evidence.memory_id = ? AND evidence.version = ?
+          AND source.source_id IS NULL
+        LIMIT 1
+        """,
+        (memory_id, version),
+    ).fetchone()
+    missing_memory = connection.execute(
+        """
+        SELECT 1
+        FROM canonical_memory_dependencies AS dependency
+        LEFT JOIN canonical_memory_versions AS target
+          ON target.memory_id = dependency.depends_on_memory_id
+         AND target.version = dependency.depends_on_version
+        WHERE dependency.memory_id = ? AND dependency.version = ?
+          AND target.memory_id IS NULL
+        LIMIT 1
+        """,
+        (memory_id, version),
+    ).fetchone()
+    return missing_evidence is None and missing_memory is None
 
 
 def _select_ids_for_values(

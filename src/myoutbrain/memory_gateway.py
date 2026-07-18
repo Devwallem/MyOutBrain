@@ -526,6 +526,14 @@ class MemoryGateway:
             )
             for memory in canonical
         )
+        historical = _eligible_for_phase(
+            memories,
+            state=MemoryState.HISTORICAL_TRUSTED,
+            access=request.access,
+            task=task,
+            requested_memory_ids=requested_memory_ids,
+            requested_source_ids=requested_source_ids,
+        )
         buffered = _eligible_for_phase(
             memories,
             state=MemoryState.BUFFERED,
@@ -540,6 +548,12 @@ class MemoryGateway:
             requested_memory_ids=requested_memory_ids,
             requested_source_ids=requested_source_ids,
         )
+        historical_matches = _match_phase(
+            query,
+            historical,
+            requested_memory_ids=requested_memory_ids,
+            requested_source_ids=requested_source_ids,
+        )
         buffered_matches = _match_phase(
             query,
             buffered,
@@ -548,7 +562,7 @@ class MemoryGateway:
         )
         semantic_scores = self._semantic_scores(
             query,
-            canonical + buffered,
+            canonical + historical + buffered,
             query_sensitivity=request.query_sensitivity,
         )
         canonical_matches = _with_semantic_matches(
@@ -556,17 +570,23 @@ class MemoryGateway:
             canonical_matches,
             semantic_scores,
         )
+        historical_matches = _with_semantic_matches(
+            historical,
+            historical_matches,
+            semantic_scores,
+        )
         buffered_matches = _with_semantic_matches(
             buffered,
             buffered_matches,
             semantic_scores,
         )
-        matched = canonical_matches + buffered_matches
+        matched = canonical_matches + historical_matches + buffered_matches
         ordered = tuple(
             sorted(
                 matched,
                 key=lambda pair: (
                     _MATCH_ORDER[pair[1]],
+                    pair[0].memory_state is MemoryState.HISTORICAL_TRUSTED,
                     pair[0].memory_state is MemoryState.BUFFERED,
                     -pair[2],
                     pair[0].memory_id,
@@ -733,7 +753,10 @@ def _allows(
 ) -> bool:
     if access is MemoryAccess.PUBLIC_EXTERNAL and memory.sensitivity == "local-only":
         return False
-    if memory.memory_state is MemoryState.CANONICAL:
+    if memory.memory_state in (
+        MemoryState.CANONICAL,
+        MemoryState.HISTORICAL_TRUSTED,
+    ):
         return True
     if access is MemoryAccess.LOCAL_TRUSTED:
         return True

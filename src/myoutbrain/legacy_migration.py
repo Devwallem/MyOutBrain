@@ -319,6 +319,10 @@ class V1PermanentKnowledgeMigrator:
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("BEGIN IMMEDIATE")
                 for source in migration_input.sources:
+                    if _has_deletion_marker(connection, "source", source.source_id):
+                        raise IntegrityError(
+                            "V1 migration cannot restore a permanently erased source"
+                        )
                     existing_source = connection.execute(
                         """
                         SELECT content_hash, object_reference
@@ -366,20 +370,28 @@ class V1PermanentKnowledgeMigrator:
                         ),
                     )
                 for note in migration_input.notes:
+                    if _has_deletion_marker(
+                        connection, "canonical-memory", note.knowledge_id
+                    ):
+                        raise IntegrityError(
+                            "V1 migration cannot restore permanently erased memory"
+                        )
                     content = _canonical_content(note)
-                    state = "active" if note.state == "active" else "inactive"
+                    state = "current" if note.state == "active" else "inactive"
+                    previous_live_state = "current" if state == "inactive" else None
                     connection.execute(
                         """
                         INSERT INTO canonical_memories
                             (memory_id, content, current_version, sensitivity,
-                             state, created_at, updated_at)
-                        VALUES (?, ?, 1, ?, ?, ?, ?)
+                             state, previous_live_state, created_at, updated_at)
+                        VALUES (?, ?, 1, ?, ?, ?, ?, ?)
                         """,
                         (
                             note.knowledge_id,
                             content,
                             note.sensitivity,
                             state,
+                            previous_live_state,
                             note.created_at,
                             note.updated_at,
                         ),
@@ -524,3 +536,18 @@ def _source_fingerprint(root: Path, paths: tuple[Path, ...]) -> str:
         hasher.update(len(content).to_bytes(8, "big"))
         hasher.update(content)
     return f"sha256:{hasher.hexdigest()}"
+
+
+def _has_deletion_marker(
+    connection: sqlite3.Connection,
+    subject_kind: str,
+    subject_id: str,
+) -> bool:
+    fingerprint = "sha256:" + hashlib.sha256(subject_id.encode("utf-8")).hexdigest()
+    return connection.execute(
+        """
+        SELECT 1 FROM deletion_markers
+        WHERE subject_kind = ? AND subject_fingerprint = ?
+        """,
+        (subject_kind, fingerprint),
+    ).fetchone() is not None

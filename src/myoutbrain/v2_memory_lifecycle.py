@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,7 +14,12 @@ import uuid
 
 from myoutbrain.core_types import ConfigurationConflict, IntegrityError, UserInputError
 from myoutbrain.local_core import LocalMemoryCore, MEMORY_DATABASE
-from myoutbrain.persistence import atomic_commit, recover_transactions, writer_lock
+from myoutbrain.persistence import (
+    atomic_commit,
+    permanent_deletion_cleanup_change,
+    recover_transactions,
+    writer_lock,
+)
 
 
 class V2MemoryLifecycleService:
@@ -322,13 +328,49 @@ class V2MemoryLifecycleService:
                 raise UserInputError(
                     "permanent erasure confirmation does not match the current impact closure"
                 )
-            staged_database, result = _stage_erasure(
+            staged_database, result, object_references = _stage_erasure(
                 database_path,
                 impact=impact,
                 entrance=normalized_entrance,
             )
-            atomic_commit(self._root, [(database_path, staged_database)])
+            atomic_commit(
+                self._root,
+                [
+                    (database_path, staged_database),
+                    permanent_deletion_cleanup_change(
+                        self._root,
+                        object_references=object_references,
+                        view_paths=(),
+                    ),
+                ],
+            )
+            recover_transactions(self._root)
         return result
+
+
+@contextmanager
+def _staged_database(
+    database_path: Path,
+    *,
+    prefix: str,
+) -> Iterator[tuple[Path, sqlite3.Connection]]:
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=database_path.parent,
+            prefix=prefix,
+            suffix=".sqlite3",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(database_path.read_bytes())
+        with closing(sqlite3.connect(temporary_path)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield temporary_path, connection
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _stage_historicization(
@@ -341,20 +383,11 @@ def _stage_historicization(
     request_hash: str,
     entrance: str,
 ) -> tuple[bytes, dict[str, object]]:
-    temporary_path: Path | None = None
     occurred_at = datetime.now(timezone.utc).isoformat()
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=database_path.parent,
-            prefix=".memory-historicize.",
-            suffix=".sqlite3",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(database_path.read_bytes())
-        with closing(sqlite3.connect(temporary_path)) as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
+        with _staged_database(
+            database_path, prefix=".memory-historicize."
+        ) as (temporary_path, connection):
             row = connection.execute(
                 "SELECT current_version, state FROM canonical_memories WHERE memory_id = ?",
                 (memory_id,),
@@ -425,7 +458,8 @@ def _stage_historicization(
                 ),
             )
             connection.commit()
-        return temporary_path.read_bytes(), _transition_result(
+            staged_database = temporary_path.read_bytes()
+        return staged_database, _transition_result(
             memory_id=memory_id,
             version=expected_version,
             reason=reason,
@@ -436,9 +470,6 @@ def _stage_historicization(
         )
     except (OSError, sqlite3.Error) as error:
         raise IntegrityError("cannot historicize canonical memory") from error
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _stage_revision(
@@ -452,20 +483,12 @@ def _stage_revision(
     request_hash: str,
     entrance: str,
 ) -> tuple[bytes, dict[str, object]]:
-    temporary_path: Path | None = None
     occurred_at = datetime.now(timezone.utc).isoformat()
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=database_path.parent,
-            prefix=".memory-revise.",
-            suffix=".sqlite3",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(database_path.read_bytes())
-        with closing(sqlite3.connect(temporary_path)) as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
+        with _staged_database(database_path, prefix=".memory-revise.") as (
+            temporary_path,
+            connection,
+        ):
             row = connection.execute(
                 """
                 SELECT memory.current_version, memory.state,
@@ -483,12 +506,9 @@ def _stage_revision(
             ).fetchone()
             if row is None:
                 raise UserInputError(f"canonical memory does not exist: {memory_id}")
-            if row[0] != expected_version or row[1] not in (
-                "current",
-                "historical-trusted",
-            ):
+            if row[0] != expected_version or row[1] != "current":
                 raise UserInputError(
-                    "revise-memory requires the expected current or historically trusted version"
+                    "revise-memory requires the expected current memory version"
                 )
             if not all(isinstance(row[index], str) for index in range(2, 6)):
                 raise IntegrityError("canonical memory revision target is invalid")
@@ -611,22 +631,21 @@ def _stage_revision(
                 (idempotency_key, memory_id, request_hash, result_hash, occurred_at),
             )
             connection.commit()
-        return temporary_path.read_bytes(), _revision_result(
-            connection_path=temporary_path,
-            memory_id=memory_id,
-            previous_version=expected_version,
-            current_version=new_version,
-            reason=reason,
-            event_id=event_id,
-            occurred_at=occurred_at,
-            entrance=entrance,
-            result_hash=result_hash,
-        )
+            staged_database = temporary_path.read_bytes()
+            result = _revision_result(
+                connection_path=temporary_path,
+                memory_id=memory_id,
+                previous_version=expected_version,
+                current_version=new_version,
+                reason=reason,
+                event_id=event_id,
+                occurred_at=occurred_at,
+                entrance=entrance,
+                result_hash=result_hash,
+            )
+        return staged_database, result
     except (OSError, sqlite3.Error) as error:
         raise IntegrityError("cannot revise canonical memory") from error
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _stage_supersession(
@@ -641,20 +660,12 @@ def _stage_supersession(
     request_hash: str,
     entrance: str,
 ) -> tuple[bytes, dict[str, object]]:
-    temporary_path: Path | None = None
     occurred_at = datetime.now(timezone.utc).isoformat()
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=database_path.parent,
-            prefix=".memory-supersede.",
-            suffix=".sqlite3",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(database_path.read_bytes())
-        with closing(sqlite3.connect(temporary_path)) as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
+        with _staged_database(database_path, prefix=".memory-supersede.") as (
+            temporary_path,
+            connection,
+        ):
             target = connection.execute(
                 """
                 SELECT memory.current_version, memory.state, version.content
@@ -749,21 +760,20 @@ def _stage_supersession(
                 (idempotency_key, memory_id, request_hash, result_hash, occurred_at),
             )
             connection.commit()
-        return temporary_path.read_bytes(), _supersession_result(
-            connection_path=temporary_path,
-            memory_id=memory_id,
-            version=expected_version,
-            reason=reason,
-            event_id=event_id,
-            occurred_at=occurred_at,
-            entrance=entrance,
-            result_hash=result_hash,
-        )
+            staged_database = temporary_path.read_bytes()
+            result = _supersession_result(
+                connection_path=temporary_path,
+                memory_id=memory_id,
+                version=expected_version,
+                reason=reason,
+                event_id=event_id,
+                occurred_at=occurred_at,
+                entrance=entrance,
+                result_hash=result_hash,
+            )
+        return staged_database, result
     except (OSError, sqlite3.Error) as error:
         raise IntegrityError("cannot supersede canonical memory") from error
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _stage_availability_change(
@@ -778,20 +788,12 @@ def _stage_availability_change(
     request_hash: str,
     entrance: str,
 ) -> tuple[bytes, dict[str, object]]:
-    temporary_path: Path | None = None
     occurred_at = datetime.now(timezone.utc).isoformat()
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=database_path.parent,
-            prefix=".memory-availability.",
-            suffix=".sqlite3",
-            delete=False,
-        ) as temporary_file:
-            temporary_path = Path(temporary_file.name)
-            temporary_file.write(database_path.read_bytes())
-        with closing(sqlite3.connect(temporary_path)) as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
+        with _staged_database(database_path, prefix=".memory-availability.") as (
+            temporary_path,
+            connection,
+        ):
             row = connection.execute(
                 """
                 SELECT current_version, state, previous_live_state
@@ -868,7 +870,8 @@ def _stage_availability_change(
                 (operation, idempotency_key, memory_id, request_hash, result_hash, occurred_at),
             )
             connection.commit()
-        return temporary_path.read_bytes(), _availability_result(
+            staged_database = temporary_path.read_bytes()
+        return staged_database, _availability_result(
             memory_id=memory_id,
             version=expected_version,
             from_state=from_state,
@@ -883,9 +886,6 @@ def _stage_availability_change(
         )
     except (OSError, sqlite3.Error) as error:
         raise IntegrityError(f"cannot apply {operation}") from error
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _historicization_for_key(
@@ -1273,6 +1273,242 @@ def _erasure_impact_for_connection(
                 "action": "retain-shared" if shared else "erase-receipt",
             }
         )
+    erased_receipt_source_ids = {
+        cast(str, item["source_id"])
+        for item in source_impacts
+        if item["action"] == "erase-receipt"
+    }
+    fully_erased_receipt_source_ids = tuple(
+        sorted(
+            source_id
+            for source_id in erased_receipt_source_ids
+            if connection.execute(
+                "SELECT COUNT(*) FROM evidence_source_versions WHERE source_id = ?",
+                (source_id,),
+            ).fetchone()[0]
+            == sum(
+                item["source_id"] == source_id
+                and item["action"] == "erase-receipt"
+                for item in source_impacts
+            )
+        )
+    )
+    legacy_source_rows = connection.execute(
+        f"""
+        SELECT DISTINCT object.source_id, object.content_hash,
+               object.object_reference
+        FROM source_objects AS object
+        WHERE object.source_id IN (
+            SELECT source_id FROM canonical_memory_sources
+            WHERE memory_id IN ({placeholders})
+            UNION
+            SELECT source_id FROM canonical_memory_version_sources
+            WHERE memory_id IN ({placeholders})
+        )
+        ORDER BY object.source_id
+        """,
+        (*memory_ids, *memory_ids),
+    ).fetchall()
+    legacy_source_impacts: list[dict[str, object]] = []
+    erased_legacy_source_ids: list[str] = []
+    for source_id, content_hash, object_reference in legacy_source_rows:
+        if not all(
+            isinstance(value, str)
+            for value in (source_id, content_hash, object_reference)
+        ):
+            raise IntegrityError("permanent erasure raw source closure is invalid")
+        shared = connection.execute(
+            f"""
+            SELECT 1 FROM canonical_memory_sources
+            WHERE source_id = ? AND memory_id NOT IN ({placeholders})
+            UNION
+            SELECT 1 FROM canonical_memory_version_sources
+            WHERE source_id = ? AND memory_id NOT IN ({placeholders})
+            LIMIT 1
+            """,
+            (source_id, *memory_ids, source_id, *memory_ids),
+        ).fetchone() is not None
+        action = "retain-shared" if shared else "erase-object"
+        if not shared:
+            erased_legacy_source_ids.append(source_id)
+        legacy_source_impacts.append(
+            {
+                "source_id": source_id,
+                "content_hash": content_hash,
+                "object_reference": object_reference,
+                "action": action,
+            }
+        )
+    erased_source_ids_tuple = tuple(erased_legacy_source_ids)
+    experience_ids = tuple(
+        row[0]
+        for row in _rows_for_values(
+            connection,
+            "experiences",
+            "experience_id",
+            "source_id",
+            erased_source_ids_tuple,
+        )
+        if isinstance(row[0], str)
+    )
+    digest_ids = tuple(
+        row[0]
+        for row in _rows_for_values(
+            connection,
+            "buffered_digests",
+            "digest_id",
+            "experience_id",
+            experience_ids,
+        )
+        if isinstance(row[0], str)
+    )
+    proposal_id_set = set(_erasure_proposal_ids(connection, memory_ids))
+    for table, column, values in (
+        ("integration_proposal_sources", "source_id", erased_source_ids_tuple),
+        ("integration_proposal_buffered", "digest_id", digest_ids),
+    ):
+        proposal_id_set.update(
+            row[0]
+            for row in _rows_for_values(
+                connection, table, "proposal_id", column, values
+            )
+            if isinstance(row[0], str)
+        )
+    proposal_ids = tuple(sorted(proposal_id_set))
+    batch_ids = tuple(
+        sorted(
+            row[0]
+            for row in _rows_for_values(
+                connection,
+                "review_batch_items",
+                "batch_id",
+                "proposal_id",
+                proposal_ids,
+            )
+            if isinstance(row[0], str)
+        )
+    )
+    group_ids = tuple(
+        sorted(
+            row[0]
+            for row in _rows_for_values(
+                connection,
+                "review_group_members",
+                "group_id",
+                "proposal_id",
+                proposal_ids,
+            )
+            if isinstance(row[0], str)
+        )
+    )
+    recall_ids = tuple(
+        sorted(
+            row[0]
+            for row in _rows_for_values(
+                connection,
+                "recall_event_items",
+                "recall_id",
+                "memory_id",
+                memory_ids,
+            )
+            if isinstance(row[0], str)
+        )
+    )
+    relation_rows = connection.execute(
+        f"""
+        SELECT 'related', memory_id, related_memory_id
+        FROM canonical_memory_relations
+        WHERE memory_id IN ({placeholders})
+           OR related_memory_id IN ({placeholders})
+        UNION ALL
+        SELECT 'conflict', first_memory_id, second_memory_id
+        FROM canonical_memory_conflicts
+        WHERE first_memory_id IN ({placeholders})
+           OR second_memory_id IN ({placeholders})
+        ORDER BY 1, 2, 3
+        """,
+        (*memory_ids, *memory_ids, *memory_ids, *memory_ids),
+    ).fetchall()
+    relation_impacts = [
+        {"relationship": row[0], "memory_id": row[1], "related_memory_id": row[2]}
+        for row in relation_rows
+    ]
+    lifecycle_event_ids = tuple(
+        sorted(
+            row[0]
+            for row in _rows_for_values(
+                connection,
+                "canonical_memory_lifecycle_events",
+                "event_id",
+                "memory_id",
+                memory_ids,
+            )
+            if isinstance(row[0], str)
+        )
+    )
+    sensitive_subject_ids = (
+        *memory_ids,
+        *fully_erased_receipt_source_ids,
+        *erased_source_ids_tuple,
+        *experience_ids,
+        *digest_ids,
+        *proposal_ids,
+    )
+    memory_event_ids = tuple(
+        sorted(
+            row[0]
+            for row in _rows_for_values(
+                connection,
+                "memory_events",
+                "event_id",
+                "subject_id",
+                sensitive_subject_ids,
+            )
+            if isinstance(row[0], str)
+        )
+    )
+    capsule_rows = connection.execute(
+        f"""
+        SELECT dictionary.primary_capsule_id, dictionary.memory_id,
+               version.content
+        FROM knowledge_dictionary AS dictionary
+        JOIN canonical_memory_versions AS version
+          ON version.memory_id = dictionary.memory_id
+         AND version.version = dictionary.current_version
+        WHERE dictionary.memory_id IN ({placeholders})
+        ORDER BY dictionary.primary_capsule_id, dictionary.memory_id
+        """,
+        memory_ids,
+    ).fetchall()
+    capsule_impacts_by_id: dict[str, dict[str, object]] = {}
+    for capsule_id, affected_memory_id, body in capsule_rows:
+        if not all(isinstance(value, str) for value in (capsule_id, affected_memory_id, body)):
+            raise IntegrityError("permanent erasure capsule closure is invalid")
+        impact_entry = capsule_impacts_by_id.setdefault(
+            capsule_id,
+            {
+                "capsule_id": capsule_id,
+                "affected_memory_ids": [],
+                "removed_body_bytes": 0,
+            },
+        )
+        cast(list[str], impact_entry["affected_memory_ids"]).append(affected_memory_id)
+        impact_entry["removed_body_bytes"] = cast(
+            int, impact_entry["removed_body_bytes"]
+        ) + len(body.encode("utf-8"))
+    capsule_impacts: list[dict[str, object]] = []
+    for capsule_id, capsule_impact in sorted(capsule_impacts_by_id.items()):
+        shared = connection.execute(
+            f"""
+            SELECT 1 FROM knowledge_dictionary
+            WHERE primary_capsule_id = ? AND memory_id NOT IN ({placeholders})
+            LIMIT 1
+            """,
+            (capsule_id, *memory_ids),
+        ).fetchone() is not None
+        capsule_impacts.append(
+            {**capsule_impact, "action": "retain-shared" if shared else "delete"}
+        )
     dependencies = [
         {
             "memory_id": row[0],
@@ -1291,7 +1527,19 @@ def _erasure_impact_for_connection(
         "target_fingerprint": _deletion_fingerprint(memory_id),
         "memory_versions": versions,
         "source_impacts": source_impacts,
+        "fully_erased_receipt_source_ids": fully_erased_receipt_source_ids,
         "dependency_edges": dependencies,
+        "legacy_source_impacts": legacy_source_impacts,
+        "experience_ids": experience_ids,
+        "digest_ids": digest_ids,
+        "proposal_ids": proposal_ids,
+        "review_batch_ids": batch_ids,
+        "review_group_ids": group_ids,
+        "recall_ids": recall_ids,
+        "relation_impacts": relation_impacts,
+        "lifecycle_event_ids": lifecycle_event_ids,
+        "memory_event_ids": memory_event_ids,
+        "capsule_impacts": capsule_impacts,
     }
     confirmation_token = "erase_" + hashlib.sha256(
         json.dumps(
@@ -1308,6 +1556,18 @@ def _erasure_impact_for_connection(
         "memory_versions": versions,
         "derivative_memory_ids": list(derivatives),
         "source_impacts": source_impacts,
+        "fully_erased_receipt_source_ids": list(fully_erased_receipt_source_ids),
+        "legacy_source_impacts": legacy_source_impacts,
+        "experience_ids": list(experience_ids),
+        "digest_ids": list(digest_ids),
+        "proposal_ids": list(proposal_ids),
+        "review_batch_ids": list(batch_ids),
+        "review_group_ids": list(group_ids),
+        "recall_ids": list(recall_ids),
+        "relation_impacts": relation_impacts,
+        "lifecycle_event_ids": list(lifecycle_event_ids),
+        "memory_event_ids": list(memory_event_ids),
+        "capsule_impacts": capsule_impacts,
         "dependency_edges": dependencies,
         "backup_impact": {
             "future_backups": "excluded",
@@ -1323,7 +1583,7 @@ def _stage_erasure(
     *,
     impact: dict[str, object],
     entrance: str,
-) -> tuple[bytes, dict[str, object]]:
+) -> tuple[bytes, dict[str, object], tuple[str, ...]]:
     temporary_path: Path | None = None
     deleted_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -1340,28 +1600,55 @@ def _stage_erasure(
             connection.execute("PRAGMA foreign_keys = OFF")
             memory_ids_value = impact.get("memory_ids")
             source_impacts_value = impact.get("source_impacts")
+            legacy_source_impacts_value = impact.get("legacy_source_impacts")
+            capsule_impacts_value = impact.get("capsule_impacts")
             if (
                 not isinstance(memory_ids_value, list)
                 or not memory_ids_value
                 or not all(isinstance(value, str) for value in memory_ids_value)
                 or not isinstance(source_impacts_value, list)
+                or not isinstance(legacy_source_impacts_value, list)
+                or not isinstance(capsule_impacts_value, list)
             ):
                 raise IntegrityError("permanent erasure impact is invalid")
             memory_ids = tuple(cast(list[str], memory_ids_value))
+            proposal_ids = _impact_string_tuple(impact, "proposal_ids")
+            batch_ids = _impact_string_tuple(impact, "review_batch_ids")
+            group_ids = _impact_string_tuple(impact, "review_group_ids")
+            experience_ids = _impact_string_tuple(impact, "experience_ids")
+            digest_ids = _impact_string_tuple(impact, "digest_ids")
+            memory_event_ids = _impact_string_tuple(impact, "memory_event_ids")
+            fully_erased_receipt_source_ids = _impact_string_tuple(
+                impact, "fully_erased_receipt_source_ids"
+            )
             target_memory_id = memory_ids[0]
             current_impact = _erasure_impact_for_connection(connection, target_memory_id)
             if current_impact["confirmation_token"] != impact["confirmation_token"]:
                 raise UserInputError("permanent erasure impact closure changed")
-            capsule_rows = _rows_for_values(
-                connection,
-                "knowledge_dictionary",
-                "primary_capsule_id",
-                "memory_id",
-                memory_ids,
-            )
-            capsule_ids = tuple(
-                row[0] for row in capsule_rows if isinstance(row[0], str)
-            )
+            exclusive_capsule_ids: list[str] = []
+            shared_capsule_updates: list[tuple[int, int, str]] = []
+            for capsule_impact in capsule_impacts_value:
+                if not isinstance(capsule_impact, dict):
+                    raise IntegrityError("permanent erasure capsule impact is invalid")
+                capsule_id = capsule_impact.get("capsule_id")
+                action = capsule_impact.get("action")
+                removed_body_bytes = capsule_impact.get("removed_body_bytes")
+                affected_ids = capsule_impact.get("affected_memory_ids")
+                if (
+                    not isinstance(capsule_id, str)
+                    or action not in ("delete", "retain-shared")
+                    or not isinstance(removed_body_bytes, int)
+                    or not isinstance(affected_ids, list)
+                    or not all(isinstance(value, str) for value in affected_ids)
+                ):
+                    raise IntegrityError("permanent erasure capsule impact is invalid")
+                if action == "delete":
+                    exclusive_capsule_ids.append(capsule_id)
+                else:
+                    shared_capsule_updates.append(
+                        (removed_body_bytes, len(affected_ids), capsule_id)
+                    )
+            capsule_ids = tuple(exclusive_capsule_ids)
             partition_ids = tuple(
                 row[0]
                 for row in _rows_for_values(
@@ -1373,33 +1660,23 @@ def _stage_erasure(
                 )
                 if isinstance(row[0], str)
             )
-            proposal_ids = _erasure_proposal_ids(connection, memory_ids)
-            batch_ids = tuple(
-                row[0]
-                for row in _rows_for_values(
-                    connection,
-                    "review_batch_items",
-                    "batch_id",
-                    "proposal_id",
-                    proposal_ids,
-                )
-                if isinstance(row[0], str)
-            )
-            group_ids = tuple(
-                row[0]
-                for row in _rows_for_values(
-                    connection,
-                    "review_group_members",
-                    "group_id",
-                    "proposal_id",
-                    proposal_ids,
-                )
-                if isinstance(row[0], str)
-            )
             _delete_review_proposals(connection, proposal_ids)
-            _delete_for_values(connection, "review_batch_items", "batch_id", batch_ids)
-            _delete_for_values(connection, "review_batches", "batch_id", batch_ids)
-            _delete_for_values(connection, "review_groups", "group_id", group_ids)
+            for batch_id in batch_ids:
+                if connection.execute(
+                    "SELECT 1 FROM review_batch_items WHERE batch_id = ? LIMIT 1",
+                    (batch_id,),
+                ).fetchone() is None:
+                    connection.execute(
+                        "DELETE FROM review_batches WHERE batch_id = ?", (batch_id,)
+                    )
+            for group_id in group_ids:
+                if connection.execute(
+                    "SELECT 1 FROM review_group_members WHERE group_id = ? LIMIT 1",
+                    (group_id,),
+                ).fetchone() is None:
+                    connection.execute(
+                        "DELETE FROM review_groups WHERE group_id = ?", (group_id,)
+                    )
             _delete_for_values(connection, "integration_reviews", "canonical_memory_id", memory_ids)
             _delete_for_values(connection, "source_memory_proposal_details", "planned_memory_id", memory_ids)
             for table in (
@@ -1412,6 +1689,7 @@ def _stage_erasure(
             _delete_for_values(connection, "recall_evidence_expansions", "memory_id", memory_ids)
             _delete_for_values(connection, "recall_event_items", "memory_id", memory_ids)
             _delete_for_values(connection, "canonical_memory_lifecycle_events", "memory_id", memory_ids)
+            _delete_for_values(connection, "memory_events", "event_id", memory_event_ids)
             _delete_for_values(connection, "canonical_memory_dependencies", "memory_id", memory_ids)
             _delete_for_values(
                 connection,
@@ -1441,6 +1719,21 @@ def _stage_erasure(
             _delete_for_values(connection, "canonical_memories", "memory_id", memory_ids)
             _delete_for_values(connection, "capsule_partitions", "capsule_id", capsule_ids)
             _delete_for_values(connection, "knowledge_capsules", "capsule_id", capsule_ids)
+            connection.executemany(
+                """
+                UPDATE knowledge_capsules
+                SET body_bytes = body_bytes - ?,
+                    memory_record_count = memory_record_count - ?,
+                    structural_version = structural_version + 1,
+                    updated_at = ?
+                WHERE capsule_id = ?
+                """,
+                (
+                    (removed_bytes, removed_count, deleted_at, capsule_id)
+                    for removed_bytes, removed_count, capsule_id
+                    in shared_capsule_updates
+                ),
+            )
             for partition_id in partition_ids:
                 if connection.execute(
                     "SELECT 1 FROM capsule_partitions WHERE partition_id = ? LIMIT 1",
@@ -1469,6 +1762,7 @@ def _stage_erasure(
                         (source_id, source_version),
                     )
                     erased_source_ids.add(source_id)
+            deleted_receipt_source_ids: set[str] = set()
             for source_id in erased_source_ids:
                 if connection.execute(
                     "SELECT 1 FROM evidence_source_versions WHERE source_id = ? LIMIT 1",
@@ -1478,6 +1772,33 @@ def _stage_erasure(
                         "DELETE FROM evidence_sources WHERE source_id = ?",
                         (source_id,),
                     )
+                    deleted_receipt_source_ids.add(source_id)
+            if deleted_receipt_source_ids != set(fully_erased_receipt_source_ids):
+                raise IntegrityError("permanent erasure source identity closure changed")
+            erased_legacy_source_ids: set[str] = set()
+            object_references: list[str] = []
+            for source_impact in legacy_source_impacts_value:
+                if not isinstance(source_impact, dict):
+                    raise IntegrityError("permanent erasure raw source impact is invalid")
+                source_id = source_impact.get("source_id")
+                object_reference = source_impact.get("object_reference")
+                action = source_impact.get("action")
+                if (
+                    not isinstance(source_id, str)
+                    or not isinstance(object_reference, str)
+                    or action not in ("erase-object", "retain-shared")
+                ):
+                    raise IntegrityError("permanent erasure raw source impact is invalid")
+                if action == "erase-object":
+                    erased_legacy_source_ids.add(source_id)
+                    object_references.append(object_reference)
+            _delete_for_values(connection, "buffered_digests", "digest_id", digest_ids)
+            _delete_for_values(connection, "experiences", "experience_id", experience_ids)
+            legacy_source_ids = tuple(sorted(erased_legacy_source_ids))
+            _delete_for_values(
+                connection, "legacy_source_metadata", "source_id", legacy_source_ids
+            )
+            _delete_for_values(connection, "source_objects", "source_id", legacy_source_ids)
             marker_ids: list[str] = []
             for erased_memory_id in memory_ids:
                 fingerprint = _deletion_fingerprint(erased_memory_id)
@@ -1493,6 +1814,24 @@ def _stage_erasure(
                     VALUES (?, 'canonical-memory', ?, ?, ?)
                     """,
                     (marker_id, fingerprint, deleted_at, deleted_at),
+                )
+            erased_all_source_ids = tuple(
+                sorted(deleted_receipt_source_ids | erased_legacy_source_ids)
+            )
+            for erased_source_id in erased_all_source_ids:
+                fingerprint = _deletion_fingerprint(erased_source_id)
+                source_marker_id = "del_" + hashlib.sha256(
+                    f"source:{fingerprint}".encode("utf-8")
+                ).hexdigest()
+                marker_ids.append(source_marker_id)
+                connection.execute(
+                    """
+                    INSERT INTO deletion_markers
+                        (marker_id, subject_kind, subject_fingerprint,
+                         deleted_at, backup_exclusion_after)
+                    VALUES (?, 'source', ?, ?, ?)
+                    """,
+                    (source_marker_id, fingerprint, deleted_at, deleted_at),
                 )
             event_id = f"aud_{uuid.uuid4().hex}"
             result_hash = _stable_hash(
@@ -1528,7 +1867,7 @@ def _stage_erasure(
                 "entrance": entrance,
                 "result_hash": result_hash,
             },
-        }
+        }, tuple(sorted(object_references))
     except (OSError, sqlite3.Error) as error:
         raise IntegrityError("cannot permanently erase memory") from error
     finally:
@@ -1634,6 +1973,18 @@ def _rows_for_values(
         f"SELECT {result_column} FROM {table} WHERE {filter_column} IN ({placeholders})",
         values,
     ).fetchall()
+
+
+def _impact_string_tuple(
+    impact: dict[str, object],
+    key: str,
+) -> tuple[str, ...]:
+    value = impact.get(key)
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) for item in value
+    ):
+        raise IntegrityError(f"permanent erasure {key} impact is invalid")
+    return tuple(cast(list[str], value))
 
 
 def _delete_for_values(

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from typing import cast
 
 from myoutbrain.memory_gateway import MemoryGateway
 from tests.cli_support import run_cli
+from tests.test_cli_memory_evolution import remember_evidence
+from tests.test_cli_unified_review import proposal_payload, submit_proposal
 
 
 def create_source_backed_memory(
@@ -122,6 +126,22 @@ class V2MemoryLifecycleTests(unittest.TestCase):
                 "--format",
                 "json",
             )
+            rejected_revision = run_cli(
+                "revise-memory",
+                memory_id,
+                "--body",
+                "A stale client tried to make historical content current again.",
+                "--reason",
+                "Exercise the explicit historical transition guard.",
+                "--expected-version",
+                "1",
+                "--idempotency-key",
+                "reject-hidden-historical-revision",
+                "--entrance",
+                "stale-client",
+                "--root",
+                str(instance_root),
+            )
             explained = run_cli(
                 "why-memory",
                 memory_id,
@@ -155,7 +175,10 @@ class V2MemoryLifecycleTests(unittest.TestCase):
             package = json.loads(recalled.stdout)
             self.assertEqual(package["memories"][0]["memory_id"], memory_id)
             self.assertEqual(package["memories"][0]["state"], "historical-trusted")
+            self.assertEqual(rejected_revision.returncode, 2)
+            self.assertIn("expected current memory", rejected_revision.stderr)
             self.assertEqual(explained.returncode, 0, explained.stderr)
+            self.assertEqual(json.loads(explained.stdout)["state"], "historical-trusted")
             self.assertEqual(
                 json.loads(explained.stdout)["lifecycle_events"][0]["reason"],
                 "The rule lacks evidence that it is still current.",
@@ -641,6 +664,370 @@ class V2MemoryLifecycleTests(unittest.TestCase):
             self.assertEqual(marker["disposition"], "already-erased")
             self.assertNotIn(original_id, json.dumps(marker))
             self.assertNotIn(original_body, json.dumps(marker))
+
+    def test_legacy_forget_restores_the_historical_state_in_legacy_recall(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            materialized = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="legacy-historical",
+                name="Historic compatibility note",
+                body="The historic compatibility note applies only to release one.",
+            )
+            memory_id = cast(
+                str,
+                cast(dict[str, object], materialized["memory"])["memory_id"],
+            )
+            self.assertEqual(
+                run_cli(
+                    "historicize-memory",
+                    memory_id,
+                    "--reason",
+                    "Release one is no longer current.",
+                    "--expected-version",
+                    "1",
+                    "--idempotency-key",
+                    "historicize-legacy-bridge",
+                    "--entrance",
+                    "codex",
+                    "--root",
+                    str(instance_root),
+                ).returncode,
+                0,
+            )
+            forgotten = run_cli(
+                "forget-memory",
+                memory_id,
+                "forget this",
+                "--root",
+                str(instance_root),
+            )
+            restored = run_cli(
+                "forget-memory",
+                memory_id,
+                "restore this",
+                "--root",
+                str(instance_root),
+            )
+            recalled = run_cli(
+                "recall",
+                "Historic compatibility note",
+                "--task",
+                "legacy-historical-recall",
+                "--access",
+                "local-trusted",
+                "--memory-id",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(forgotten.returncode, 0, forgotten.stderr)
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(recalled.returncode, 0, recalled.stderr)
+            self.assertEqual(
+                json.loads(recalled.stdout)["items"][0]["memory_state"],
+                "historical-trusted",
+            )
+
+    def test_v8_inactive_memory_migrates_with_a_restorable_live_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            materialized = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="inactive-v8-migration",
+                name="Migrated inactive note",
+                body="An inactive V8 note must remain reversibly restorable.",
+            )
+            memory_id = cast(
+                str,
+                cast(dict[str, object], materialized["memory"])["memory_id"],
+            )
+            database_path = instance_root / "store" / "memory.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    UPDATE canonical_memories
+                    SET state = 'inactive', previous_live_state = NULL
+                    WHERE memory_id = ?
+                    """,
+                    (memory_id,),
+                )
+                connection.execute("PRAGMA user_version = 8")
+                connection.commit()
+
+            upgraded = run_cli("init", "--root", str(instance_root))
+            restored = run_cli(
+                "restore-memory",
+                memory_id,
+                "--reason",
+                "Restore an inactive memory migrated from V8.",
+                "--expected-version",
+                "1",
+                "--idempotency-key",
+                "restore-migrated-v8-inactive",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(upgraded.returncode, 0, upgraded.stderr)
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(json.loads(restored.stdout)["to_state"], "current")
+
+    def test_erasure_retains_a_shared_capsule_and_its_unaffected_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            first = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="shared-capsule-first",
+                name="Disposable capsule member",
+                body="This capsule member may be permanently erased.",
+            )
+            second = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="shared-capsule-second",
+                name="Retained capsule member",
+                body="This other capsule member must remain recallable.",
+            )
+            first_id = cast(str, cast(dict[str, object], first["memory"])["memory_id"])
+            second_id = cast(str, cast(dict[str, object], second["memory"])["memory_id"])
+            database_path = instance_root / "store" / "memory.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                first_capsule = cast(
+                    str,
+                    connection.execute(
+                        "SELECT primary_capsule_id FROM knowledge_dictionary WHERE memory_id = ?",
+                        (first_id,),
+                    ).fetchone()[0],
+                )
+                second_capsule = cast(
+                    str,
+                    connection.execute(
+                        "SELECT primary_capsule_id FROM knowledge_dictionary WHERE memory_id = ?",
+                        (second_id,),
+                    ).fetchone()[0],
+                )
+                second_bytes = cast(
+                    int,
+                    connection.execute(
+                        "SELECT body_bytes FROM knowledge_capsules WHERE capsule_id = ?",
+                        (second_capsule,),
+                    ).fetchone()[0],
+                )
+                connection.execute(
+                    "UPDATE knowledge_dictionary SET primary_capsule_id = ? WHERE memory_id = ?",
+                    (first_capsule, second_id),
+                )
+                connection.execute(
+                    "UPDATE canonical_memory_versions SET capsule_id = ? WHERE memory_id = ?",
+                    (first_capsule, second_id),
+                )
+                connection.execute(
+                    "UPDATE canonical_memory_fts SET capsule_id = ? WHERE memory_id = ?",
+                    (first_capsule, second_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE knowledge_capsules
+                    SET body_bytes = body_bytes + ?, memory_record_count = 2
+                    WHERE capsule_id = ?
+                    """,
+                    (second_bytes, first_capsule),
+                )
+                connection.execute(
+                    "DELETE FROM capsule_partitions WHERE capsule_id = ?",
+                    (second_capsule,),
+                )
+                connection.execute(
+                    "DELETE FROM knowledge_capsules WHERE capsule_id = ?",
+                    (second_capsule,),
+                )
+                connection.commit()
+
+            previewed = run_cli(
+                "erase-memory",
+                first_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            preview = json.loads(previewed.stdout)
+            confirmed = run_cli(
+                "erase-memory",
+                first_id,
+                "--confirm",
+                preview["confirmation_token"],
+                "--root",
+                str(instance_root),
+            )
+            recalled = run_cli(
+                "recall-memory",
+                "Retained capsule member",
+                "--task",
+                "shared-capsule-after-erasure",
+                "--entrance",
+                "codex",
+                "--answerable",
+                "true",
+                "--answerability-reason",
+                "covered",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(previewed.returncode, 0, previewed.stderr)
+            self.assertEqual(preview["capsule_impacts"][0]["action"], "retain-shared")
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+            self.assertEqual(recalled.returncode, 0, recalled.stderr)
+            self.assertEqual(json.loads(recalled.stdout)["memories"][0]["memory_id"], second_id)
+            with closing(sqlite3.connect(database_path)) as connection:
+                capsule = connection.execute(
+                    "SELECT memory_record_count FROM knowledge_capsules WHERE capsule_id = ?",
+                    (first_capsule,),
+                ).fetchone()
+            self.assertEqual(capsule, (1,))
+
+    def test_erasure_closes_raw_sources_and_unified_review_cannot_restore_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            materialized = create_source_backed_memory(
+                temporary_root,
+                instance_root,
+                stem="erasure-connectors",
+                name="Erasure connector memory",
+                body="This memory proves every erasure connector is closed.",
+            )
+            memory_id = cast(
+                str,
+                cast(dict[str, object], materialized["memory"])["memory_id"],
+            )
+            legacy = remember_evidence(
+                temporary_root,
+                instance_root,
+                name="erasure-raw-source",
+                digest="Raw source attached to the erasure connector memory.",
+                task="erasure-connectors",
+            )
+            source_id = cast(str, legacy["source_id"])
+            database_path = instance_root / "store" / "memory.sqlite3"
+            with closing(sqlite3.connect(database_path)) as connection:
+                source_row = connection.execute(
+                    "SELECT object_reference FROM source_objects WHERE source_id = ?",
+                    (source_id,),
+                ).fetchone()
+                self.assertIsNotNone(source_row)
+                object_reference = cast(str, source_row[0])
+                connection.execute(
+                    "INSERT INTO canonical_memory_sources (memory_id, source_id) VALUES (?, ?)",
+                    (memory_id, source_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO canonical_memory_version_sources
+                        (memory_id, version, source_id) VALUES (?, 1, ?)
+                    """,
+                    (memory_id, source_id),
+                )
+                connection.commit()
+            object_path = instance_root / "store" / "objects" / object_reference
+            self.assertTrue(object_path.is_file())
+
+            previewed = run_cli(
+                "erase-memory",
+                memory_id,
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+            preview = json.loads(previewed.stdout)
+            confirmed = run_cli(
+                "erase-memory",
+                memory_id,
+                "--confirm",
+                preview["confirmation_token"],
+                "--root",
+                str(instance_root),
+            )
+            payload = proposal_payload(
+                intent="derive",
+                formation="derived",
+                priority="routine",
+                title="Stale erased memory recreation",
+                content="A stale client tries to recreate an erased identity.",
+                effect_type="create_derived_memory",
+            )
+            cast(dict[str, object], payload["target"])["memory_id"] = memory_id
+            proposal = submit_proposal(
+                instance_root,
+                temporary_root / "stale-recreation.json",
+                payload,
+                "stale-erased-recreation-proposal",
+            )
+            batch_path = temporary_root / "stale-recreation-batch.json"
+            batch_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": "bat_stale_erased_recreation",
+                        "decisions": [
+                            {
+                                "proposal_id": proposal["proposal_id"],
+                                "proposal_version": proposal["proposal_version"],
+                                "decision": "approve",
+                                "edited_content": None,
+                                "reason": "Exercise the erased identity guard.",
+                                "defer_until": None,
+                                "confirm_personal_cognition": False,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            decided = run_cli(
+                "review-batch",
+                str(batch_path),
+                "--idempotency-key",
+                "stale-erased-recreation-batch",
+                "--entrance",
+                "codex",
+                "--root",
+                str(instance_root),
+                "--format",
+                "json",
+            )
+
+            self.assertEqual(previewed.returncode, 0, previewed.stderr)
+            self.assertEqual(preview["legacy_source_impacts"][0]["action"], "erase-object")
+            self.assertTrue(preview["experience_ids"])
+            self.assertTrue(preview["digest_ids"])
+            self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+            self.assertFalse(object_path.exists())
+            self.assertEqual(decided.returncode, 0, decided.stderr)
+            outcome = json.loads(decided.stdout)["outcomes"][0]
+            self.assertEqual(outcome["status"], "failed")
+            self.assertEqual(outcome["error"], "permanently_erased")
 
     def test_time_recall_frequency_and_invalid_commands_cannot_change_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

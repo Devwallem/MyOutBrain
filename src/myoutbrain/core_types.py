@@ -18,6 +18,7 @@ def is_canonical_memory_id(value: str) -> bool:
 
 class MemoryState(StrEnum):
     CANONICAL = "canonical"
+    HISTORICAL_TRUSTED = "historical-trusted"
     BUFFERED = "buffered"
 
 

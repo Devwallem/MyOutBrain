@@ -1313,13 +1313,14 @@ def _apply_review_decision(
             failed_at=decided_at,
         )
     personal_cognition = proposal.payload.approval_effect.personal_cognition
-    if _target_version_conflicts(connection, proposal):
+    target_error = _target_version_error(connection, proposal)
+    if target_error is not None:
         return _record_failed_decision(
             connection,
             proposal,
             base,
             decision="approve",
-            error="target_version_conflict",
+            error=target_error,
             failed_at=decided_at,
         )
     if personal_cognition is True and not decision.confirm_personal_cognition:
@@ -1492,33 +1493,38 @@ def _record_failed_decision(
     }
 
 
-def _target_version_conflicts(
+def _target_version_error(
     connection: sqlite3.Connection,
     proposal: ReviewProposal,
-) -> bool:
+) -> str | None:
     if proposal.payload.intent not in ("derive", "integrate"):
-        return False
+        return None
     target_memory_id = proposal.payload.target.memory_id
     expected_version = proposal.payload.target.expected_version
     effect_type = proposal.payload.approval_effect.effect_type
+    if isinstance(target_memory_id, str) and _has_memory_tombstone(
+        connection, target_memory_id
+    ):
+        return "permanently_erased"
     if effect_type == "revise_canonical_memory":
         if not isinstance(target_memory_id, str) or not isinstance(expected_version, int):
-            return True
+            return "target_version_conflict"
         row = connection.execute(
             "SELECT current_version FROM canonical_memories WHERE memory_id = ?",
             (target_memory_id,),
         ).fetchone()
-        return row is None or row[0] != expected_version
+        return "target_version_conflict" if row is None or row[0] != expected_version else None
     if expected_version != 0:
-        return True
+        return "target_version_conflict"
     if target_memory_id is None:
-        return False
+        return None
     if not isinstance(target_memory_id, str):
-        return True
-    return connection.execute(
+        return "target_version_conflict"
+    exists = connection.execute(
         "SELECT 1 FROM canonical_memories WHERE memory_id = ?",
         (target_memory_id,),
     ).fetchone() is not None
+    return "target_version_conflict" if exists else None
 
 
 def _materialize_proposal(
@@ -2638,3 +2644,17 @@ def _json(value: object) -> str:
 
 def _stable_hash(value: object) -> str:
     return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _has_memory_tombstone(
+    connection: sqlite3.Connection,
+    memory_id: str,
+) -> bool:
+    fingerprint = "sha256:" + hashlib.sha256(memory_id.encode("utf-8")).hexdigest()
+    return connection.execute(
+        """
+        SELECT 1 FROM deletion_markers
+        WHERE subject_kind = 'canonical-memory' AND subject_fingerprint = ?
+        """,
+        (fingerprint,),
+    ).fetchone() is not None
