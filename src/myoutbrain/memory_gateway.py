@@ -42,6 +42,12 @@ from myoutbrain.v2_recall import (
     V2RecallRequest,
     V2RecallService,
 )
+from myoutbrain.v2_public_research import (
+    PublicAnswerabilityEngine,
+    PublicResearchProvider,
+    V2PublicResearchRequest,
+    V2PublicResearchService,
+)
 
 
 class MemoryAccess(StrEnum):
@@ -304,6 +310,18 @@ class MemoryGateway:
         return V2RecallService(self._root).assess_answerability(
             recall_id,
             capability_answerability,
+        )
+
+    def research_public_v2(
+        self,
+        request: V2PublicResearchRequest,
+        provider: PublicResearchProvider,
+        answerability_engine: PublicAnswerabilityEngine,
+    ) -> dict[str, object]:
+        return V2PublicResearchService(self._root).research(
+            request,
+            provider,
+            answerability_engine,
         )
 
     def v2_recall_activity(self) -> dict[str, object]:

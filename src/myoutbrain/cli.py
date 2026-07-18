@@ -65,6 +65,11 @@ from myoutbrain.v2_recall import (
     FixedAnswerabilityEngine,
     V2RecallRequest,
 )
+from myoutbrain.v2_public_research import (
+    ConfiguredPublicResearchProvider,
+    FixedPublicAnswerabilityEngine,
+    V2PublicResearchRequest,
+)
 from myoutbrain.unified_review import load_review_batch, load_review_proposal
 
 
@@ -259,6 +264,36 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_reflection_parser.add_argument("--idempotency-key", required=True)
     abandon_reflection_parser.add_argument("--root", type=Path, default=Path.cwd())
     abandon_reflection_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    research_public_parser = subcommands.add_parser(
+        "research-public",
+        help="Continue an insufficient V2 recall with authorized public evidence",
+    )
+    research_public_parser.add_argument("recall_id")
+    research_public_parser.add_argument("question")
+    research_public_parser.add_argument("--task", required=True)
+    research_public_parser.add_argument("--public-query", required=True)
+    research_public_parser.add_argument(
+        "--allow-public-research", action="store_true"
+    )
+    research_public_parser.add_argument("--time-sensitive", action="store_true")
+    research_public_parser.add_argument(
+        "--answerable", choices=("true", "false"), required=True
+    )
+    research_public_parser.add_argument(
+        "--answerability-reason",
+        choices=(
+            "covered",
+            "coverage-insufficient",
+            "freshness-insufficient",
+            "missing-dependency",
+            "unresolved-conflict",
+        ),
+        required=True,
+    )
+    research_public_parser.add_argument("--root", type=Path, default=Path.cwd())
+    research_public_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     review_propose_parser = subcommands.add_parser(
@@ -852,6 +887,60 @@ def _assess_recall(
         print(
             f"Recall {recall_id} answerable: "
             f"{result['answerability']}"
+        )
+    return 0
+
+
+def _research_public(
+    root: Path,
+    recall_id: str,
+    question: str,
+    *,
+    task: str,
+    public_query: str,
+    allowed_for_task: bool,
+    time_sensitive: bool,
+    answerable: bool,
+    answerability_reason: str,
+    output_format: str,
+) -> int:
+    result = MemoryGateway(root).research_public_v2(
+        V2PublicResearchRequest(
+            recall_id=recall_id,
+            question=question,
+            task=task,
+            public_query=public_query,
+            allowed_for_task=allowed_for_task,
+            time_sensitive=time_sensitive,
+        ),
+        ConfiguredPublicResearchProvider(),
+        FixedPublicAnswerabilityEngine(
+            CapabilityAnswerability(
+                answerable=answerable,
+                reason=cast(AnswerabilityReason, answerability_reason),
+            )
+        ),
+    )
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    declaration = cast(dict[str, object], result["source_declaration"])
+    print(declaration["label"])
+    if result["status"] == "unknown":
+        print("公开检索后仍无法形成可靠结论。")
+        for fact in cast(list[object], result["verified_facts"]):
+            print(f"已核验：{fact}")
+        for gap in cast(list[object], result["unresolved_gaps"]):
+            print(f"关键未知：{gap}")
+        for step in cast(list[object], result["next_steps"]):
+            print(f"验证方向：{step}")
+    public_research = cast(dict[str, object], result["public_research"])
+    for source_value in cast(list[object], public_research["sources"]):
+        source = cast(dict[str, object], source_value)
+        print(
+            f"公开来源：{source['title']} — {source['url']} "
+            f"(published {source['published_at']}; "
+            f"retrieved {source['retrieved_at']})"
         )
     return 0
 
@@ -1630,6 +1719,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _assess_recall(
                 parsed_arguments.root,
                 parsed_arguments.recall_id,
+                answerable=parsed_arguments.answerable == "true",
+                answerability_reason=parsed_arguments.answerability_reason,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "research-public":
+            return _research_public(
+                parsed_arguments.root,
+                parsed_arguments.recall_id,
+                parsed_arguments.question,
+                task=parsed_arguments.task,
+                public_query=parsed_arguments.public_query,
+                allowed_for_task=parsed_arguments.allow_public_research,
+                time_sensitive=parsed_arguments.time_sensitive,
                 answerable=parsed_arguments.answerable == "true",
                 answerability_reason=parsed_arguments.answerability_reason,
                 output_format=parsed_arguments.format,
