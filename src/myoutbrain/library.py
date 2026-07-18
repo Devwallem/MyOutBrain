@@ -314,6 +314,8 @@ def _render_initial_configuration() -> str:
         "[storage]\n"
         f"permanent = [{permanent}]\n"
         f"rebuildable = [{rebuildable}]\n"
+        "capsule_target_bytes = 65536\n"
+        "capsule_hard_limit_bytes = 131072\n"
         f"\n{_render_default_generation_configuration()}"
         f"\n{_render_default_embedding_configuration()}"
         "\n[reflection]\n"

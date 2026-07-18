@@ -6,9 +6,10 @@ from typing import cast
 
 
 SERVER_MINIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 0}
-SERVER_PROTOCOL_VERSION = {"major": 2, "minor": 1}
+SERVER_PROTOCOL_VERSION = {"major": 2, "minor": 2}
 SERVER_CAPABILITIES = (
     "instance_status.v1",
+    "capsule_maintenance.v1",
     "review_list.v1",
     "review_payload.v1",
     "review_decision.v1",

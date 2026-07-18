@@ -24,9 +24,10 @@ ADAPTER_CLIENTS: tuple[AdapterClient, ...] = (
     "claude-code",
 )
 ADAPTER_MINIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 0}
-ADAPTER_MAXIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 1}
+ADAPTER_MAXIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 2}
 ADAPTER_CAPABILITIES = (
     "instance_status.v1",
+    "capsule_maintenance.v1",
     "review_list.v1",
     "review_payload.v1",
     "review_decision.v1",

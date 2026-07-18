@@ -57,6 +57,7 @@ from myoutbrain.v2_public_search import (
     V2PublicSearchService,
 )
 from myoutbrain.v2_memory_lifecycle import V2MemoryLifecycleService
+from myoutbrain.capsule_maintenance import CapsuleMaintenanceService
 from myoutbrain.unified_review import ReviewBatchRequest
 
 
@@ -296,6 +297,43 @@ class MemoryGateway:
         answerability_engine: AnswerabilityEngine,
     ) -> dict[str, object]:
         return V2RecallService(self._root).recall(request, answerability_engine)
+
+    def inspect_capsule_structure(self) -> dict[str, object]:
+        return CapsuleMaintenanceService(self._root).inspect()
+
+    def plan_capsule_maintenance(
+        self,
+        parameters: dict[str, object],
+    ) -> dict[str, object]:
+        return CapsuleMaintenanceService(self._root).plan(parameters)
+
+    def configure_partition(
+        self,
+        parameters: dict[str, object],
+        *,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return CapsuleMaintenanceService(self._root).configure_partition(
+            parameters,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def reorganize_capsules(
+        self,
+        parameters: dict[str, object],
+        *,
+        expected_version: int,
+        idempotency_key: str,
+        entrance: str,
+    ) -> dict[str, object]:
+        return CapsuleMaintenanceService(self._root).reorganize(
+            parameters,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+            entrance=entrance,
+        )
 
     def historicize_v2_memory(
         self,

@@ -147,12 +147,22 @@ class AgentAdapterProtocolTests(unittest.TestCase):
 
             self.assertEqual(described.returncode, 0, described.stderr)
             response = json.loads(described.stdout)
-            self.assertEqual(response["result"]["current"], {"major": 2, "minor": 1})
+            self.assertEqual(response["result"]["current"], {"major": 2, "minor": 2})
             self.assertEqual(
                 response["result"]["operations"],
                 {
-                    "reads": ["instance.status", "protocol.describe", "review.list"],
-                    "writes": ["review.decide"],
+                    "reads": [
+                        "instance.status",
+                        "maintenance.inspect",
+                        "maintenance.plan",
+                        "protocol.describe",
+                        "review.list",
+                    ],
+                    "writes": [
+                        "maintenance.configure_partition",
+                        "maintenance.reorganize",
+                        "review.decide",
+                    ],
                 },
             )
             self.assertIn(
@@ -171,7 +181,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             )
             self.assertEqual(request_schema["$id"], "myoutbrain://schema/domain-request-v2")
             self.assertEqual(response_schema["$id"], "myoutbrain://schema/domain-response-v2")
-            self.assertEqual(compatibility["current"], {"major": 2, "minor": 1})
+            self.assertEqual(compatibility["current"], {"major": 2, "minor": 2})
 
     def test_old_minor_adapter_can_read_current_instance_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -209,7 +219,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
             self.assertEqual(response["protocol_version"], {"major": 2, "minor": 0})
             self.assertEqual(
                 response["server_protocol_version"],
-                {"major": 2, "minor": 1},
+                {"major": 2, "minor": 2},
             )
             self.assertEqual(response["result"]["canonical_schema_version"], 10)
             self.assertEqual(response["result"]["integrity"]["overall"], "ok")
@@ -223,9 +233,9 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                 run_cli("init", "--root", str(instance_root)).returncode,
                 0,
             )
-            for minimum, maximum in (
-                ((1, 0), (2, 1)),
-                ((2, 0), (3, 0)),
+            for minimum, maximum, expected in (
+                ((1, 0), (2, 1), (2, 1)),
+                ((2, 0), (3, 0), (2, 2)),
             ):
                 with self.subTest(minimum=minimum, maximum=maximum):
                     write_request(
@@ -251,7 +261,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(
                         json.loads(result.stdout)["protocol_version"],
-                        {"major": 2, "minor": 1},
+                        {"major": expected[0], "minor": expected[1]},
                     )
 
     def test_request_parser_enforces_the_published_schema_shape(self) -> None:
@@ -362,7 +372,7 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                     "details": {
                         "client_maximum": {"major": 1, "minor": 9},
                         "client_minimum": {"major": 1, "minor": 0},
-                        "server": {"major": 2, "minor": 1},
+                        "server": {"major": 2, "minor": 2},
                     },
                 },
             )
@@ -797,12 +807,12 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                         check["protocol"],
                         {
                             "client": {
-                                "maximum": {"major": 2, "minor": 1},
+                                "maximum": {"major": 2, "minor": 2},
                                 "minimum": {"major": 2, "minor": 0},
                             },
                             "compatible": True,
-                            "negotiated": {"major": 2, "minor": 1},
-                            "server": {"major": 2, "minor": 1},
+                            "negotiated": {"major": 2, "minor": 2},
+                            "server": {"major": 2, "minor": 2},
                         },
                     )
                     self.assertTrue(check["config_matches"])

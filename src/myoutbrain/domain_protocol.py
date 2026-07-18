@@ -7,8 +7,10 @@ from typing import cast
 
 from myoutbrain.core_types import (
     ConfigurationConflict,
+    ConstraintConflict,
     IdempotencyConflict,
     IntegrityError,
+    RecallRegressionFailure,
     UserInputError,
     WriterLocked,
 )
@@ -186,6 +188,27 @@ class DomainProtocol:
         elif request.operation == "review.decide":
             proposal = self._require_understood_review_effect(request)
             result = self._decide_review(request, proposal)
+        elif request.operation == "maintenance.inspect":
+            result = MemoryGateway(self._root).inspect_capsule_structure()
+        elif request.operation == "maintenance.plan":
+            result = MemoryGateway(self._root).plan_capsule_maintenance(
+                request.parameters
+            )
+        elif request.operation == "maintenance.configure_partition":
+            write = self._require_capsule_maintenance_write(request, negotiated)
+            result = MemoryGateway(self._root).configure_partition(
+                request.parameters,
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+            )
+        elif request.operation == "maintenance.reorganize":
+            write = self._require_capsule_maintenance_write(request, negotiated)
+            result = MemoryGateway(self._root).reorganize_capsules(
+                request.parameters,
+                expected_version=write.expected_version,
+                idempotency_key=write.idempotency_key,
+                entrance=request.client_name,
+            )
         else:
             raise UserInputError(f"unknown gateway operation: {request.operation}")
         return {
@@ -196,6 +219,30 @@ class DomainProtocol:
             "server_capabilities": list(SERVER_CAPABILITIES),
             "result": result,
         }
+
+    @staticmethod
+    def _require_capsule_maintenance_write(
+        request: DomainRequest,
+        negotiated: ProtocolVersion,
+    ) -> WriteCondition:
+        if negotiated < ProtocolVersion(major=2, minor=2):
+            raise DomainProtocolError(
+                "protocol_incompatible",
+                "capsule maintenance writes require protocol 2.2",
+                details=_version_details(request),
+            )
+        if "capsule_maintenance.v1" not in request.capabilities:
+            raise DomainProtocolError(
+                "capability_required",
+                "client cannot understand capsule maintenance effects",
+                details={"missing": ["capsule_maintenance.v1"]},
+            )
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "capsule maintenance writes require idempotency_key and expected_version",
+            )
+        return request.write
 
     def _require_understood_review_effect(
         self,
@@ -309,6 +356,10 @@ def execute_domain_request(
         )
     except IdempotencyConflict as error:
         return _error_response(operation, "idempotency_conflict", str(error), 2)
+    except ConstraintConflict as error:
+        return _error_response(operation, "constraint_conflict", str(error), 2)
+    except RecallRegressionFailure as error:
+        return _error_response(operation, "recall_regression_failed", str(error), 2)
     except ConfigurationConflict as error:
         return _error_response(operation, "configuration_conflict", str(error), 3)
     except WriterLocked as error:

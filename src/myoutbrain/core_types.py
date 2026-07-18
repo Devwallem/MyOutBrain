@@ -38,5 +38,13 @@ class IdempotencyConflict(UserInputError):
     """Raised when one idempotency key is reused for another request."""
 
 
+class ConstraintConflict(UserInputError):
+    """Raised when a durable creator constraint forbids an operation."""
+
+
+class RecallRegressionFailure(UserInputError):
+    """Raised when a maintenance candidate changes fixed recall behaviour."""
+
+
 class WriterLocked(Exception):
     """Raised when another writer already owns the private-instance lock."""

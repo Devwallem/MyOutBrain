@@ -111,6 +111,8 @@ CREATE TABLE knowledge_capsules (
     body_bytes INTEGER NOT NULL CHECK (body_bytes >= 0),
     memory_record_count INTEGER NOT NULL CHECK (memory_record_count >= 0),
     structural_version INTEGER NOT NULL CHECK (structural_version >= 1),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'staged', 'redirecting', 'retired')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -121,6 +123,13 @@ CREATE TABLE knowledge_partitions (
     node_kind TEXT NOT NULL CHECK (node_kind IN ('root', 'leaf')),
     topic TEXT NOT NULL,
     normalized_topic TEXT NOT NULL,
+    display_name TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    user_named INTEGER NOT NULL DEFAULT 0 CHECK (user_named IN (0, 1)),
+    merge_forbidden INTEGER NOT NULL DEFAULT 0
+        CHECK (merge_forbidden IN (0, 1)),
+    constraint_version INTEGER NOT NULL DEFAULT 0
+        CHECK (constraint_version >= 0),
     CHECK (
         (node_kind = 'root' AND parent_partition_id IS NULL)
         OR (node_kind = 'leaf' AND parent_partition_id IS NOT NULL)
@@ -130,6 +139,62 @@ CREATE TABLE knowledge_partitions (
 CREATE TABLE capsule_partitions (
     capsule_id TEXT PRIMARY KEY REFERENCES knowledge_capsules(capsule_id),
     partition_id TEXT NOT NULL REFERENCES knowledge_partitions(partition_id)
+);
+
+CREATE TABLE capsule_structure_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    structural_version INTEGER NOT NULL CHECK (structural_version >= 1)
+);
+
+INSERT INTO capsule_structure_state (singleton, structural_version) VALUES (1, 1);
+
+CREATE TABLE partition_constraint_writes (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE capsule_reorganizations (
+    reorganization_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('split', 'merge')),
+    status TEXT NOT NULL CHECK (status IN (
+        'planned', 'staged', 'validated', 'switched', 'retired', 'aborted'
+    )),
+    source_capsule_ids_json TEXT NOT NULL,
+    target_capsule_ids_json TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    expected_structural_version INTEGER NOT NULL,
+    recall_regression_json TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE capsule_staged_records (
+    reorganization_id TEXT NOT NULL
+        REFERENCES capsule_reorganizations(reorganization_id),
+    target_capsule_id TEXT NOT NULL REFERENCES knowledge_capsules(capsule_id),
+    target_partition_id TEXT NOT NULL REFERENCES knowledge_partitions(partition_id),
+    source_capsule_id TEXT NOT NULL REFERENCES knowledge_capsules(capsule_id),
+    memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+    memory_version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    integrity_hash TEXT NOT NULL,
+    PRIMARY KEY (reorganization_id, memory_id),
+    FOREIGN KEY (memory_id, memory_version)
+        REFERENCES canonical_memory_versions(memory_id, version)
+);
+
+CREATE TABLE capsule_redirects (
+    source_capsule_id TEXT NOT NULL REFERENCES knowledge_capsules(capsule_id),
+    target_capsule_id TEXT NOT NULL REFERENCES knowledge_capsules(capsule_id),
+    reorganization_id TEXT NOT NULL
+        REFERENCES capsule_reorganizations(reorganization_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_capsule_id, target_capsule_id)
 );
 
 CREATE TABLE experiences (
@@ -5385,13 +5450,120 @@ class LocalMemoryCore:
                     FROM evidence_sources;
                     DROP TABLE evidence_sources;
                     ALTER TABLE evidence_sources_v10 RENAME TO evidence_sources;
+                    """
+                )
+                capsule_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(knowledge_capsules)"
+                    ).fetchall()
+                }
+                if "status" not in capsule_columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE knowledge_capsules
+                        ADD COLUMN status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN (
+                            'active', 'staged', 'redirecting', 'retired'
+                        ))
+                        """
+                    )
+                partition_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(knowledge_partitions)"
+                    ).fetchall()
+                }
+                partition_additions = {
+                    "display_name": "TEXT",
+                    "pinned": (
+                        "INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1))"
+                    ),
+                    "user_named": (
+                        "INTEGER NOT NULL DEFAULT 0 CHECK (user_named IN (0, 1))"
+                    ),
+                    "merge_forbidden": (
+                        "INTEGER NOT NULL DEFAULT 0 "
+                        "CHECK (merge_forbidden IN (0, 1))"
+                    ),
+                    "constraint_version": (
+                        "INTEGER NOT NULL DEFAULT 0 CHECK (constraint_version >= 0)"
+                    ),
+                }
+                for column, definition in partition_additions.items():
+                    if column not in partition_columns:
+                        connection.execute(
+                            f"ALTER TABLE knowledge_partitions "
+                            f"ADD COLUMN {column} {definition}"
+                        )
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS capsule_structure_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        structural_version INTEGER NOT NULL
+                            CHECK (structural_version >= 1)
+                    );
+                    INSERT OR IGNORE INTO capsule_structure_state
+                        (singleton, structural_version)
+                    VALUES (1, 1);
+                    CREATE TABLE IF NOT EXISTS partition_constraint_writes (
+                        idempotency_key TEXT PRIMARY KEY,
+                        request_hash TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS capsule_reorganizations (
+                        reorganization_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        request_hash TEXT NOT NULL,
+                        action TEXT NOT NULL CHECK (action IN ('split', 'merge')),
+                        status TEXT NOT NULL CHECK (status IN (
+                            'planned', 'staged', 'validated', 'switched',
+                            'retired', 'aborted'
+                        )),
+                        source_capsule_ids_json TEXT NOT NULL,
+                        target_capsule_ids_json TEXT NOT NULL,
+                        plan_json TEXT NOT NULL,
+                        expected_structural_version INTEGER NOT NULL,
+                        recall_regression_json TEXT,
+                        result_json TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS capsule_staged_records (
+                        reorganization_id TEXT NOT NULL
+                            REFERENCES capsule_reorganizations(reorganization_id),
+                        target_capsule_id TEXT NOT NULL
+                            REFERENCES knowledge_capsules(capsule_id),
+                        target_partition_id TEXT NOT NULL
+                            REFERENCES knowledge_partitions(partition_id),
+                        source_capsule_id TEXT NOT NULL
+                            REFERENCES knowledge_capsules(capsule_id),
+                        memory_id TEXT NOT NULL REFERENCES canonical_memories(memory_id),
+                        memory_version INTEGER NOT NULL,
+                        body TEXT NOT NULL,
+                        integrity_hash TEXT NOT NULL,
+                        PRIMARY KEY (reorganization_id, memory_id),
+                        FOREIGN KEY (memory_id, memory_version)
+                            REFERENCES canonical_memory_versions(memory_id, version)
+                    );
+                    CREATE TABLE IF NOT EXISTS capsule_redirects (
+                        source_capsule_id TEXT NOT NULL
+                            REFERENCES knowledge_capsules(capsule_id),
+                        target_capsule_id TEXT NOT NULL
+                            REFERENCES knowledge_capsules(capsule_id),
+                        reorganization_id TEXT NOT NULL
+                            REFERENCES capsule_reorganizations(reorganization_id),
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (source_capsule_id, target_capsule_id)
+                    );
                     PRAGMA user_version = 10;
                     """
                 )
                 connection.commit()
                 connection.execute("PRAGMA foreign_keys = ON")
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                    raise IntegrityError("counterevidence source migration broke references")
+                    raise IntegrityError("schema 10 migration broke references")
             return temporary_path.read_bytes()
         except (OSError, sqlite3.Error) as error:
             raise IntegrityError("cannot migrate the local memory database") from error

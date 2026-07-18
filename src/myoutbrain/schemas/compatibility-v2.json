@@ -1,12 +1,12 @@
 {
-  "current": {"major": 2, "minor": 1},
+  "current": {"major": 2, "minor": 2},
   "operations": {
-    "reads": ["instance.status", "protocol.describe", "review.list"],
-    "writes": ["review.decide"]
+    "reads": ["instance.status", "maintenance.inspect", "maintenance.plan", "protocol.describe", "review.list"],
+    "writes": ["maintenance.configure_partition", "maintenance.reorganize", "review.decide"]
   },
   "rules": {
     "major": "Semantic writes require protocol major 2.",
-    "minor": "Protocol 2.0 clients remain read-compatible with 2.1 responses.",
+    "minor": "Protocol 2.0 clients remain read-compatible with 2.2 responses.",
     "unknown_fields": "Unknown display-only response fields may be ignored.",
     "unknown_effects": "Approval requires the exact review_effect.<type>.v1 capability.",
     "writes": "Every semantic write requires idempotency_key and expected_version."

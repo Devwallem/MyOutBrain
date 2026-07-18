@@ -671,7 +671,10 @@ def _candidate_paths(
         FROM knowledge_partitions AS partition
         JOIN capsule_partitions AS capsule
           ON capsule.partition_id = partition.partition_id
+        JOIN knowledge_capsules AS capsule_record
+          ON capsule_record.capsule_id = capsule.capsule_id
         WHERE partition.node_kind = 'leaf'
+          AND capsule_record.status = 'active'
         ORDER BY partition.partition_id
         """
     ).fetchall()
@@ -1016,6 +1019,239 @@ def _event_has_expansion(connection: sqlite3.Connection, recall_id: str) -> bool
         "SELECT 1 FROM recall_evidence_expansions WHERE recall_id = ? LIMIT 1",
         (recall_id,),
     ).fetchone() is not None
+
+
+RECALL_REGRESSION_CATEGORIES = (
+    "name-collision",
+    "old-alias",
+    "cross-partition-fts",
+    "historical-trusted",
+    "counterevidence",
+    "dependency",
+)
+
+
+def fixed_recall_regression_cases(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[str, ...]]:
+    """Freeze the public-recall questions that guard one structure switch."""
+    collisions = connection.execute(
+        """
+        SELECT MIN(name)
+        FROM memory_names
+        GROUP BY normalized_name
+        HAVING COUNT(DISTINCT memory_id) > 1
+        ORDER BY normalized_name
+        """
+    ).fetchall()
+    aliases = connection.execute(
+        """
+        SELECT name FROM memory_names
+        WHERE name_kind = 'alias'
+        ORDER BY normalized_name, memory_id
+        """
+    ).fetchall()
+    all_live = connection.execute(
+        """
+        SELECT version.content
+        FROM knowledge_dictionary AS dictionary
+        JOIN canonical_memories AS memory
+          ON memory.memory_id = dictionary.memory_id
+        JOIN canonical_memory_versions AS version
+          ON version.memory_id = dictionary.memory_id
+         AND version.version = dictionary.current_version
+        WHERE memory.state IN ('current', 'historical-trusted')
+        ORDER BY dictionary.memory_id
+        """
+    ).fetchall()
+    topic_rows = connection.execute(
+        """
+        SELECT DISTINCT normalized_topic
+        FROM knowledge_partitions
+        WHERE node_kind = 'leaf'
+        ORDER BY normalized_topic
+        """
+    ).fetchall()
+    historical = connection.execute(
+        """
+        SELECT dictionary.canonical_name
+        FROM knowledge_dictionary AS dictionary
+        JOIN canonical_memories AS memory
+          ON memory.memory_id = dictionary.memory_id
+        WHERE memory.state = 'historical-trusted'
+        ORDER BY dictionary.memory_id
+        """
+    ).fetchall()
+    counterevidence = connection.execute(
+        """
+        SELECT dictionary.canonical_name
+        FROM canonical_memory_conflicts AS conflict
+        JOIN knowledge_dictionary AS dictionary
+          ON dictionary.memory_id = conflict.first_memory_id
+          OR dictionary.memory_id = conflict.second_memory_id
+        WHERE conflict.status = 'unresolved'
+        UNION
+        SELECT dictionary.canonical_name
+        FROM integration_proposals AS proposal
+        JOIN knowledge_dictionary AS dictionary
+          ON dictionary.memory_id = proposal.target_memory_id
+        WHERE proposal.suggested_action = 'conflict'
+          AND proposal.status = 'pending'
+        ORDER BY 1
+        """
+    ).fetchall()
+    dependencies = connection.execute(
+        """
+        SELECT dictionary.canonical_name
+        FROM canonical_memory_dependencies AS dependency
+        JOIN knowledge_dictionary AS dictionary
+          ON dictionary.memory_id = dependency.memory_id
+        UNION
+        SELECT dictionary.canonical_name
+        FROM canonical_memory_dependencies AS dependency
+        JOIN knowledge_dictionary AS dictionary
+          ON dictionary.memory_id = dependency.depends_on_memory_id
+        ORDER BY 1
+        """
+    ).fetchall()
+    return {
+        "name-collision": _unique_text_rows(collisions),
+        "old-alias": _unique_text_rows(aliases),
+        "cross-partition-fts": _cross_partition_regression_queries(
+            connection,
+            _unique_text_rows(all_live),
+            _unique_text_rows(topic_rows),
+        ),
+        "historical-trusted": _unique_text_rows(historical),
+        "counterevidence": _unique_text_rows(counterevidence),
+        "dependency": _unique_text_rows(dependencies),
+    }
+
+
+def evaluate_fixed_recall_regression(
+    connection: sqlite3.Connection,
+    cases: dict[str, tuple[str, ...]],
+) -> dict[str, object]:
+    categories: dict[str, object] = {}
+    for category in RECALL_REGRESSION_CATEGORIES:
+        categories[category] = [
+            {
+                "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+                "signature": _recall_regression_signature(connection, query),
+            }
+            for query in cases.get(category, ())
+        ]
+    return {"categories": categories}
+
+
+def _recall_regression_signature(
+    connection: sqlite3.Connection,
+    question: str,
+) -> dict[str, object]:
+    paths, routed_capsules, ambiguity = _candidate_paths(connection, question)
+    candidates = _load_candidates(connection, paths)
+    selected, _truncated = _within_budget(
+        candidates,
+        MAXIMUM_RECALL_BUDGET_BYTES,
+        reserved_bytes=0,
+    )
+    selected_ids = tuple(candidate.memory_id for candidate in selected)
+    conflicts: list[list[object]] = []
+    dependencies: list[list[object]] = []
+    if selected_ids:
+        placeholders = ", ".join("?" for _ in selected_ids)
+        conflicts = [
+            list(row)
+            for row in connection.execute(
+                f"""
+                SELECT first_memory_id, second_memory_id, status
+                FROM canonical_memory_conflicts
+                WHERE first_memory_id IN ({placeholders})
+                   OR second_memory_id IN ({placeholders})
+                ORDER BY first_memory_id, second_memory_id
+                """,
+                (*selected_ids, *selected_ids),
+            ).fetchall()
+        ]
+        dependencies = [
+            list(row)
+            for row in connection.execute(
+                f"""
+                SELECT memory_id, version, depends_on_memory_id,
+                       depends_on_version, relationship
+                FROM canonical_memory_dependencies
+                WHERE memory_id IN ({placeholders})
+                   OR depends_on_memory_id IN ({placeholders})
+                ORDER BY memory_id, depends_on_memory_id, relationship
+                """,
+                (*selected_ids, *selected_ids),
+            ).fetchall()
+        ]
+    return {
+        "memories": [
+            {
+                "memory_id": candidate.memory_id,
+                "version": candidate.version,
+                "state": candidate.state,
+                "body_hash": hashlib.sha256(
+                    candidate.body.encode("utf-8")
+                ).hexdigest(),
+                "evidence": list(candidate.evidence),
+                "candidate_paths": sorted(candidate.candidate_paths),
+            }
+            for candidate in sorted(selected, key=lambda item: item.memory_id)
+        ],
+        "ambiguity": ambiguity,
+        "cross_partition_hit": any(
+            "global-fts" in candidate.candidate_paths
+            and candidate.capsule_id not in routed_capsules
+            for candidate in selected
+        ),
+        "global_fts_memory_ids": sorted(
+            candidate.memory_id
+            for candidate in selected
+            if "global-fts" in candidate.candidate_paths
+        ),
+        "unresolved_conflict": _has_unresolved_conflict(connection, selected_ids),
+        "conflicts": conflicts,
+        "dependencies": dependencies,
+    }
+
+
+def _cross_partition_regression_queries(
+    connection: sqlite3.Connection,
+    bodies: tuple[str, ...],
+    topics: tuple[str, ...],
+) -> tuple[str, ...]:
+    topic_prefix = " ".join(topics)
+    candidates = tuple(
+        dict.fromkeys(
+            (*bodies, *(f"{topic_prefix} {body}" for body in bodies))
+        )
+    )
+    actual_cross_partition = tuple(
+        query
+        for query in candidates
+        if cast(
+            bool,
+            _recall_regression_signature(connection, query)[
+                "cross_partition_hit"
+            ],
+        )
+    )
+    return actual_cross_partition or bodies
+
+
+def _unique_text_rows(rows: list[tuple[object, ...]]) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if len(row) != 1 or not isinstance(row[0], str):
+            raise IntegrityError("recall regression source is invalid")
+        if row[0] not in seen:
+            seen.add(row[0])
+            values.append(row[0])
+    return tuple(values)
 
 
 def _required_text(label: str, value: str) -> str:

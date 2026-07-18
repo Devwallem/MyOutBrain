@@ -3,6 +3,7 @@
 ## Decisions-so-far
 
 - 工单 09：本地或公开反证以规范来源凭证进入任务内召回并强制不可回答，同时生成 blocking 统一整合提案；待审不改规范知识，批准沿既有 revision 路径物化，拒绝保留来源与决定且不做多数裁决。详见 [工单 09](issues/09-route-counterevidence-through-review.md)。
+- 工单 10：胶囊重组采用写时复制、语义指纹、结构版本 CAS、原子指针切换与旧胶囊重定向；切换前故障清理 staged 副本，语义漂移转为统一 research 审阅提案，固定召回门禁保护身份、正文、关系与召回等价。详见 [工单 10](issues/10-reorganize-capsules-without-changing-recall.md)。
 - 工单 11：三种可替换代理入口通过统一主实例注册表与 V2.1 MCP/CLI 领域协议接入；协议按版本区间和能力协商，未理解的审阅效果禁止批准，语义写入使用幂等键与期望版本。详见 [工单 11](issues/11-install-adapters-and-negotiate-capabilities.md)。
 
 ## Notes
@@ -11,4 +12,5 @@
 
 ## Fog
 
+- 工单 14/15 的能力扩展不属于工单 10 范围。
 - 工单 12/13/15 与计划调度不属于工单 11 范围。
