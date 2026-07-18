@@ -19,6 +19,10 @@ SERVER_CAPABILITIES = (
     "review_effect.revise_canonical_memory.v1",
     "review_effect.create_human_archive.v1",
     "review_effect.create_research_thread.v1",
+    "reflection_schedule.v1",
+    "reflection_claim.v1",
+    "reflection_complete.v1",
+    "reflection_abandon.v1",
 )
 
 

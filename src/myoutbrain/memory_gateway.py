@@ -266,6 +266,118 @@ class MemoryGateway:
             idempotency_key=idempotency_key,
         ).to_data()
 
+    def configure_reflection_schedule(
+        self,
+        *,
+        enabled: bool,
+        first_due_at: str,
+        every_hours: int,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.configure_reflection_schedule(
+            enabled=enabled,
+            first_due_at=first_due_at,
+            every_hours=every_hours,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def enqueue_scheduled_reflection(
+        self,
+        *,
+        now: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.enqueue_scheduled_reflection(
+            now=now,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def claim_scheduled_reflection(
+        self,
+        *,
+        now: str,
+        lease_seconds: int,
+        claimed_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.claim_scheduled_reflection(
+            now=now,
+            lease_seconds=lease_seconds,
+            claimed_by=claimed_by,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def return_scheduled_reflection(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        now: str,
+        reason: str,
+        returned_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.return_scheduled_reflection(
+            run_id=run_id,
+            lease_token=lease_token,
+            now=now,
+            reason=reason,
+            returned_by=returned_by,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def complete_scheduled_reflection(
+        self,
+        request: ImmediateReflectionRequest,
+        *,
+        run_id: str,
+        lease_token: str,
+        completed_at: str,
+        completed_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.complete_scheduled_reflection(
+            request,
+            run_id=run_id,
+            lease_token=lease_token,
+            completed_at=completed_at,
+            completed_by=completed_by,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
+    def abandon_scheduled_reflection(
+        self,
+        *,
+        run_id: str,
+        abandoned_at: str,
+        reason: str,
+        permanently_missing_input_ids: tuple[str, ...],
+        confirm_permanent_missing: bool,
+        abandoned_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        return self._memory_core.abandon_scheduled_reflection(
+            run_id=run_id,
+            abandoned_at=abandoned_at,
+            reason=reason,
+            permanently_missing_input_ids=permanently_missing_input_ids,
+            confirm_permanent_missing=confirm_permanent_missing,
+            abandoned_by=abandoned_by,
+            expected_version=expected_version,
+            idempotency_key=idempotency_key,
+        )
+
     def propose_consolidation(
         self,
         task: str,

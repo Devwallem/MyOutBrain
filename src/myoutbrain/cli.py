@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -374,6 +376,17 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_reflection_parser.add_argument("--idempotency-key", required=True)
     abandon_reflection_parser.add_argument("--root", type=Path, default=Path.cwd())
     abandon_reflection_parser.add_argument(
+        "--format", choices=("json", "text"), default="text"
+    )
+    enqueue_scheduled_reflection_parser = subcommands.add_parser(
+        "enqueue-scheduled-reflection",
+        help="Run one model-free scheduled-reflection tick through the V2 protocol",
+    )
+    enqueue_scheduled_reflection_parser.add_argument("--now")
+    enqueue_scheduled_reflection_parser.add_argument(
+        "--root", type=Path, default=Path.cwd()
+    )
+    enqueue_scheduled_reflection_parser.add_argument(
         "--format", choices=("json", "text"), default="text"
     )
     search_public_parser = subcommands.add_parser(
@@ -1405,6 +1418,48 @@ def _abandon_reflection(
     return 0
 
 
+def _enqueue_scheduled_reflection_tick(
+    root: Path,
+    *,
+    now: str | None,
+    output_format: str,
+) -> int:
+    tick_time = now or datetime.now().astimezone().isoformat()
+    tick_key = "scheduled-reflection-tick:" + hashlib.sha256(
+        tick_time.encode("utf-8")
+    ).hexdigest()
+    response, exit_code = execute_domain_request(
+        root,
+        {
+            "protocol": {
+                "minimum": {"major": 2, "minor": 2},
+                "maximum": {"major": 2, "minor": 2},
+            },
+            "client": {
+                "name": "local-scheduler",
+                "capabilities": ["reflection_schedule.v1"],
+            },
+            "operation": "reflection.enqueue",
+            "parameters": {"now": tick_time},
+            "write": {
+                "idempotency_key": tick_key,
+                "expected_version": 0,
+            },
+        },
+    )
+    result = response.get("result") if response.get("ok") is True else response
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif isinstance(result, dict):
+        if result.get("queued") is True:
+            run = result.get("run")
+            run_id = run.get("run_id") if isinstance(run, dict) else None
+            print(f"Queued scheduled reflection {run_id}.")
+        else:
+            print(f"No scheduled reflection queued: {result.get('reason')}.")
+    return exit_code
+
+
 def _load_json_payload(path: Path, description: str) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -2209,6 +2264,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 parsed_arguments.root,
                 parsed_arguments.payload,
                 idempotency_key=parsed_arguments.idempotency_key,
+                output_format=parsed_arguments.format,
+            )
+        if parsed_arguments.command == "enqueue-scheduled-reflection":
+            return _enqueue_scheduled_reflection_tick(
+                parsed_arguments.root,
+                now=parsed_arguments.now,
                 output_format=parsed_arguments.format,
             )
         if parsed_arguments.command == "review-propose":

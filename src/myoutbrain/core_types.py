@@ -46,5 +46,18 @@ class RecallRegressionFailure(UserInputError):
     """Raised when a maintenance candidate changes fixed recall behaviour."""
 
 
+class VersionConflict(UserInputError):
+    """Raised when a versioned runtime write targets stale state."""
+
+    def __init__(self, message: str, *, expected: int, actual: int) -> None:
+        super().__init__(message)
+        self.expected = expected
+        self.actual = actual
+
+
+class LeaseConflict(UserInputError):
+    """Raised when a runtime lease is absent, expired, or owned elsewhere."""
+
+
 class WriterLocked(Exception):
     """Raised when another writer already owns the private-instance lock."""

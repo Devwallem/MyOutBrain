@@ -1212,7 +1212,11 @@ def _recall_regression_signature(
             for candidate in selected
             if "global-fts" in candidate.candidate_paths
         ),
-        "unresolved_conflict": _has_unresolved_conflict(connection, selected_ids),
+        "unresolved_conflict": _has_unresolved_conflict(
+            connection,
+            selected_ids,
+            task="capsule-maintenance-regression",
+        ),
         "conflicts": conflicts,
         "dependencies": dependencies,
     }

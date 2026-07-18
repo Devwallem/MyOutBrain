@@ -1,6 +1,6 @@
 ---
 name: myoutbrain-reflector
-description: Turn explicit MyOutBrain learning signals into traceable, grouped unified-review proposals. Use when the creator explicitly asks to reflect now, inspect pending reflection inputs, form explicit/derived/hypothesis proposals, or explicitly abandon selected temporary reflection inputs.
+description: Turn explicit or leased scheduled MyOutBrain learning signals into traceable, grouped unified-review proposals. Use when the creator explicitly asks to reflect now, a compatible entrance can claim scheduled reflection, pending reflection inputs need inspection, proposals need grouping, or permanently missing inputs must be explicitly abandoned.
 ---
 
 # MyOutBrain Reflector
@@ -35,12 +35,27 @@ Use the private instance only through the stable MemoryGateway CLI contract. Nev
 
 The core atomically preserves proposal receipts and cleans temporary reflection inputs only after successful proposal formation. A failed run leaves inputs available for retry.
 
+## Claim scheduled reflection
+
+Use the negotiated MCP `myoutbrain_gateway` tool when available, with the same JSON request accepted by `python -m myoutbrain gateway <request-json> --root <instance>`. Declare protocol 2.2 and only capabilities the entrance understands.
+
+1. Call `reflection.claim` with `reflection_claim.v1`, a stable idempotency key, `expected_version: 0`, the current offset-aware time and a bounded lease of 30–3600 seconds. `claimed: false` means there is no work; do not wake or invoke a capability engine.
+2. When claimed, use only `run.inputs`. They are the due-time frozen closure; do not add later queue entries or read SQLite, Vault, the object store, or invisible history.
+3. Form candidates using the same rules as **Reflect now**, then call `reflection.complete` before `lease_expires_at`. Declare `reflection_complete.v1` and `review_payload.v1`, use the returned run `version` as `expected_version`, and include the lease token and exact frozen input IDs.
+4. If execution cannot finish, call `reflection.return` with the same lease token and version so another compatible entrance can retry. A process crash needs no separate recovery action: the core returns an expired lease to queued on the next claim.
+5. Report only the completed proposal identities and blind spots. Never approve the proposals.
+
+The scheduler only freezes and queues inputs. It never supplies model credentials or invokes a model/network provider.
+An OS scheduler can invoke `python -m myoutbrain enqueue-scheduled-reflection --root <instance> --format json`; the command generates a per-tick idempotency key and dispatches `reflection.enqueue` through the same negotiated protocol. It does not need to know the mutable schedule version.
+
 ## Abandon selected inputs
 
-Only when the creator explicitly abandons a reflection, submit selected input IDs and a non-sensitive reason:
+For an explicit immediate reflection, only when the creator explicitly abandons it, submit selected input IDs and a non-sensitive reason:
 
 ```text
 python -m myoutbrain abandon-reflection <payload-json> --root <instance> --idempotency-key <stable-key> --format json
 ```
 
 Confirm the returned IDs were cleaned. Do not use abandonment as routine expiry, scheduled processing, or a substitute for rejecting a proposal.
+
+For a scheduled run whose frozen input is permanently unavailable, use negotiated `reflection.abandon` with `reflection_abandon.v1`, the observed run version, the affected input IDs, `confirm_permanent_missing: true`, and a short reason that contains no input body. Never abandon a scheduled run merely because a lease expired or an entrance is temporarily unavailable.

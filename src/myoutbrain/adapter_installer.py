@@ -37,6 +37,10 @@ ADAPTER_CAPABILITIES = (
     "review_effect.revise_canonical_memory.v1",
     "review_effect.create_human_archive.v1",
     "review_effect.create_research_thread.v1",
+    "reflection_schedule.v1",
+    "reflection_claim.v1",
+    "reflection_complete.v1",
+    "reflection_abandon.v1",
 )
 _CODEX_START = "# BEGIN MYOUTBRAIN MANAGED ADAPTER"
 _CODEX_END = "# END MYOUTBRAIN MANAGED ADAPTER"
@@ -61,6 +65,11 @@ understands. Never read SQLite, the object store, Vault, or generated views
 directly. Before approving a proposal, inspect its complete `approval_effect`
 and declare the matching `review_effect.<type>.v1` capability. Every semantic
 write must carry a stable idempotency key and the observed `expected_version`.
+Protocol 2.2 entrances may claim scheduled reflection with
+`reflection_claim.v1`, complete the exact frozen closure with
+`reflection_complete.v1` plus `review_payload.v1`, return unfinished leases,
+or explicitly abandon permanently missing inputs with `reflection_abandon.v1`.
+Never invoke a model merely because a schedule was enqueued.
 """
 
 

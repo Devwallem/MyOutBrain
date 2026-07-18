@@ -11,7 +11,9 @@ from myoutbrain.core_types import (
     IdempotencyConflict,
     IntegrityError,
     RecallRegressionFailure,
+    LeaseConflict,
     UserInputError,
+    VersionConflict,
     WriterLocked,
 )
 from myoutbrain.library import KnowledgeWorkflow
@@ -22,6 +24,7 @@ from myoutbrain.protocol_contract import (
     SERVER_MINIMUM_PROTOCOL_VERSION,
     SERVER_PROTOCOL_VERSION,
 )
+from myoutbrain.reflection import load_immediate_reflection
 from myoutbrain.unified_review import ReviewBatchRequest, ReviewDecision
 
 
@@ -209,6 +212,18 @@ class DomainProtocol:
                 idempotency_key=write.idempotency_key,
                 entrance=request.client_name,
             )
+        elif request.operation == "reflection.schedule":
+            result = self._configure_reflection_schedule(request)
+        elif request.operation == "reflection.enqueue":
+            result = self._enqueue_scheduled_reflection(request)
+        elif request.operation == "reflection.claim":
+            result = self._claim_scheduled_reflection(request)
+        elif request.operation == "reflection.return":
+            result = self._return_scheduled_reflection(request)
+        elif request.operation == "reflection.complete":
+            result = self._complete_scheduled_reflection(request)
+        elif request.operation == "reflection.abandon":
+            result = self._abandon_scheduled_reflection(request)
         else:
             raise UserInputError(f"unknown gateway operation: {request.operation}")
         return {
@@ -241,6 +256,226 @@ class DomainProtocol:
             raise DomainProtocolError(
                 "write_contract_required",
                 "capsule maintenance writes require idempotency_key and expected_version",
+            )
+        return request.write
+
+    def _configure_reflection_schedule(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_schedule.v1")
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"enabled", "first_due_at", "every_hours"},
+            "reflection.schedule parameters",
+        )
+        enabled = request.parameters.get("enabled")
+        first_due_at = request.parameters.get("first_due_at")
+        every_hours = request.parameters.get("every_hours")
+        if not isinstance(enabled, bool):
+            raise UserInputError("reflection.schedule enabled must be boolean")
+        if not isinstance(first_due_at, str) or not first_due_at.strip():
+            raise UserInputError("reflection.schedule first_due_at must be non-blank text")
+        if not isinstance(every_hours, int) or isinstance(every_hours, bool):
+            raise UserInputError("reflection.schedule every_hours must be an integer")
+        return MemoryGateway(self._root).configure_reflection_schedule(
+            enabled=enabled,
+            first_due_at=first_due_at,
+            every_hours=every_hours,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    def _enqueue_scheduled_reflection(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_schedule.v1")
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"now"},
+            "reflection.enqueue parameters",
+        )
+        now = request.parameters.get("now")
+        if not isinstance(now, str) or not now.strip():
+            raise UserInputError("reflection.enqueue now must be non-blank text")
+        return MemoryGateway(self._root).enqueue_scheduled_reflection(
+            now=now,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    def _claim_scheduled_reflection(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_claim.v1")
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"now", "lease_seconds"},
+            "reflection.claim parameters",
+        )
+        now = request.parameters.get("now")
+        lease_seconds = request.parameters.get("lease_seconds")
+        if not isinstance(now, str) or not now.strip():
+            raise UserInputError("reflection.claim now must be non-blank text")
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool):
+            raise UserInputError("reflection.claim lease_seconds must be an integer")
+        return MemoryGateway(self._root).claim_scheduled_reflection(
+            now=now,
+            lease_seconds=lease_seconds,
+            claimed_by=request.client_name,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    def _return_scheduled_reflection(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_claim.v1")
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"run_id", "lease_token", "now", "reason"},
+            "reflection.return parameters",
+        )
+        run_id = request.parameters.get("run_id")
+        lease_token = request.parameters.get("lease_token")
+        now = request.parameters.get("now")
+        reason = request.parameters.get("reason")
+        if not all(isinstance(value, str) and value.strip() for value in (
+            run_id,
+            lease_token,
+            now,
+            reason,
+        )):
+            raise UserInputError(
+                "reflection.return run_id, lease_token, now and reason must be non-blank text"
+            )
+        return MemoryGateway(self._root).return_scheduled_reflection(
+            run_id=cast(str, run_id),
+            lease_token=cast(str, lease_token),
+            now=cast(str, now),
+            reason=cast(str, reason),
+            returned_by=request.client_name,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    def _complete_scheduled_reflection(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_complete.v1")
+        if "review_payload.v1" not in request.capabilities:
+            raise DomainProtocolError(
+                "capability_required",
+                "reflection.complete requires review_payload.v1",
+                details={"missing": ["review_payload.v1"]},
+            )
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"run_id", "lease_token", "completed_at", "reflection"},
+            "reflection.complete parameters",
+        )
+        run_id = request.parameters.get("run_id")
+        lease_token = request.parameters.get("lease_token")
+        completed_at = request.parameters.get("completed_at")
+        if not all(isinstance(value, str) and value.strip() for value in (
+            run_id,
+            lease_token,
+            completed_at,
+        )):
+            raise UserInputError(
+                "reflection.complete run_id, lease_token and completed_at "
+                "must be non-blank text"
+            )
+        reflection = load_immediate_reflection(
+            request.parameters.get("reflection")
+        )
+        return MemoryGateway(self._root).complete_scheduled_reflection(
+            reflection,
+            run_id=cast(str, run_id),
+            lease_token=cast(str, lease_token),
+            completed_at=cast(str, completed_at),
+            completed_by=request.client_name,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    def _abandon_scheduled_reflection(
+        self,
+        request: DomainRequest,
+    ) -> dict[str, object]:
+        write = self._require_runtime_write(request, "reflection_abandon.v1")
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {
+                "run_id",
+                "abandoned_at",
+                "reason",
+                "permanently_missing_input_ids",
+                "confirm_permanent_missing",
+            },
+            "reflection.abandon parameters",
+        )
+        run_id = request.parameters.get("run_id")
+        abandoned_at = request.parameters.get("abandoned_at")
+        reason = request.parameters.get("reason")
+        raw_missing = request.parameters.get("permanently_missing_input_ids")
+        confirmed = request.parameters.get("confirm_permanent_missing")
+        if not all(isinstance(value, str) and value.strip() for value in (
+            run_id,
+            abandoned_at,
+            reason,
+        )):
+            raise UserInputError(
+                "reflection.abandon run_id, abandoned_at and reason "
+                "must be non-blank text"
+            )
+        if not isinstance(raw_missing, list) or not all(
+            isinstance(value, str) and value.strip() for value in raw_missing
+        ):
+            raise UserInputError(
+                "reflection.abandon permanently_missing_input_ids must be text"
+            )
+        if not isinstance(confirmed, bool):
+            raise UserInputError(
+                "reflection.abandon confirm_permanent_missing must be boolean"
+            )
+        return MemoryGateway(self._root).abandon_scheduled_reflection(
+            run_id=cast(str, run_id),
+            abandoned_at=cast(str, abandoned_at),
+            reason=cast(str, reason),
+            permanently_missing_input_ids=tuple(cast(list[str], raw_missing)),
+            confirm_permanent_missing=confirmed,
+            abandoned_by=request.client_name,
+            expected_version=write.expected_version,
+            idempotency_key=write.idempotency_key,
+        )
+
+    @staticmethod
+    def _require_runtime_write(
+        request: DomainRequest,
+        capability: str,
+    ) -> WriteCondition:
+        required_version = ProtocolVersion(major=2, minor=2)
+        if request.maximum_version < required_version:
+            raise DomainProtocolError(
+                "protocol_incompatible",
+                f"{request.operation} requires protocol 2.2",
+                details={"required": required_version.to_data()},
+            )
+        if capability not in request.capabilities:
+            raise DomainProtocolError(
+                "capability_required",
+                f"{request.operation} requires {capability}",
+                details={"missing": [capability]},
+            )
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "runtime writes require idempotency_key and expected_version",
             )
         return request.write
 
@@ -360,6 +595,16 @@ def execute_domain_request(
         return _error_response(operation, "constraint_conflict", str(error), 2)
     except RecallRegressionFailure as error:
         return _error_response(operation, "recall_regression_failed", str(error), 2)
+    except VersionConflict as error:
+        return _error_response(
+            operation,
+            "version_conflict",
+            str(error),
+            2,
+            details={"expected_version": error.expected, "actual_version": error.actual},
+        )
+    except LeaseConflict as error:
+        return _error_response(operation, "lease_conflict", str(error), 2)
     except ConfigurationConflict as error:
         return _error_response(operation, "configuration_conflict", str(error), 3)
     except WriterLocked as error:

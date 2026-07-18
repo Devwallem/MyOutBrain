@@ -161,6 +161,12 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                     "writes": [
                         "maintenance.configure_partition",
                         "maintenance.reorganize",
+                        "reflection.abandon",
+                        "reflection.claim",
+                        "reflection.complete",
+                        "reflection.enqueue",
+                        "reflection.return",
+                        "reflection.schedule",
                         "review.decide",
                     ],
                 },
@@ -635,6 +641,72 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                 json.loads(cast(str, content[0]["text"])),
                 cli_response,
             )
+
+    def test_mcp_and_cli_return_the_same_scheduled_reflection_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            instance_root = temporary_root / "MyOutBrain"
+            request_path = temporary_root / "reflection-schedule.json"
+            self.assertEqual(run_cli("init", "--root", str(instance_root)).returncode, 0)
+            request = {
+                "protocol": {
+                    "minimum": {"major": 2, "minor": 2},
+                    "maximum": {"major": 2, "minor": 2},
+                },
+                "client": {
+                    "name": "codex",
+                    "capabilities": ["reflection_schedule.v1"],
+                },
+                "operation": "reflection.schedule",
+                "parameters": {
+                    "enabled": True,
+                    "first_due_at": "2026-07-20T03:00:00+08:00",
+                    "every_hours": 168,
+                },
+                "write": {
+                    "idempotency_key": "transport-neutral-reflection-schedule",
+                    "expected_version": 0,
+                },
+            }
+            write_request(request_path, request)
+            cli_response = json.loads(
+                run_cli(
+                    "gateway",
+                    str(request_path),
+                    "--root",
+                    str(instance_root),
+                ).stdout
+            )
+
+            responses = run_mcp(
+                instance_root,
+                [
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-11-25",
+                            "capabilities": {},
+                            "clientInfo": {"name": "acceptance", "version": "1"},
+                        },
+                    },
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "myoutbrain_gateway",
+                            "arguments": {"request": request},
+                        },
+                    },
+                ],
+            )
+
+            tool_result = cast(dict[str, object], responses[1]["result"])
+            self.assertFalse(tool_result["isError"])
+            self.assertEqual(tool_result["structuredContent"], cli_response)
 
     def test_mcp_and_cli_return_the_same_stable_domain_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -52,6 +52,15 @@ from myoutbrain.reflection import (
     stage_reflection_abandonment,
     stage_learning_signal,
 )
+from myoutbrain.scheduled_reflection import (
+    SCHEDULED_REFLECTION_SCHEMA,
+    stage_scheduled_reflection_abandonment,
+    stage_reflection_schedule,
+    stage_scheduled_reflection_claim,
+    stage_scheduled_reflection_completion,
+    stage_scheduled_reflection_enqueue,
+    stage_scheduled_reflection_return,
+)
 from myoutbrain.unified_review import (
     ReviewProposal,
     ReviewProposalInput,
@@ -550,7 +559,7 @@ CREATE TABLE deletion_markers (
     deleted_at TEXT NOT NULL,
     backup_exclusion_after TEXT NOT NULL
 );
-""" + UNIFIED_REVIEW_SCHEMA + REFLECTION_SCHEMA
+""" + UNIFIED_REVIEW_SCHEMA + REFLECTION_SCHEMA + SCHEDULED_REFLECTION_SCHEMA
 
 
 MemoryDisposition = Literal["buffered", "duplicate"]
@@ -2379,6 +2388,184 @@ class LocalMemoryCore:
             staged_database, result = stage_reflection_abandonment(
                 database_path,
                 request,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def configure_reflection_schedule(
+        self,
+        *,
+        enabled: bool,
+        first_due_at: str,
+        every_hours: int,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_reflection_schedule(
+                database_path,
+                enabled=enabled,
+                first_due_at=first_due_at,
+                every_hours=every_hours,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def enqueue_scheduled_reflection(
+        self,
+        *,
+        now: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_scheduled_reflection_enqueue(
+                database_path,
+                now=now,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def claim_scheduled_reflection(
+        self,
+        *,
+        now: str,
+        lease_seconds: int,
+        claimed_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_scheduled_reflection_claim(
+                database_path,
+                now=now,
+                lease_seconds=lease_seconds,
+                claimed_by=claimed_by,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def return_scheduled_reflection(
+        self,
+        *,
+        run_id: str,
+        lease_token: str,
+        now: str,
+        reason: str,
+        returned_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_scheduled_reflection_return(
+                database_path,
+                run_id=run_id,
+                lease_token=lease_token,
+                now=now,
+                reason=reason,
+                returned_by=returned_by,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def complete_scheduled_reflection(
+        self,
+        request: ImmediateReflectionRequest,
+        *,
+        run_id: str,
+        lease_token: str,
+        completed_at: str,
+        completed_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_scheduled_reflection_completion(
+                database_path,
+                request,
+                run_id=run_id,
+                lease_token=lease_token,
+                completed_at=completed_at,
+                completed_by=completed_by,
+                expected_version=expected_version,
+                idempotency_key=idempotency_key,
+            )
+            atomic_commit(self._root, [(database_path, staged_database)])
+        return result
+
+    def abandon_scheduled_reflection(
+        self,
+        *,
+        run_id: str,
+        abandoned_at: str,
+        reason: str,
+        permanently_missing_input_ids: tuple[str, ...],
+        confirm_permanent_missing: bool,
+        abandoned_by: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> dict[str, object]:
+        database_path = self._root / MEMORY_DATABASE
+        if not database_path.is_file():
+            raise ConfigurationConflict(
+                f"MyOutBrain memory core is not initialized at: {self._root}"
+            )
+        with writer_lock(self._root):
+            recover_transactions(self._root)
+            self._validate_database(database_path)
+            staged_database, result = stage_scheduled_reflection_abandonment(
+                database_path,
+                run_id=run_id,
+                abandoned_at=abandoned_at,
+                reason=reason,
+                permanently_missing_input_ids=permanently_missing_input_ids,
+                confirm_permanent_missing=confirm_permanent_missing,
+                abandoned_by=abandoned_by,
+                expected_version=expected_version,
                 idempotency_key=idempotency_key,
             )
             atomic_commit(self._root, [(database_path, staged_database)])
@@ -5560,6 +5747,7 @@ class LocalMemoryCore:
                     PRAGMA user_version = 10;
                     """
                 )
+                connection.executescript(SCHEDULED_REFLECTION_SCHEMA)
                 connection.commit()
                 connection.execute("PRAGMA foreign_keys = ON")
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:

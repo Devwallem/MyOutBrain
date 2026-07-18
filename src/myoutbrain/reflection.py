@@ -537,6 +537,9 @@ def stage_immediate_reflection(
     temporary_path = _copy_database(database_path)
     try:
         reflection_inputs = _selected_inputs(temporary_path, request.input_ids)
+        reserved_runs = _reserved_scheduled_runs(
+            temporary_path, request.input_ids
+        )
         inputs_by_id = {
             reflection_input.input_id: reflection_input
             for reflection_input in reflection_inputs
@@ -641,6 +644,56 @@ def stage_immediate_reflection(
         )
         with closing(sqlite3.connect(temporary_path)) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
+            for scheduled_run_id, scheduled_version in reserved_runs:
+                scheduled_result = result.to_data()
+                scheduled_result["run_id"] = scheduled_run_id
+                changed = connection.execute(
+                    """
+                    UPDATE scheduled_reflection_runs
+                    SET status = 'completed', run_version = ?, result_json = ?,
+                        claimed_by = COALESCE(claimed_by, 'explicit-reflection'),
+                        lease_token = NULL, lease_expires_at = NULL,
+                        completed_at = ?
+                    WHERE run_id = ? AND run_version = ?
+                      AND status IN ('queued', 'claimed')
+                    """,
+                    (
+                        scheduled_version + 1,
+                        _json(scheduled_result),
+                        completed_at,
+                        scheduled_run_id,
+                        scheduled_version,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise IntegrityError(
+                        "explicit reflection lost a scheduled-run race"
+                    )
+                connection.execute(
+                    "DELETE FROM scheduled_reflection_run_inputs WHERE run_id = ?",
+                    (scheduled_run_id,),
+                )
+                connection.execute(
+                    """
+                    UPDATE reflection_runtime_operations
+                    SET result_json = ?
+                    WHERE operation = 'reflection.claim' AND run_id = ?
+                    """,
+                    (
+                        _json(
+                            {
+                                "claimed": False,
+                                "reason": "run-finished",
+                                "run": {
+                                    "run_id": scheduled_run_id,
+                                    "status": "completed",
+                                    "version": scheduled_version + 1,
+                                },
+                            }
+                        ),
+                        scheduled_run_id,
+                    ),
+                )
             connection.executemany(
                 "DELETE FROM reflection_inputs WHERE input_id = ?",
                 ((input_id,) for input_id in request.input_ids),
@@ -769,7 +822,8 @@ def _selected_inputs(
         with closing(sqlite3.connect(database_path)) as connection:
             rows = tuple(
                 connection.execute(
-                    "SELECT * FROM reflection_inputs WHERE input_id = ?", (input_id,)
+                    "SELECT * FROM reflection_inputs WHERE input_id = ?",
+                    (input_id,),
                 ).fetchone()
                 for input_id in input_ids
             )
@@ -784,6 +838,51 @@ def _selected_inputs(
     return tuple(
         _input_from_row(cast(tuple[object, ...], row)) for row in rows
     )
+
+
+def _reserved_scheduled_runs(
+    database_path: Path,
+    input_ids: tuple[str, ...],
+) -> tuple[tuple[str, int], ...]:
+    if not input_ids:
+        return ()
+    placeholders = ",".join("?" for _ in input_ids)
+    try:
+        with closing(sqlite3.connect(database_path)) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT run.run_id, run.run_version
+                FROM scheduled_reflection_runs AS run
+                JOIN scheduled_reflection_run_inputs AS frozen
+                  ON frozen.run_id = run.run_id
+                WHERE run.status IN ('queued', 'claimed')
+                  AND frozen.input_id IN ({placeholders})
+                ORDER BY run.run_id
+                """,
+                input_ids,
+            ).fetchall()
+            selected = set(input_ids)
+            reserved: list[tuple[str, int]] = []
+            for row in rows:
+                run_id = cast(str, row[0])
+                closure_ids = {
+                    cast(str, closure[0])
+                    for closure in connection.execute(
+                        """
+                        SELECT input_id FROM scheduled_reflection_run_inputs
+                        WHERE run_id = ?
+                        """,
+                        (run_id,),
+                    ).fetchall()
+                }
+                if not closure_ids <= selected:
+                    raise UserInputError(
+                        "explicit reflection must include the complete frozen closure"
+                    )
+                reserved.append((run_id, cast(int, row[1])))
+    except sqlite3.Error as error:
+        raise IntegrityError("cannot inspect scheduled reflection closure") from error
+    return tuple(reserved)
 
 
 def _input_receipts(
