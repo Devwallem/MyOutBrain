@@ -15,38 +15,40 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
             library_root = Path(temporary_directory) / "My Knowledge"
 
             result = run_cli("init", "--root", str(library_root))
+            status = run_cli(
+                "status",
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
+            doctor = run_cli(
+                "doctor",
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Initialized MyOutBrain", result.stdout)
-            expected_directories = (
-                "vault",
-                "store/objects/sha256",
-                "store/records",
-                "store/journal",
-                "runtime/derived",
-                "runtime/indexes/fulltext",
-                "runtime/indexes/semantic",
-                "runtime/workspace/inbox",
-                "runtime/workspace/candidates",
-                "runtime/cache",
-                "runtime/logs",
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(
+                json.loads(status.stdout),
+                {
+                    "instance_version": 2,
+                    "canonical_schema_version": 11,
+                    "write": {"available": True, "mode": "single-writer"},
+                    "integrity": {
+                        "canonical_store": "ok",
+                        "object_store": "ok",
+                        "overall": "ok",
+                    },
+                },
             )
-            for relative_path in expected_directories:
-                self.assertTrue(
-                    (library_root / relative_path).is_dir(),
-                    f"Expected initialized directory: {relative_path}",
-                )
-            self.assertTrue((library_root / "myoutbrain.toml").is_file())
-            configuration = (library_root / "myoutbrain.toml").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("[embedding]\nenabled = false", configuration)
-            self.assertIn('provider = "sentence-transformers"', configuration)
-            self.assertIn("allow_cloud = false", configuration)
-            self.assertIn('cloud_send_scope = "none"', configuration)
-            self.assertIn("cloud_budget_usd = 0.0", configuration)
-            self.assertIn("cloud_max_texts_per_request = 0", configuration)
-            self.assertTrue((library_root / "store" / "memory.sqlite3").is_file())
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            self.assertEqual(json.loads(doctor.stdout)["overall"], "ok")
+            self.assertEqual(json.loads(doctor.stdout)["mode"], "read-only")
             self.assertFalse((library_root / ".git").exists())
 
     def test_reinitialization_preserves_existing_content(self) -> None:
@@ -54,19 +56,31 @@ class InitializePrivateCognitiveLibraryTests(unittest.TestCase):
             library_root = Path(temporary_directory) / "My Knowledge"
             first_result = run_cli("init", "--root", str(library_root))
             self.assertEqual(first_result.returncode, 0, first_result.stderr)
-            note = library_root / "vault" / "My Existing Note.md"
+            note = library_root / "Creator Note.md"
             note.write_text("Do not overwrite me.", encoding="utf-8")
-            configuration = library_root / "myoutbrain.toml"
-            configuration.write_text(
-                configuration.read_text(encoding="utf-8") + "\ncreator = \"me\"\n",
-                encoding="utf-8",
-            )
 
             second_result = run_cli("init", "--root", str(library_root))
+            status = run_cli(
+                "status",
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
+            doctor = run_cli(
+                "doctor",
+                "--root",
+                str(library_root),
+                "--format",
+                "json",
+            )
 
             self.assertEqual(second_result.returncode, 0, second_result.stderr)
             self.assertEqual(note.read_text(encoding="utf-8"), "Do not overwrite me.")
-            self.assertIn('creator = "me"', configuration.read_text(encoding="utf-8"))
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(json.loads(status.stdout)["integrity"]["overall"], "ok")
+            self.assertEqual(doctor.returncode, 0, doctor.stderr)
+            self.assertEqual(json.loads(doctor.stdout)["overall"], "ok")
 
     def test_conflicting_content_is_rejected_before_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

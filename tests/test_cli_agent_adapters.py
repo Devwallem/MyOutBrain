@@ -152,12 +152,14 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                 response["result"]["operations"],
                 {
                     "reads": [
+                        "activity.recall_log",
                         "backup.verify",
                         "instance.doctor",
                         "instance.status",
                         "maintenance.gc_plan",
                         "maintenance.inspect",
                         "maintenance.plan",
+                        "memory.recall",
                         "migration.import_dry_run",
                         "migration.plan",
                         "protocol.describe",
@@ -166,10 +168,12 @@ class AgentAdapterProtocolTests(unittest.TestCase):
                     "writes": [
                         "backup.create",
                         "backup.restore",
+                        "experience.submit_signal",
                         "instance.doctor(repair)",
                         "maintenance.configure_partition",
                         "maintenance.gc_apply",
                         "maintenance.reorganize",
+                        "memory.route_counterevidence",
                         "migration.export",
                         "migration.import",
                         "reflection.abandon",
@@ -890,11 +894,11 @@ class AgentAdapterInstallationTests(unittest.TestCase):
                         check["protocol"],
                         {
                             "client": {
-                                "maximum": {"major": 2, "minor": 2},
+                                "maximum": {"major": 2, "minor": 3},
                                 "minimum": {"major": 2, "minor": 0},
                             },
                             "compatible": True,
-                            "negotiated": {"major": 2, "minor": 2},
+                            "negotiated": {"major": 2, "minor": 3},
                             "server": {"major": 2, "minor": 3},
                         },
                     )

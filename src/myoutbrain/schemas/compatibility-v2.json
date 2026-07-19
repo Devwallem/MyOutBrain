@@ -1,8 +1,8 @@
 {
   "current": {"major": 2, "minor": 3},
   "operations": {
-    "reads": ["backup.verify", "instance.doctor", "instance.status", "maintenance.gc_plan", "maintenance.inspect", "maintenance.plan", "migration.import_dry_run", "migration.plan", "protocol.describe", "review.list"],
-    "writes": ["backup.create", "backup.restore", "instance.doctor(repair)", "maintenance.configure_partition", "maintenance.gc_apply", "maintenance.reorganize", "migration.export", "migration.import", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
+    "reads": ["activity.recall_log", "backup.verify", "instance.doctor", "instance.status", "maintenance.gc_plan", "maintenance.inspect", "maintenance.plan", "memory.recall", "migration.import_dry_run", "migration.plan", "protocol.describe", "review.list"],
+    "writes": ["backup.create", "backup.restore", "experience.submit_signal", "instance.doctor(repair)", "maintenance.configure_partition", "maintenance.gc_apply", "maintenance.reorganize", "memory.route_counterevidence", "migration.export", "migration.import", "reflection.abandon", "reflection.claim", "reflection.complete", "reflection.enqueue", "reflection.return", "reflection.schedule", "review.decide"]
   },
   "rules": {
     "major": "Semantic writes require protocol major 2.",

@@ -9,6 +9,7 @@
 - 工单 11：三种可替换代理入口通过统一主实例注册表与 V2.1 MCP/CLI 领域协议接入；协议按版本区间和能力协商，未理解的审阅效果禁止批准，语义写入使用幂等键与期望版本。详见 [工单 11](issues/11-install-adapters-and-negotiate-capabilities.md)。
 - 工单 12：计划反思通过 V2.2 客户端中立协议在 SQLite 核心中冻结输入闭包并提供跨入口租约；空队列不唤醒，完成/归还/过期/永久缺失均幂等收敛，显式反思可接管计划闭包。详见 [工单 12](issues/12-claim-scheduled-reflection-across-adapters.md)。
 - 工单 14：实例维护通过 V2.3 统一领域协议提供带维护锁的冷全量 ZIP、恢复到新目录后的只读 Doctor 门禁、只重建投影的显式 repair，以及保护所有历史引用并需精确确认的孤立对象 GC；规范损坏进入受限只读且最小删除标记阻止静默恢复。详见 [工单 14](issues/14-back-up-diagnose-and-garbage-collect-the-instance.md)。
+- 工单 15：V2 以九项跨客户端黑盒发布场景收口；三入口经统一 MCP/CLI 协议召回同一知识版本、写入同构紧凑日志并共享审阅状态，基础闭环无需网络、Embedding 或常驻进程，V1 规格仅保留为历史且 V2 成为唯一规范事实来源。详见 [工单 15](issues/15-release-v2-through-cross-client-scenarios.md)。
 
 ## Notes
 
@@ -16,4 +17,4 @@
 
 ## Fog
 
-- 工单 15 尚未实施，不属于已完成工单 10–14 的范围。
+- 当前没有阻塞 V2 发布的已知未决项；发布后的可选能力记录在 `docs/releases/v2.md`，不属于 V2 范围。

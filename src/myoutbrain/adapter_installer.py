@@ -23,9 +23,13 @@ ADAPTER_CLIENTS: tuple[AdapterClient, ...] = (
     "claude-code",
 )
 ADAPTER_MINIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 0}
-ADAPTER_MAXIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 2}
+ADAPTER_MAXIMUM_PROTOCOL_VERSION = {"major": 2, "minor": 3}
 ADAPTER_CAPABILITIES = (
     "instance_status.v1",
+    "memory_recall.v1",
+    "recall_activity.v1",
+    "learning_signal.v1",
+    "counterevidence_review.v1",
     "capsule_maintenance.v1",
     "review_list.v1",
     "review_payload.v1",
@@ -44,6 +48,12 @@ ADAPTER_CAPABILITIES = (
     "migration_export.v1",
     "migration_import_preview.v1",
     "migration_import.v1",
+    "backup_create.v1",
+    "backup_verify.v1",
+    "backup_restore.v1",
+    "doctor_read.v1",
+    "doctor_repair.v1",
+    "orphan_gc.v1",
 )
 _CODEX_START = "# BEGIN MYOUTBRAIN MANAGED ADAPTER"
 _CODEX_END = "# END MYOUTBRAIN MANAGED ADAPTER"
@@ -68,11 +78,17 @@ understands. Never read SQLite, the object store, Vault, or generated views
 directly. Before approving a proposal, inspect its complete `approval_effect`
 and declare the matching `review_effect.<type>.v1` capability. Every semantic
 write must carry a stable idempotency key and the observed `expected_version`.
-Protocol 2.2 entrances may claim scheduled reflection with
+Protocol 2.3 entrances may submit explicit learning signals, recall canonical
+memory, route task-scoped counterevidence into unified review, inspect compact
+recall activity, and claim scheduled reflection with
 `reflection_claim.v1`, complete the exact frozen closure with
 `reflection_complete.v1` plus `review_payload.v1`, return unfinished leases,
 or explicitly abandon permanently missing inputs with `reflection_abandon.v1`.
-Never invoke a model merely because a schedule was enqueued.
+Never invoke a model merely because a schedule was enqueued. Instance backup,
+restore, Doctor and garbage collection remain explicit creator operations.
+When a recall response includes `source_declaration.kind = "myoutbrain"`, show
+its `source_declaration.label` to the creator with the answer; do not silently
+discard the knowledge-source declaration.
 """
 
 

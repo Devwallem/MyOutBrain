@@ -1,6 +1,10 @@
 # MyOutBrain V1：单篇 Markdown 的认知闭环
 
-Status: ready-for-agent
+Status: wontfix
+Superseded by: ../myoutbrain-v2/spec.md
+
+> 历史规格，仅用于解释 V1 的设计演变；V2 行为与发布要求只以
+> [MyOutBrain V2 规格](../myoutbrain-v2/spec.md)为准。
 
 ## Problem Statement
 

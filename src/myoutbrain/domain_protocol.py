@@ -24,8 +24,15 @@ from myoutbrain.protocol_contract import (
     SERVER_MINIMUM_PROTOCOL_VERSION,
     SERVER_PROTOCOL_VERSION,
 )
-from myoutbrain.reflection import load_immediate_reflection
+from myoutbrain.reflection import LearningSignalSubmission, load_immediate_reflection
 from myoutbrain.unified_review import ReviewBatchRequest, ReviewDecision
+from myoutbrain.v2_recall import (
+    AnswerabilityReason,
+    CapabilityAnswerability,
+    FixedAnswerabilityEngine,
+    V2RecallRequest,
+)
+from myoutbrain.counterevidence import CounterevidenceRequest
 
 
 class DomainProtocolError(Exception):
@@ -184,6 +191,23 @@ class DomainProtocol:
         negotiated = self._negotiate(request)
         if request.operation == "instance.status":
             result = KnowledgeWorkflow(self._root).instance_status().to_data()
+        elif request.operation == "memory.recall":
+            self._require_capability(request, "memory_recall.v1")
+            result = self._recall_memory(request)
+        elif request.operation == "activity.recall_log":
+            self._require_capability(request, "recall_activity.v1")
+            _reject_unknown_fields(
+                cast(dict[object, object], request.parameters),
+                set(),
+                "activity.recall_log parameters",
+            )
+            result = MemoryGateway(self._root).v2_recall_activity()
+        elif request.operation == "experience.submit_signal":
+            self._require_capability(request, "learning_signal.v1")
+            result = self._submit_learning_signal(request)
+        elif request.operation == "memory.route_counterevidence":
+            self._require_capability(request, "counterevidence_review.v1")
+            result = self._route_counterevidence(request)
         elif request.operation == "instance.doctor":
             result = self._doctor(request, negotiated)
         elif request.operation == "backup.create":
@@ -322,6 +346,95 @@ class DomainProtocol:
             "server_capabilities": list(SERVER_CAPABILITIES),
             "result": result,
         }
+
+    def _recall_memory(self, request: DomainRequest) -> dict[str, object]:
+        _reject_unknown_fields(
+            cast(dict[object, object], request.parameters),
+            {"question", "task", "budget_bytes", "answerability"},
+            "memory.recall parameters",
+        )
+        question = self._required_parameter_text(request, "question")
+        task = self._required_parameter_text(request, "task")
+        budget_bytes = request.parameters.get("budget_bytes")
+        if not isinstance(budget_bytes, int) or isinstance(budget_bytes, bool):
+            raise UserInputError("memory.recall budget_bytes must be an integer")
+        raw_answerability = request.parameters.get("answerability")
+        if not isinstance(raw_answerability, dict):
+            raise UserInputError("memory.recall answerability must be an object")
+        answerability = cast(dict[object, object], raw_answerability)
+        _reject_unknown_fields(
+            answerability,
+            {"answerable", "reason"},
+            "memory.recall answerability",
+        )
+        answerable = answerability.get("answerable")
+        reason = answerability.get("reason")
+        if not isinstance(answerable, bool) or not isinstance(reason, str):
+            raise UserInputError(
+                "memory.recall answerability requires boolean answerable and text reason"
+            )
+        assessment = CapabilityAnswerability(
+            answerable=answerable,
+            reason=cast(AnswerabilityReason, reason),
+        )
+        assessment.validate()
+        return MemoryGateway(self._root).recall_v2(
+            V2RecallRequest(
+                question=question,
+                task=task,
+                entrance=request.client_name,
+                budget_bytes=budget_bytes,
+            ),
+            FixedAnswerabilityEngine(assessment),
+        )
+
+    def _submit_learning_signal(self, request: DomainRequest) -> dict[str, object]:
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "learning signal writes require idempotency_key and expected_version",
+            )
+        if request.write.expected_version != 0:
+            raise DomainProtocolError(
+                "version_conflict",
+                "new learning signals require expected_version 0",
+                details={
+                    "expected_version": request.write.expected_version,
+                    "actual_version": 0,
+                },
+            )
+        declared_entrance = request.parameters.get("entrance")
+        if declared_entrance is not None and declared_entrance != request.client_name:
+            raise UserInputError(
+                "experience.submit_signal entrance must match client.name"
+            )
+        submission_data = dict(request.parameters)
+        submission_data["entrance"] = request.client_name
+        return MemoryGateway(self._root).submit_learning_signal(
+            LearningSignalSubmission.from_data(submission_data),
+            idempotency_key=request.write.idempotency_key,
+        )
+
+    def _route_counterevidence(self, request: DomainRequest) -> dict[str, object]:
+        if request.write is None:
+            raise DomainProtocolError(
+                "write_contract_required",
+                "counterevidence writes require idempotency_key and expected_version",
+            )
+        counterevidence = CounterevidenceRequest.from_data(request.parameters)
+        if request.write.expected_version != counterevidence.expected_version:
+            raise DomainProtocolError(
+                "version_conflict",
+                "counterevidence target version does not match expected_version",
+                details={
+                    "expected_version": request.write.expected_version,
+                    "actual_version": counterevidence.expected_version,
+                },
+            )
+        return MemoryGateway(self._root).route_counterevidence(
+            counterevidence,
+            idempotency_key=request.write.idempotency_key,
+        )
 
     @staticmethod
     def _require_maintenance_write(
