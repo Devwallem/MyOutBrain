@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import tempfile
@@ -143,6 +144,8 @@ class CompanionLoopCliTests(unittest.TestCase):
             public_query = "Product Nova 2 official release date"
             url = "https://official.example/products/nova-2"
             web_source_id = f"web_{hashlib.sha256(url.encode()).hexdigest()}"
+            retrieved_at = datetime.now(timezone.utc)
+            published_at = retrieved_at - timedelta(hours=19)
             public_response = json.dumps(
                 {
                     "results": [
@@ -150,8 +153,8 @@ class CompanionLoopCliTests(unittest.TestCase):
                             "url": url,
                             "title": "Product Nova 2 release",
                             "content": "Product Nova 2 launches on 2026-08-01.",
-                            "published_at": "2026-07-17T09:00:00+00:00",
-                            "retrieved_at": "2026-07-18T04:00:00+00:00",
+                            "published_at": published_at.isoformat(),
+                            "retrieved_at": retrieved_at.isoformat(),
                             "source_type": "official",
                             "fact_key": "nova-2-release-date",
                             "fact_value": "2026-08-01",
