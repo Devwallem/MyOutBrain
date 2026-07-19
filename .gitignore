@@ -2,11 +2,14 @@
 __pycache__/
 *.py[cod]
 .mypy_cache/
+.pytest_cache/
 *.egg-info/
 
-# MyOutBrain machine data
-/store/objects/
-/runtime/
-/store/transactions/
+# A source checkout is not a private MyOutBrain instance. Keep all canonical
+# memory, evidence, projections, Obsidian views, and instance configuration in
+# a separate local instance root created with `myoutbrain init`.
+/myoutbrain.toml
 /.myoutbrain.lock
-/vault/.obsidian/
+/store/
+/runtime/
+/vault/
