@@ -1,0 +1,29 @@
+{
+  "name": "myoutbrain-memory",
+  "version": "3.0.0",
+  "description": "Local-first MyOutBrain V3 memory authority bridge for Codex and OpenCode.",
+  "author": {
+    "name": "Devwallem / MyOutBrain"
+  },
+  "repository": "https://github.com/Devwallem/MyOutBrain",
+  "keywords": ["memory", "mcp", "codex", "opencode", "local-first"],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "MyOutBrain Memory",
+    "shortDescription": "Recall and govern the shared MyOutBrain memory graph.",
+    "longDescription": "Connect Codex to the existing MyOutBrain V3 Memory Graph Authority through a standalone MCP harness, including recall, inspection, collector, and review operations.",
+    "developerName": "Devwallem / MyOutBrain",
+    "category": "Productivity",
+    "websiteURL": "https://github.com/Devwallem/MyOutBrain",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Recall relevant knowledge from MyOutBrain.",
+      "Inspect the current MyOutBrain memory graph.",
+      "List pending MyOutBrain review proposals."
+    ],
+    "brandColor": "#1F6F5B"
+  }
+}

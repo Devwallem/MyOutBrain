@@ -1,4 +1,0 @@
-interface:
-  display_name: "MyOutBrain Companion"
-  short_description: "Use shared memory before and after Codex tasks"
-  default_prompt: "Use $myoutbrain-companion to recall relevant context, complete this task, and submit only what was visible."

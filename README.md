@@ -1,280 +1,220 @@
-# MyOutBrain
+# MyOutBrain V3 Memory Plugin
 
-MyOutBrain 是一个面向单一创作者的、本地优先的长期知识与认知记忆核心。
-它把 Codex、OpenCode 和 Claude Code 视为可替换的智能体入口，把规范记忆、
-来源关系、审阅决定和演变历史保存在同一个项目无关的私人实例中。
+MyOutBrain V3 是面向 Codex 和 OpenCode 的本地优先记忆插件。它用一层共享 harness 连接 MyOutBrain Memory Graph Authority，并确保用户自己的记忆数据库始终位于仓库之外。
 
-当前发布代际为 **V2**，运行协议为 **V2.3**，私人实例 Schema 为 **11**。
-Python 包仍处于 `0.1.0` 开发版本。
+插件不会上传或内置个人记忆。它通过 stdio JSON-RPC，把 Agent 宿主连接到兼容 MyOutBrain Domain Protocol 3.0 的 Authority 运行时。
 
-> MyOutBrain V2 已完成可发布的本地知识闭环，但仍是记忆核心而不是完整的
-> 桌面应用或自主智能同伴。人格、情绪、多媒体、实时同步、无人值守模型调用
-> 和自动知识批准不在当前版本范围内。
+## V3 的定位
 
-## 核心原则
+MyOutBrain 的 V1、V2 曾探索更完整的个人记忆系统。V3 将成果收敛为可移植的插件边界：
 
-- **一个私人实例**：不同项目和智能体入口共享同一个长期记忆核心。
-- **本地优先**：基础闭环不要求网络、Embedding 模型或常驻进程。
-- **人工拥有语义权**：模型只能提出知识变更，不能自动批准、改写或删除规范记忆。
-- **来源可追溯**：长期记忆保留稳定身份、版本、适用范围和最低来源凭证。
-- **入口可替换**：客户端配置和 Skill 不保存规范数据，重装入口不会删除知识。
-- **紧凑召回**：普通任务先取得相关规范记忆，需要核验时再展开完整证据。
-- **冲突不投票**：反证会阻止无冲突结论并进入统一审阅，不按来源数量自动裁决。
+- Codex 与 OpenCode 共用一套 harness；
+- 完整透传 Domain Protocol 3.0 操作；
+- 提供 recall、inspection、Collector 与 Review Staging 治理入口；
+- 所有审核写操作都要求显式用户决策；
+- 插件代码与私有 Memory Root 完全分离。
 
-## 源码仓库与私人实例
+V1、V2 的失败与设计记录保留在 Git 历史中，当前分支代表独立插件形态的 V3。
 
-源码仓库和私人实例是两个不同的边界，不应放在同一个目录中。
+## 架构
 
-### 本仓库保存
-
-```text
-MyOutBrain/
-├── src/                 # Python 实现与 V2 协议 Schema
-├── skills/              # 通用 Companion / Reflector Skills
-├── tests/               # CLI、MCP 和跨入口黑盒测试
-├── evaluation/          # 召回回归数据
-├── docs/                # 发布说明、ADR 和智能体文档
-├── .scratch/            # 本地规格与实施事项记录
-├── CONTEXT.md           # 领域语言
-└── pyproject.toml       # 包与开发工具配置
+```mermaid
+flowchart LR
+    C["Codex MCP host"] --> S["src/mcp-server.js"]
+    O["OpenCode plugin host"] --> P["opencode-plugin.js"]
+    S --> H["Shared MyOutBrain harness"]
+    P --> H
+    H --> M["MyOutBrain V3 MCP runtime"]
+    M --> R["Private Memory Root"]
 ```
 
-这里不保存任何真实用户知识、Vault、SQLite 数据库、对象存储或运行缓存。
+`src/myoutbrain-harness.js` 统一负责进程启动、MCP 初始化、JSON-RPC 请求关联、协议校验、错误归一化和关闭流程。两个宿主适配器不会各自实现一套记忆逻辑。
 
-### 私人实例保存
+## 能力
 
-执行 `myoutbrain init` 后会在另一个本地目录生成：
+### 完整网关
 
-```text
-MyOutBrain-private/
-├── myoutbrain.toml      # 实例身份、Schema 与本地配置
-├── store/
-│   ├── memory.sqlite3   # 规范记忆与审阅状态的事实来源
-│   └── objects/         # 内容寻址的来源对象
-├── runtime/             # 可重建索引、缓存、日志和临时工作区
-└── vault/               # 可重建的人类 / Obsidian 视图
-```
+`myoutbrain_gateway` 接受完整的 Domain Protocol 3.0 请求，因此 Authority 增加领域操作时，不需要在每个宿主适配器里复制业务逻辑。
 
-`vault/` **仍然有用**，但它属于私人实例，而不是云端源码仓库。V2 中 SQLite
-规范状态和内容寻址对象才是事实来源；Vault 用于人类浏览、审计和可选的 Obsidian
-工作流。删除生成视图不应造成知识丢失，视图可以从规范状态重建。
+### Collector 治理
 
-## 安装
+- 列出 `pending` 与 `deferred` Temporary Knowledge Cards；
+- 将混合卡片拆成原子候选；
+- 接受、拒绝或暂缓卡片；
+- 写操作要求 `explicitUserDecision: true`。
 
-### 要求
+### Review Staging
 
-- Windows、macOS 或 Linux
-- Python 3.13+
-- Git（从源码安装时）
-- 可选：Obsidian 1.12.7+ 及其 CLI
-- 可选：`sentence-transformers`，仅用于未来或实验性的本地 Embedding 后备
+- 列出待审 graph-change 提案；
+- 接受、拒绝或暂缓提案；
+- 区分“已进入 Staging”和“已成为 canonical Memory”；
+- 应用图变更前要求显式用户决定。
 
-### 从源码安装
+### 共享 Authority
 
-以下示例使用 PowerShell：
+Codex 和 OpenCode 可以指向同一个 Memory Root。Authority 是唯一 canonical writer，适配器不会绕过网关直接读取 SQLite、Vault 或运行时内部文件。
+
+## 环境要求
+
+- Node.js 18 或更高版本；
+- Python 3.10 或更高版本；
+- 兼容 MyOutBrain V3 的 Python 包或 MCP 命令；
+- 一个独立、可写的私有 Memory Root；
+- Codex 或 OpenCode。
+
+本仓库包含插件 harness，不包含用户的私有记忆实例。
+
+## 快速开始
+
+### 1. 克隆
 
 ```powershell
 git clone https://github.com/Devwallem/MyOutBrain.git
-Set-Location MyOutBrain
-
-py -3.13 -m venv .venv
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -e .
+cd MyOutBrain
 ```
 
-如需安装可选 Embedding 依赖：
+Codex MCP 适配器没有 npm 依赖。OpenCode 可选用 `@opencode-ai/plugin`；缺少该模块时会使用内置兼容构造器。
+
+### 2. 配置 Authority
+
+在启动 Agent 宿主的环境中设置：
 
 ```powershell
-& .\.venv\Scripts\python.exe -m pip install -e ".[embeddings]"
+$env:MYOUTBRAIN_MEMORY_ROOT = "D:\Memory\MyOutBrain-private"
+$env:MYOUTBRAIN_PYTHON_EXECUTABLE = "python"
 ```
 
-## 创建私人实例
-
-私人实例应位于源码仓库之外：
+若 `myoutbrain` 来自源码目录，指定其 package root：
 
 ```powershell
-$MyOutBrainPython = "$(Resolve-Path .\.venv\Scripts\python.exe)"
-$MyOutBrainInstance = "$env:USERPROFILE\MyOutBrain-private"
-
-& $MyOutBrainPython -m myoutbrain init `
-  --root $MyOutBrainInstance `
-  --format text
-
-& $MyOutBrainPython -m myoutbrain status `
-  --root $MyOutBrainInstance `
-  --format text
-
-& $MyOutBrainPython -m myoutbrain doctor `
-  --root $MyOutBrainInstance `
-  --format text
+$env:MYOUTBRAIN_PACKAGE_ROOT = "D:\src\myoutbrain"
 ```
 
-成功状态应报告：
+也可以覆盖完整命令；harness 会替换 `{memoryRoot}`：
+
+```powershell
+$env:MYOUTBRAIN_MCP_COMMAND = '["python","-m","myoutbrain","mcp","--root","{memoryRoot}"]'
+```
+
+### 3. 连接 Codex
+
+仓库提供 `.codex-plugin/plugin.json` 与 `.mcp.json`，可直接作为 marketplace 中的 `myoutbrain-memory` 插件源。
+
+本地开发也可以直接注册 MCP Server：
+
+```toml
+[mcp_servers.myoutbrain-memory]
+command = "node"
+args = ["D:\\src\\MyOutBrain\\src\\mcp-server.js"]
+
+[mcp_servers.myoutbrain-memory.env]
+MYOUTBRAIN_MEMORY_ROOT = "D:\\Memory\\MyOutBrain-private"
+MYOUTBRAIN_PYTHON_EXECUTABLE = "python"
+MYOUTBRAIN_PACKAGE_ROOT = "D:\\src\\myoutbrain"
+```
+
+修改插件或 MCP 配置后重新启动 Codex。
+
+### 4. 连接 OpenCode
+
+在 `opencode.json` 中注册本地适配器：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "file:///D:/src/MyOutBrain/opencode-plugin.js"
+  ]
+}
+```
+
+从包含相同 `MYOUTBRAIN_*` 环境变量的终端启动 OpenCode。适配器会按 Memory Root 复用 harness，并在宿主关闭时回收子进程。
+
+## OIWiki 范例记忆库
+
+完整 OIWiki 范例、SHA-256、安装步骤和 Codex/OpenCode 配置位于：
+
+[Issue #2: OIWiki sample Memory Root for MyOutBrain V3](https://github.com/Devwallem/MyOutBrain/issues/2)
+
+范例库不进入 Git 历史，而是作为 `v3.0.0` Release asset 提供。建议先复制一份再测试写操作。
+
+## 暴露的工具
+
+| Tool | 用途 | 写入保护 |
+| --- | --- | --- |
+| `myoutbrain_gateway` | 调用任意 Domain Protocol 3.0 操作 | 由领域协议决定 |
+| `memory_list_collector_cards` | 列出 Collector 卡片 | 只读 |
+| `memory_split_collector_card` | 拆分知识卡片 | 显式决定 |
+| `memory_decide_collector_card` | 接受、拒绝或暂缓卡片 | 显式决定 |
+| `memory_list_review_proposals` | 列出 Review Staging 提案 | 只读 |
+| `memory_decide_review_proposal` | 审议图变更 | 显式决定 |
+
+## 环境变量
+
+| 变量 | 用途 | 默认值 |
+| --- | --- | --- |
+| `MYOUTBRAIN_MEMORY_ROOT` | 私有 Authority 根目录 | `<host cwd>/.myoutbrain` |
+| `MYOUTBRAIN_ROOT` | Memory Root 别名 | 未设置 |
+| `MYOUTBRAIN_PYTHON_EXECUTABLE` | Python 启动器 | `python` |
+| `MYOUTBRAIN_PACKAGE_ROOT` | 包含 `src/myoutbrain` 的源码根目录 | 尝试自动发现 |
+| `MYOUTBRAIN_MCP_COMMAND` | JSON 数组或 shell 风格的完整 MCP 命令 | 自动生成 |
+| `MYOUTBRAIN_STARTUP_TIMEOUT_MS` | Authority 启动超时，单位毫秒 | `10000` |
+
+## Domain 请求示例
+
+```json
+{
+  "protocol": { "major": 3, "minor": 0 },
+  "client": {
+    "name": "my-agent",
+    "capabilities": ["memory-graph.v3"]
+  },
+  "operation": "review.list",
+  "parameters": {}
+}
+```
+
+写操作应携带稳定的 `idempotency_key`，确保传输重试不会制造重复提案或决定。
+
+## 隐私与安全边界
+
+- 将 `MYOUTBRAIN_MEMORY_ROOT` 放在 Git 仓库之外；
+- 不要提交数据库、Vault、导出证据、凭据或未脱敏工具日志；
+- 仓库内 `.mcp.json` 不包含机器路径或秘密；
+- Collector 接受与 Review Staging 决策要求显式用户批准；
+- 候选知识只有经独立审核并接受 graph change 后才成为 canonical Memory；
+- harness 只能通过 Authority Gateway 访问私有状态。
+
+## 故障排查
+
+### `Transport closed`
+
+表示 Python MCP 进程退出或初始化失败。依次检查 Python 路径、`myoutbrain` 是否可导入、package root、Memory Root 写权限以及自定义 MCP 命令格式。
+
+### Protocol mismatch
+
+本版本要求 Domain Protocol `3.0`。请升级 Authority，或使用与 Authority 协议一致的插件版本。
+
+### 相对 MCP 路径无法解析
+
+Marketplace 宿主应从插件根目录解析 `./src/mcp-server.js`。直接注册 MCP 时请使用上文所示的绝对路径。
+
+## 仓库结构
 
 ```text
-MyOutBrain V2 canonical schema 11
-Canonical store: ok
-Object store: ok
-Writer: available (single-writer)
-Integrity: ok
+.
+|-- .codex-plugin/
+|   `-- plugin.json
+|-- .mcp.json
+|-- opencode-plugin.js
+|-- package.json
+`-- src/
+    |-- mcp-server.js
+    `-- myoutbrain-harness.js
 ```
 
-## 连接智能体
+## 版本与贡献
 
-安装 Codex 入口：
+插件遵循语义化版本。V3 对齐 Domain Protocol 3.0，后续插件补丁版本可以在协议兼容的前提下独立演进。
 
-```powershell
-& $MyOutBrainPython -m myoutbrain adapter install codex `
-  --root $MyOutBrainInstance
-
-& $MyOutBrainPython -m myoutbrain adapter check codex `
-  --root $MyOutBrainInstance
-```
-
-也可以把同一个私人实例连接到另外两个入口：
-
-```powershell
-& $MyOutBrainPython -m myoutbrain adapter install opencode `
-  --root $MyOutBrainInstance
-
-& $MyOutBrainPython -m myoutbrain adapter install claude-code `
-  --root $MyOutBrainInstance
-```
-
-安装器会注册同一个主私人实例，写入受管的 MCP 配置和无状态 Skill。安装或重装
-不会复制规范数据；卸载入口也不会删除私人实例。安装后请重启对应客户端或新建任务，
-让 MCP 配置和 Skill 生效。
-
-## 日常使用
-
-MyOutBrain 的首选控制面是与智能体的自然对话。CLI 主要用于运维、自动化和
-黑盒验收。
-
-### 1. 任务前召回
-
-对智能体说：
-
-> 请先使用 MyOutBrain 召回与这个任务有关的长期记忆，再开始工作。
-
-入口会通过 MCP 请求任务相关的紧凑召回包。回答主要来自私人知识库时，应显示
-MyOutBrain 知识来源声明；需要核验时再展开证据。
-
-### 2. 捕获明确学习信号
-
-V2 只捕获五类明确学习信号：
-
-- 用户纠正
-- 已确认决定
-- 可复用步骤
-- 重复失败及其解决办法
-- 值得持续研究的问题
-
-普通闲聊、任务时长、消息数量、任务完成或沉默都不会自动形成学习记录。
-
-可以对智能体说：
-
-> 我明确确认：……。请把它作为学习信号提交，但不要替我批准长期记忆。
-
-### 3. 反思与审阅
-
-对智能体说：
-
-> 现在反思本轮，把候选记忆、形成方式、依据、冲突和盲区交给我审阅。
-
-Reflector 会把有界输入变成统一审阅提案。创作者可以逐项修改、批准、拒绝或
-延期；只有批准后的正确意图才会物化为规范记忆、人类归档或研究线程。
-
-个人认知必须逐项明确确认，不能通过“全部批准”批量定义。
-
-### 4. 后续召回和审计
-
-可以自然询问：
-
-- “你还记得我们关于 X 的决定吗？”
-- “为什么你认为 X？”
-- “展开这条记忆的来源和演变。”
-- “这条知识是否受到过反证？”
-- “把这条认识标记为历史可信。”
-- “忘掉这条记忆。”（默认可恢复停用）
-- “永久删除，并先展示影响闭包。”
-
-## 常用运维命令
-
-```powershell
-# 查看实例状态
-& $MyOutBrainPython -m myoutbrain status `
-  --root $MyOutBrainInstance --format text
-
-# 只读完整性诊断
-& $MyOutBrainPython -m myoutbrain doctor `
-  --root $MyOutBrainInstance --format text
-
-# 查看统一审阅队列
-& $MyOutBrainPython -m myoutbrain review-list `
-  --root $MyOutBrainInstance --format text
-
-# 查看不复制问题或正文的紧凑召回日志
-& $MyOutBrainPython -m myoutbrain recall-activity `
-  --root $MyOutBrainInstance --format text
-```
-
-备份、迁移、修复、垃圾回收和永久删除需要显式版本、幂等键或影响确认。运行
-`python -m myoutbrain --help` 及具体子命令的 `--help` 查看当前协议参数。
-
-## V2 已发布能力
-
-- 学习信号经 Reflector 和统一审阅成为可召回规范记忆。
-- Codex、OpenCode、Claude Code 共享同一记忆身份、版本和审阅状态。
-- 名称、旧别名、分区、胶囊、全文检索和可选语义后备共同支持有界召回。
-- 反证使当前任务不可回答并进入审阅，待审期间不改变既有规范知识。
-- 知识修订、历史化、取代、可恢复停用和永久删除保留相应审计边界。
-- 胶囊裂分、故障恢复和合并保持知识身份、正文、关系与召回结果。
-- 经审计的知识闭包可通过普通 ZIP 进行 dry-run 和幂等迁移。
-- 整库冷快照只恢复到新目录，并在只读 Doctor 通过后允许切换。
-- 基础闭环不依赖网络、Embedding 模型或常驻进程。
-
-九项发布阻塞场景见 [`docs/releases/v2.md`](docs/releases/v2.md)，唯一 V2 行为规格
-见 [`.scratch/myoutbrain-v2/spec.md`](.scratch/myoutbrain-v2/spec.md)。
-
-## 当前非目标
-
-- 固定 Web、桌面、Obsidian 或 TUI 审阅界面
-- 无人值守 headless 模型调用
-- 自动知识批准或自动反证裁决
-- 人格、情绪、用户声音和作者模仿
-- 多媒体理解
-- 实时同步、设备配对和多用户协作
-- 内建迁移加密、签名或云端备份服务
-- 推荐算法或持久知识权重
-
-这些能力可以在真实使用证明需要后，通过同一个 MemoryGateway 协议增量加入，
-但不能把客户端缓存、向量索引、Vault 或模型私有记忆升级为规范事实来源。
-
-## 开发与验证
-
-```powershell
-& .\.venv\Scripts\python.exe -m pytest -q
-& .\.venv\Scripts\python.exe -m mypy
-```
-
-发布门禁测试：
-
-```powershell
-& .\.venv\Scripts\python.exe -m pytest tests\test_cli_v2_release.py -q
-```
-
-领域术语见 [`CONTEXT.md`](CONTEXT.md)，架构决策见 [`docs/adr/`](docs/adr/)，本地
-事项约定见 [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md)。
-
-## 隐私与备份
-
-- 不要把私人实例目录提交到源码仓库。
-- 不要让智能体绕过 MCP/CLI 直接读取 SQLite、对象存储或整个 Vault。
-- `local-only` 内容不得仅为完成任务而放宽成可外发内容。
-- 普通备份是私人实例的冷 ZIP 快照；V2 不默认提供加密或自动保留策略。
-- 恢复必须写入新目录并通过 Doctor，不能覆盖最后一个可用实例。
-
-## License
-
-仓库当前尚未包含开源许可证。除非仓库所有者明确添加许可证，否则不要假定代码
-可以被公开复制、修改或再分发。
+欢迎提交聚焦的 Issue 与 Pull Request。请勿附带私有 Memory Root、数据库、个人证据、访问令牌或未脱敏日志。

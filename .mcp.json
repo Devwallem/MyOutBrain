@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "myoutbrain-memory": {
+      "command": "node",
+      "args": [
+        "./src/mcp-server.js"
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "myoutbrain-harness-plugin",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Local-first MyOutBrain V3 memory authority bridge for Codex and OpenCode.",
+  "main": "opencode-plugin.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Devwallem/MyOutBrain.git"
+  }
+}

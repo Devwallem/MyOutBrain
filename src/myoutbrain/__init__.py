@@ -1,2 +1,0 @@
-"""MyOutBrain personal cognitive library."""
-

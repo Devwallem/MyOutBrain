@@ -1,7 +1,0 @@
----
-status: superseded by ADR-0080
----
-
-# 使用稳定身份与 YAML 元数据
-
-每篇 Vault 笔记使用人类可读标题作为文件名，同时在 YAML 属性中保存不随重命名或移动而改变的稳定 ID，以及 `kind`、`state`、`authorship`、`sensitivity`、时间、来源和取代关系等最小元数据。稳定 ID 负责跨存储引用，Markdown 属性保持人类可读和可迁移，标签、别名与自由链接则不作为系统完整性的必要条件。
